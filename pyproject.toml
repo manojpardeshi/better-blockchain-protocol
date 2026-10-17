@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sigil-protocol"
+version = "0.1.0"
+description = "Sigil: a chainless value protocol (reference implementation)"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+dependencies = ["cryptography>=41"]
+
+[tool.setuptools]
+packages = ["sigil"]
