@@ -187,7 +187,7 @@ To accept a received parcel, the holder MUST also trust its `home`.
 
 **Holders cannot be robbed by witnesses.** Rule 6.4 re-checks the owner's unlock, so even a seal produced by a fully corrupt quorum can't spend a parcel without its lock's signatures. Witnesses enforce time locks; holders accept time conditions on the quorum's word.
 
-**Mechanised check.** `tests/test_model_check.py` explores adversarial schedules against the real witness code. The adversary controls the owner and a Byzantine witness that signs anything and joins every seal and death proof. As a mutation test, it confirms that a witness accepting any death proof is caught.
+**Mechanised check.** `tests/test_model_check.py` explores adversarial schedules against the real witness code. The adversary controls the owner and a Byzantine witness that signs anything and joins every seal and death proof. As a mutation test, it confirms that a witness accepting any death proof is caught. [`formal/Sigil.tla`](../formal) is a TLA+ model of §5.1–5.2 and §3.9, and TLC checks the theorem and both lemmas against it exhaustively on small instances (see `formal/README.md`).
 
 ## 9. Recommended policies (non-normative)
 
