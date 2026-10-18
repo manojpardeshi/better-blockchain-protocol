@@ -4,33 +4,69 @@
 (* safety theorem (§8): no sigil is an input of two different complete     *)
 (* transitions.                                                            *)
 (*                                                                         *)
-(* One constellation version (no rotation).  Witnesses are split into      *)
-(* Honest and Byz.  Owners are fully adversarial: every owner authorises   *)
-(* every transition, so any honest witness may receive a spend request for *)
-(* any (sigil, transition) pair at any time.  Cryptography is abstracted:  *)
-(* a vote is the tuple <<w, s, g, t>> and only w can create it, so         *)
-(* Byzantine witnesses can create any vote for themselves and no vote for  *)
-(* anyone else.  Votes are public (STATUS, §5.3) and never disappear, so   *)
-(* the adversary can always assemble any seal or death proof that the      *)
-(* current set of votes supports.                                          *)
+(* Several constellations, one charter version each (no rotation).  Each  *)
+(* witness is a member of exactly one constellation and is Honest or Byz;  *)
+(* a constellation may be entirely Byzantine (an attacker-run "rogue"      *)
+(* constellation that is in the registry).  Every sigil has a fixed home   *)
+(* constellation: the sigil id commits to it (§3.2), so it cannot be       *)
+(* faked.  A vote carries its constellation, and a seal for a sigil counts *)
+(* only votes from the sigil's home, as holders require (§6 rule 4).       *)
+(*                                                                         *)
+(* Owners are fully adversarial: every owner authorises every transition,  *)
+(* so any honest witness may receive a spend request for any (sigil,       *)
+(* transition) pair at any time.  Cryptography is abstracted: a vote is    *)
+(* the tuple <<c, w, s, g, t>> and only w can create it, so Byzantine      *)
+(* witnesses can create any vote for themselves (under their own           *)
+(* constellation, for any sigil) and no vote for anyone else.  Votes are   *)
+(* public (STATUS, §5.3) and never disappear, so the adversary can always  *)
+(* assemble any seal or death proof that the current set of votes          *)
+(* supports.                                                               *)
 (***************************************************************************)
 EXTENDS Naturals, FiniteSets
 
 CONSTANTS
     Honest,         \* honest witnesses
     Byz,            \* Byzantine witnesses (vote anything, any time)
-    Quorum,         \* q
-    Sigils,         \* sigils (all homed at this constellation)
+    Cons,           \* constellations (cids)
+    Members,        \* Cons -> SUBSET witnesses: each constellation's charter
+    Quorum,         \* Cons -> Nat: q of each constellation
+    Sigils,         \* sigils
+    Home,           \* Sigils -> Cons: the home each sigil id commits to
     Tids,           \* transitions
     MaxGen,         \* generations in headers range over 0..MaxGen
     HeaderSpace,    \* set of functions Tids -> headers; Init picks one
     ByzEager,       \* TRUE: Byzantine votes exist from the start (see below)
-    AnyProof        \* MUTATION: TRUE makes Release accept any proof
+    AnyProof,       \* MUTATION: TRUE makes Release accept any proof
+    AnyConstellationProof
+                    \* MUTATION: TRUE makes Release accept a death proof
+                    \* whose seal/votes come from ANY constellation, not
+                    \* only from the home of the sigil the proof names
+                    \* (the behaviour before the fix)
 
 ASSUME Honest \cap Byz = {}
-ASSUME Quorum \in Nat /\ Quorum <= Cardinality(Honest \cup Byz)
-
 Witnesses == Honest \cup Byz
+
+ASSUME Members \in [Cons -> SUBSET Witnesses]
+ASSUME \A c, d \in Cons : c # d => Members[c] \cap Members[d] = {}
+ASSUME \A w \in Witnesses : \E c \in Cons : w \in Members[c]
+ASSUME Quorum \in [Cons -> Nat]
+ASSUME \A c \in Cons : 1 <= Quorum[c] /\ Quorum[c] <= Cardinality(Members[c])
+ASSUME Home \in [Sigils -> Cons]
+
+ConsOf(w) == CHOOSE c \in Cons : w \in Members[c]
+
+(* The §8 theorem assumes every home satisfies the fault bound: q = n - f  *)
+(* with f = floor((n-1)/3), and at most f Byzantine members.  Other        *)
+(* constellations (e.g. all-Byzantine rogue ones) are unconstrained but    *)
+(* home no sigil of the model: a holder that trusts a rogue home has no    *)
+(* guarantee for sigils homed there, by assumption.                        *)
+FaultBounded(c) ==
+    LET n == Cardinality(Members[c])
+        f == (n - 1) \div 3
+    IN  /\ Quorum[c] = n - f
+        /\ Cardinality(Members[c] \cap Byz) <= f
+ASSUME \A s \in Sigils : FaultBounded(Home[s])
+
 Gens      == 0..MaxGen
 NoTid     == "none"            \* r.tid = null
 ASSUME NoTid \notin Tids
@@ -47,44 +83,64 @@ VARIABLES
     header,     \* Tids -> header; chosen in Init, constant afterwards
     gen,        \* gen[w][s]   : Record.gen of honest witness w for sigil s
     bound,      \* bound[w][s] : Record.tid (a tid or NoTid)
-    votes       \* set of <<w, s, g, t>>: every vote ever cast (honest + Byz)
+    votes       \* set of <<c, w, s, g, t>>: every vote ever cast (honest
+                \* and Byz); c is the vote's constellation, w \in Members[c]
 
 vars == <<header, gen, bound, votes>>
 
 SigilsOf(t)    == { p[1] : p \in header[t] }
 GenOf(t, s)    == CHOOSE g \in Gens : <<s, g>> \in header[t]
 
-(* Distinct witnesses that voted for t at (s, g).                          *)
-VotersFor(s, g, t) == { w \in Witnesses : <<w, s, g, t>> \in votes }
+(* Distinct members of constellation c that voted for t at (s, g).        *)
+VotersFor(c, s, g, t) ==
+    { w \in Members[c] : <<c, w, s, g, t>> \in votes }
 
-(* Distinct witnesses that voted for some tid other than t at (s, g).      *)
-VotersAgainst(s, g, t) ==
-    { w \in Witnesses : \E u \in Tids \ {t} : <<w, s, g, u>> \in votes }
+(* Distinct members of c that voted for some tid other than t at (s, g).   *)
+VotersAgainst(c, s, g, t) ==
+    { w \in Members[c] : \E u \in Tids \ {t} : <<c, w, s, g, u>> \in votes }
 
-(* A valid seal for (s, g, t) exists (§3.6).                               *)
-Sealed(s, g, t) == Cardinality(VotersFor(s, g, t)) >= Quorum
+(* A seal from constellation c for (s, g, t) that is valid in the sense of *)
+(* §3.6: q_c distinct members of c voted.  Any constellation in the        *)
+(* registry can produce such a seal for any sigil, a rogue one included.  *)
+SealedBy(c, s, g, t) == Cardinality(VotersFor(c, s, g, t)) >= Quorum[c]
+
+(* The seal holders accept (§6 rule 4: seal.constellation = home).         *)
+Sealed(s, g, t) == SealedBy(Home[s], s, g, t)
+
+(* Constellations whose seal/votes a death proof naming sigil s may carry. *)
+(* Fixed rule: only Home[s].  The proof carries the target's {home, lock,  *)
+(* salt}; the witness checks sigil_of(...) = s and that the seal/votes are *)
+(* from that home.  Since the sigil id commits to its home, this is        *)
+(* exactly Home[s].                                                        *)
+ProofCons(s) == IF AnyConstellationProof THEN Cons ELSE {Home[s]}
 
 (* §3.9: a valid death proof for transition t exists.  It names an input   *)
 (* [s, g] of t's header -- not necessarily the sigil being released -- and *)
 (* is either a seal for another tid at (s, g) or q votes for other tids at *)
-(* (s, g).  Byzantine votes count.                                         *)
+(* (s, g), from one constellation in ProofCons(s).  Byzantine votes count. *)
 DeathProofExists(t) ==
     \E p \in header[t] :
         LET s == p[1]  g == p[2] IN
-        \/ \E u \in Tids \ {t} : Sealed(s, g, u)                \* kind "seal"
-        \/ Cardinality(VotersAgainst(s, g, t)) >= Quorum        \* kind "votes"
+        \E c \in ProofCons(s) :
+            \/ \E u \in Tids \ {t} : SealedBy(c, s, g, u)             \* "seal"
+            \/ Cardinality(VotersAgainst(c, s, g, t)) >= Quorum[c]    \* "votes"
 
-(* §8: complete = every input sealed to t at the generation t names.       *)
+(* §8: complete = every input sealed, by its home, to t at the generation  *)
+(* t names.                                                                *)
 Complete(t) == \A p \in header[t] : Sealed(p[1], p[2], t)
 
-ByzVotes == Byz \X Sigils \X Gens \X Tids
+VoteSpace ==
+    { v \in Cons \X Witnesses \X Sigils \X Gens \X Tids : v[2] \in Members[v[1]] }
+
+(* Byzantine members sign any vote, for any sigil, homed there or not.     *)
+ByzVotes == { v \in VoteSpace : v[2] \in Byz }
 
 -----------------------------------------------------------------------------
 TypeOK ==
     /\ header \in [Tids -> ValidHeaders]
     /\ gen    \in [Honest -> [Sigils -> 0..(MaxGen + 1)]]
     /\ bound  \in [Honest -> [Sigils -> Tids \cup {NoTid}]]
-    /\ votes  \subseteq Witnesses \X Sigils \X Gens \X Tids
+    /\ votes  \subseteq VoteSpace
 
 (* THEOREM (§8).                                                           *)
 Safety ==
@@ -94,12 +150,15 @@ Safety ==
 
 (* Auxiliary invariants (the lemmas, and the honest-witness discipline).   *)
 
-\* An honest witness votes at most once per (s, g)  (§5.1, last sentence).
+\* An honest witness votes at most once per (s, g)  (§5.1, last sentence),
+\* and only for sigils homed at its own constellation (§5.1 step 2).
 HonestNoEquivocation ==
-    \A w \in Honest, s \in Sigils, g \in Gens, t1, t2 \in Tids :
-        (<<w, s, g, t1>> \in votes /\ <<w, s, g, t2>> \in votes) => t1 = t2
+    \A c \in Cons, w \in Honest, s \in Sigils, g \in Gens, t1, t2 \in Tids :
+        /\ (<<c, w, s, g, t1>> \in votes /\ <<c, w, s, g, t2>> \in votes)
+               => t1 = t2
+        /\ <<c, w, s, g, t1>> \in votes => Home[s] = c
 
-\* Lemma 1: at most one tid sealed per (s, g).
+\* Lemma 1: at most one tid sealed (by the home) per (s, g).
 OneSealPerGen ==
     \A s \in Sigils, g \in Gens, t1, t2 \in Tids :
         (Sealed(s, g, t1) /\ Sealed(s, g, t2)) => t1 = t2
@@ -115,11 +174,13 @@ Init ==
     /\ votes  = IF ByzEager THEN ByzVotes ELSE {}
 
 (* §5.1 SPEND, honest witness w, request to consume s by t.  The owner is  *)
-(* adversarial so authorisation (step 3) always passes; steps 1-2 (stamps, *)
-(* home) are irrelevant to safety.  Rejections and Conflict replies change *)
-(* no state, so they are modelled as the action being disabled.            *)
+(* adversarial so authorisation (step 3) always passes; step 1 (stamps) is *)
+(* irrelevant to safety.  Step 2: w serves only sigils homed at its own    *)
+(* constellation.  Rejections and Conflict replies change no state, so     *)
+(* they are modelled as the action being disabled.                         *)
 Spend(w, s, t) ==
     /\ s \in SigilsOf(t)
+    /\ Home[s] = ConsOf(w)
     /\ LET g == GenOf(t, s)
            r == [gen |-> gen[w][s], tid |-> bound[w][s]]
        IN
@@ -130,10 +191,12 @@ Spend(w, s, t) ==
           \/ g = r.gen /\ r.tid \in {NoTid, t}        \* bind / re-vote
        /\ gen'   = [gen   EXCEPT ![w][s] = g]
        /\ bound' = [bound EXCEPT ![w][s] = t]
-       /\ votes' = votes \cup {<<w, s, g, t>>}
+       /\ votes' = votes \cup {<<ConsOf(w), w, s, g, t>>}
        /\ UNCHANGED header
 
-(* §5.2 RELEASE, honest witness w on sigil s.                              *)
+(* §5.2 RELEASE, honest witness w on sigil s.  The death proof may name    *)
+(* another input s' of the bound header; its seal/votes must then come     *)
+(* from Home[s'] (ProofCons), which may differ from w's constellation.     *)
 Release(w, s) ==
     /\ bound[w][s] # NoTid
     /\ AnyProof \/ DeathProofExists(bound[w][s])
@@ -150,8 +213,8 @@ Release(w, s) ==
 (* instance as a cross-check.                                              *)
 ByzVote(b, s, g, t) ==
     /\ ~ByzEager
-    /\ <<b, s, g, t>> \notin votes
-    /\ votes' = votes \cup {<<b, s, g, t>>}
+    /\ <<ConsOf(b), b, s, g, t>> \notin votes
+    /\ votes' = votes \cup {<<ConsOf(b), b, s, g, t>>}
     /\ UNCHANGED <<header, gen, bound>>
 
 Next ==

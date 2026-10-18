@@ -4,6 +4,8 @@
 #   formal/check.sh                 run every config (safety + mutation test)
 #   formal/check.sh MC.cfg ...      run only the given configs
 #
+# MC_multi*.cfg use MC_multi.tla (several constellations); the rest MC.tla.
+#
 # Downloads tla2tools.jar (pinned version + SHA-256) into a cache directory
 # on first use; never commits it. Requires java >= 11 and curl.
 # Configs named *mutant*.cfg are expected to FAIL with a Safety violation;
@@ -40,7 +42,8 @@ fi
 if [[ $# -gt 0 ]]; then
     CONFIGS=("$@")
 else
-    CONFIGS=(MC.cfg MC_all.cfg MC_lazy.cfg MC_mutant.cfg)
+    CONFIGS=(MC.cfg MC_all.cfg MC_lazy.cfg MC_mutant.cfg
+             MC_multi.cfg MC_multi_all.cfg MC_multi_mutant.cfg)
 fi
 
 WORK="$(mktemp -d)"
@@ -54,9 +57,11 @@ for cfg in "${CONFIGS[@]}"; do
     log="$WORK/$name.log"
     start=$(date +%s)
     set +e
+    module=MC.tla
+    [[ "$name" == MC_multi* ]] && module=MC_multi.tla
     (cd "$HERE" && java -XX:+UseParallelGC -cp "$JAR" tlc2.TLC \
         -workers auto -noGenerateSpecTE -cleanup \
-        -metadir "$WORK/$name.states" -config "$cfgpath" MC.tla) >"$log" 2>&1
+        -metadir "$WORK/$name.states" -config "$cfgpath" "$module") >"$log" 2>&1
     rc=$?
     set -e
     secs=$(( $(date +%s) - start ))
