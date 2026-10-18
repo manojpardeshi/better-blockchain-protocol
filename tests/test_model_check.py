@@ -73,18 +73,20 @@ class Universe:
     def death_proofs(self, header, tid):
         proofs = []
         for s, g in header["inputs"]:
+            p = self.parcels[s]
+            target = {"home": p["home"], "lock": p["lock"], "salt": p["salt"]}
             by_tid = self.honest_votes(s, g)
             for t, vs in by_tid.items():
                 if t != tid:
                     votes = list(vs.values()) + [self.byz._vote(s, g, t)]
-                    proofs.append({"kind": "seal", "sigil": s, "gen": g, "seal": model.seal_from_votes(votes)})
+                    proofs.append({"kind": "seal", "sigil": s, "gen": g, "parcel": target, "seal": model.seal_from_votes(votes)})
             others = {}
             for t, vs in by_tid.items():
                 if t != tid:
                     others.update(vs)
             fake = "f" * 64
             votes = list(others.values()) + [self.byz._vote(s, g, fake)]
-            proofs.append({"kind": "votes", "sigil": s, "gen": g, "votes": votes})
+            proofs.append({"kind": "votes", "sigil": s, "gen": g, "parcel": target, "votes": votes})
         return proofs
 
     def step(self):

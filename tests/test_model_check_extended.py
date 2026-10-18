@@ -178,6 +178,8 @@ class Universe:
         idx = self.index()
         fake = "f" * 64
         for s, g in header["inputs"]:
+            p = self.parcels[s]
+            target = {"home": p["home"], "lock": p["lock"], "salt": p["salt"]}
             groups = idx.get((s, g), {})
             pooled = {}
             for key, byz in self.byz.items():
@@ -186,17 +188,17 @@ class Universe:
                 for t, vs in by_tid.items():
                     if t != tid:
                         votes = list(vs.values()) + [b._vote(s, g, t) for b in byz]
-                        proofs.append({"kind": "seal", "sigil": s, "gen": g, "seal": model.seal_from_votes(votes)})
+                        proofs.append({"kind": "seal", "sigil": s, "gen": g, "parcel": target, "seal": model.seal_from_votes(votes)})
                         others.update(vs)
                 votes = list(others.values()) + [b._vote(s, g, fake) for b in byz]
-                proofs.append({"kind": "seal", "sigil": s, "gen": g,
+                proofs.append({"kind": "seal", "sigil": s, "gen": g, "parcel": target,
                                "seal": model.seal_from_votes([b._vote(s, g, fake) for b in byz])})
-                proofs.append({"kind": "votes", "sigil": s, "gen": g, "votes": votes})
+                proofs.append({"kind": "votes", "sigil": s, "gen": g, "parcel": target, "votes": votes})
                 pooled.update({(v["constellation"], v["version"], v["witness"]): v for v in votes})
             # Votes mixed across constellations / versions: must never be counted together.
             mixed = list(pooled.values())
             self.rng.shuffle(mixed)
-            proofs.append({"kind": "votes", "sigil": s, "gen": g, "votes": mixed})
+            proofs.append({"kind": "votes", "sigil": s, "gen": g, "parcel": target, "votes": mixed})
         return proofs
 
     # ---------------------------------------------------------- rotation
@@ -392,13 +394,17 @@ class Universe:
             done = {tid for h, tid in self.pool if any(x == s for x, _ in h["inputs"]) and self.complete(h, tid)}
             if len(done) > 1:
                 return s, done
+        n = self.honest_key_equivocations()
+        if n:
+            return "honest key equivocated", n  # an honest witness could be framed and slashed
         return None
 
     def honest_key_equivocations(self):
         """Pairs of votes by one honest key with the same (constellation, sigil, gen) and different tids.
 
         SPEC §5.1 forbids this and §3.8 makes it a valid equivocation proof
-        (which is not scoped to a charter version). See KnownGapTests.
+        (which is not scoped to a charter version), so it is checked as a
+        violation alongside double spends.
         """
         seen, out = {}, 0
         for w in self.all_honest():
@@ -553,9 +559,11 @@ class TwoConstellationModelCheck(unittest.TestCase):
         for k in ("releases", "completions", "cross_completions", "cross_releases"):
             self.assertGreater(st[k], 0, f"exploration never exercised {k}: {st}")
 
-    def test_checker_detects_votes_pooled_across_constellations(self):
-        seed, _, _ = run_mutated(votes_pooled_across_charters(), MUTATION_SEEDS, STEPS, **TWO)
-        self.assertIsNotNone(seed, "pooling votes across constellations should allow a double spend")
+    def test_checker_detects_votes_pooled_across_charter_versions(self):
+        # Pooling across *constellations* is also blocked by the home check in
+        # proves_dead, so the mutation only bites across versions of one home.
+        seed, _, _ = run_mutated(votes_pooled_across_charters(), MUTATION_SEEDS, STEPS, **ROTATION)
+        self.assertIsNotNone(seed, "pooling votes across charter versions should allow a double spend")
 
     def test_checker_detects_skipped_generation_check(self):
         seed, _, _ = run_mutated(witness_skips_generation_check(), MUTATION_SEEDS, STEPS, **TWO)
@@ -571,26 +579,24 @@ class CombinedModelCheck(unittest.TestCase):
 
 
 class KnownGapTests(unittest.TestCase):
-    """Gap 1 (safety). A death proof may cite *any* constellation in the witness's registry.
+    """Regression tests for two gaps the extended explorer found in v0 (both fixed).
 
-    ``proves_dead`` never checks that the seal or votes come from the
-    target sigil's home constellation. Constellations are permissionless,
-    so an attacker can register one it fully controls and "prove" that a
-    *sealed* transition is dead; the honest home witnesses release it and
-    seal a second spend at the next generation. Both seals are genuine
-    seals of the sigil's home, so a holder accepts both transitions.
+    Gap 1 (safety). A death proof could cite *any* constellation in the
+    witness's registry. Constellations are permissionless, so an attacker
+    could register one it fully controls and "prove" that a *sealed*
+    transition was dead; the honest home witnesses released it and sealed a
+    second spend, and holders accepted both. Fixed: SPEC §3.9 death proofs
+    reveal the target's ``{home, lock, salt}`` and the evidence must come
+    from that home.
 
-    Gap 2 (framing, not a double spend). ADOPT may re-bind a sigil at a
-    generation where a re-used member's key already voted for a transition
-    that has since been proven dead, so an honest witness signs two votes
-    with the same (constellation, sigil, gen) and different tids, against
-    SPEC §5.1. §3.8 equivocation proofs ignore the charter version, so the
-    pair convicts (and can slash the bond of) an honest witness.
-
-    Both are marked expectedFailure until fixed; a fix must remove the marker.
+    Gap 2 (framing, not a double spend). ADOPT could re-bind a sigil at a
+    generation where a re-used member's key had already voted for a
+    transition since proven dead, so an honest witness signed two votes for
+    one (constellation, sigil, gen): a valid §3.8 equivocation proof. Fixed:
+    snapshots carry each witness's own votes and ADOPT abstains rather than
+    vote a second tid at that generation (SPEC §5.4).
     """
 
-    @unittest.expectedFailure
     def test_rogue_constellation_cannot_kill_a_sealed_transition(self):
         net = Network()
         X = net.create_constellation("orion")             # 4 honest witnesses
@@ -628,7 +634,6 @@ class KnownGapTests(unittest.TestCase):
                 and verify_seal(seal1, net.registry) and verify_seal(seal2, net.registry))
         self.assertFalse(both, "sigil sealed into two transitions at its home")
 
-    @unittest.expectedFailure
     def test_rotation_never_makes_an_honest_witness_equivocate(self):
         net = Network()
         X = net.create_constellation("orion")              # all four witnesses honest
@@ -647,14 +652,17 @@ class KnownGapTests(unittest.TestCase):
         va, vb = w0.spend(ra), w1.spend(rb)
         vc = [w2.spend(rc), w3.spend(rc)]
         # Neither A nor B can ever be sealed; their witnesses release honestly.
-        w0.release(s, {"kind": "votes", "sigil": s, "gen": 0, "votes": [vb] + vc})
-        w1.release(s, {"kind": "votes", "sigil": s, "gen": 0, "votes": [va] + vc})
+        target = {"home": X, "lock": p["lock"], "salt": p["salt"]}
+        w0.release(s, {"kind": "votes", "sigil": s, "gen": 0, "parcel": target, "votes": [vb] + vc})
+        w1.release(s, {"kind": "votes", "sigil": s, "gen": 0, "parcel": target, "votes": [va] + vc})
         net.rotate(X, [w.kp for w in (w0, w1, w2, w3)])  # same keys, next version
-        again = net.witnesses(X)[0].spend(rc)             # adopted: bound to C at gen 0
+        try:
+            again = net.witnesses(X)[0].spend(rc)         # adopted: bound to C at gen 0
+        except Rejected:
+            return                                        # abstains rather than signing C at gen 0
         self.assertFalse(verify_equivocation({"a": va, "b": again}),
                          "an honest witness was made to equivocate")
 
-    @unittest.expectedFailure
     def test_explorer_with_rogue_constellation(self):
         """The explorer finds the same gap on its own once a rogue constellation exists."""
         seed, bad, _ = explore(MUTATION_SEEDS, STEPS, rogue=True, **TWO)

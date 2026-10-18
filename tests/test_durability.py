@@ -166,9 +166,9 @@ class CrashTests(DurableCase):
                     w.spend(other)
 
     def test_release_crash(self):
-        _, _, header = self.betrayed_swap()
+        alice, _, header = self.betrayed_swap()
         sigil = header["inputs"][0][0]
-        proof = find_death_proof(self.net, header, model.transition_id(header))
+        proof = find_death_proof(self.net, header, model.transition_id(header), alice._parcels_for(header))
         for i, mode in enumerate(("before", "after")):
             w = self.net.members[self.X][i]
             self.crash_on_write(w, mode)

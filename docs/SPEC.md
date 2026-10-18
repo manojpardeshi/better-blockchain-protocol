@@ -86,9 +86,11 @@ Version 0 needs no signatures. Version *v*+1 MUST be signed by a quorum of versi
 `{a: vote, b: vote}` where both votes are valid, `a.witness = b.witness`, `a.constellation = b.constellation`, `a.sigil = b.sigil`, `a.gen = b.gen`, and `a.tid ≠ b.tid`.
 
 ### 3.9 Death proof
-A death proof for transition `(header, tid)` names an input `[s, g] ∈ header.inputs` and is one of:
-* `{kind:"seal", sigil:s, gen:g, seal}`: a valid seal with `seal.sigil = s`, `seal.gen = g`, `seal.tid ≠ tid`;
-* `{kind:"votes", sigil:s, gen:g, votes}`: valid votes from at least `q` distinct members of one charter version, all with `sigil = s`, `gen = g`, `tid ≠ tid`.
+A death proof for transition `(header, tid)` names an input `[s, g] ∈ header.inputs`, reveals that input's `parcel = {home, lock, salt}` with `sigil(parcel) = s`, and is one of:
+* `{kind:"seal", sigil:s, gen:g, parcel, seal}`: a valid seal with `seal.sigil = s`, `seal.gen = g`, `seal.tid ≠ tid` and `seal.constellation = parcel.home`;
+* `{kind:"votes", sigil:s, gen:g, parcel, votes}`: valid votes from at least `q` distinct members of one charter version of `parcel.home`, all with `sigil = s`, `gen = g`, `tid ≠ tid`.
+
+The evidence MUST come from the target sigil's home. Constellations are permissionless, so a seal from any other constellation proves nothing about `s`; since the sigil commits to its home (§3.2), the home cannot be misstated.
 
 ### 3.10 Stamp
 `{serial: hex, sig: hex}`, an RSA-FDH signature over `serial` by the witness's stamp key. The witness obtains it by blind-signing `FDH(serial)·rᵉ mod N`. Each serial is redeemable once.
@@ -131,21 +133,24 @@ A witness MUST NOT sign two votes with the same `(constellation, sigil, gen)` an
 ### 5.2 RELEASE(sigil, proof)
 1. `r` = record(sigil). Require `r.tid` to be a transition (not null, not contested).
 2. Require `proof` to be a valid death proof for `(r.header, r.tid)` (§3.9).
-3. Append `{kind:"release", gen:r.gen, tid:r.tid, header:r.header, proof}` to `r.log`, then set `r.gen += 1` and clear `tid`, `header` and `vote`.
+3. Append `{kind:"release", gen:r.gen, tid:r.tid, header:r.header, proof}` to `r.log`, then set `r.gen += 1` and clear `tid`, `header`, `vote` and `abstain`.
 
 ### 5.3 STATUS(sigil)
 Return `{gen, tid, votes}`. `votes` is every vote this witness ever cast on the sigil. Anyone may query. It is used for death proofs and freshness checks.
 
 ### 5.4 FREEZE(next_charter) / ADOPT
-* FREEZE: require `next_charter.prev = H("charter", current body)`. Set frozen (no further votes or releases, ever). Return a signature on `next_charter` and the evidence `{sigil: log}`.
+* FREEZE: require `next_charter.prev = H("charter", current body)`. Set frozen (no further votes or releases, ever). Return a signature on `next_charter` and the evidence `{sigil: log ‖ [{kind:"vote", vote} for every vote this witness cast on sigil]}`.
 * The new charter is valid once a quorum of current members have signed it.
 * ADOPT(snapshots), run by each member of the new version. For each sigil, collect the union of log entries from all snapshots, then:
   * keep `bind` entries whose `auth` passes §5.1 step 3 with `now = null`; each gives a pair `(g, tid)`;
   * collect `dead` = the tids of `release` entries whose death proof verifies against their stated header;
   * `alive` = kept bindings whose tid is not in `dead`;
-  * exactly one alive `(g, tid)` → record `gen = g`, bound to `tid`;
+  * `own` = the adopter's own earlier votes on the sigil: valid `vote` entries signed by its own key for this constellation, plus any it already holds (a re-used key MUST bring its own votes);
+  * exactly one alive `(g, tid)` → record `gen = g`, bound to `tid`; if `own` holds a vote at `g` for another tid, mark the record **abstain**: it never votes at `g` (a release still moves it on);
   * more than one → record **contested** (rejects all spends and releases);
-  * none → record unbound at `gen = max over kept bindings of (g+1 if dead else g)`, or 0.
+  * none → record unbound at `gen = max over kept bindings of (g+1 if dead else g)`, raised to one past the highest generation in `own`, or 0.
+
+  A witness therefore never signs two tids for one `(constellation, sigil, gen)`, even across charter versions, so §3.8 equivocation proofs cannot be manufactured against an honest key.
 
 ## 6. Holder validation
 
@@ -179,7 +184,7 @@ To accept a received parcel, the holder MUST also trust its `home`.
 
 **Lemma 1 (one seal per generation).** For fixed `(s, g)` and charter version, at most one tid has a valid seal. *Proof:* two seals need 2*q* votes among *n* witnesses, so they share at least 2*q* − *n* ≥ *f*+1 witnesses, at least one of them honest. An honest witness votes at most once per `(s, g)` (§5.1).
 
-**Lemma 2 (death proofs are sound).** If a valid death proof exists for `T` on input `(s, g)`, then no valid seal for `(s, g, T)` ever exists. *Proof:* (seal kind) by Lemma 1. (votes kind) *q* votes for other tids include at least *q* − *f* honest witnesses who will never vote `T` at `(s, g)`, so `T` can get at most *n* − (*q* − *f*) = 2*f* < *q* votes. ∎ Because a header fixes `g`, seals for `s` at other generations don't count toward `T`.
+**Lemma 2 (death proofs are sound).** If a valid death proof exists for `T` on input `(s, g)`, then no valid seal for `(s, g, T)` ever exists. *Proof:* The proof's evidence is from `s`'s home (§3.9), the only constellation whose seals count for `s`. (seal kind) by Lemma 1. (votes kind) *q* votes for other tids include at least *q* − *f* honest witnesses who will never vote `T` at `(s, g)`, so `T` can get at most *n* − (*q* − *f*) = 2*f* < *q* votes. ∎ Because a header fixes `g`, seals for `s` at other generations don't count toward `T`.
 
 **Theorem (no double consumption).** No sigil `s` is an input of two different complete transitions. *Proof sketch:* suppose `T₁` needs `(s, g₁)` and `T₂` needs `(s, g₂)`, and both are complete.
 *Case g₁ = g₂:* contradicts Lemma 1.
@@ -191,7 +196,7 @@ To accept a received parcel, the holder MUST also trust its `home`.
 
 **Mechanised check.** `tests/test_model_check.py` explores adversarial schedules against the real witness code. The adversary controls the owner and a Byzantine witness that signs anything and joins every seal and death proof. As a mutation test, it confirms that a witness accepting any death proof is caught. `tests/test_model_check_extended.py` extends the exploration to charter rotations (adversarial signing quorums, unfrozen ex-members, forged snapshots from a Byzantine signer, a Byzantine member in every version, seals counted from any version) and to transitions spanning two constellations, each with its own mutation tests. [`formal/Sigil.tla`](../formal) is a TLA+ model of §5.1–5.2 and §3.9 for a single constellation, and TLC checks the theorem and both lemmas against it exhaustively on small instances (see `formal/README.md`).
 
-**Known gaps.** `KnownGapTests` in `tests/test_model_check_extended.py` record two open issues: death proofs are not bound to the target sigil's home constellation, so a seal from an attacker-run constellation in the registry can release a sealed transition; and ADOPT can make a re-used honest key sign two tids for the same `(constellation, sigil, gen)`, which is a valid §3.8 equivocation proof. The single-constellation TLA+ model does not cover either.
+**Fixed gaps.** The extended model checker found two issues in v0, both now fixed and covered by `KnownGapTests` in `tests/test_model_check_extended.py` (regression tests): (1) death proofs were not bound to the target sigil's home, so a seal from an attacker-run constellation could release a sealed transition and allow a double spend; §3.9 now requires the evidence to come from the home. (2) ADOPT could make a re-used honest key sign two tids for the same `(constellation, sigil, gen)`, a valid §3.8 equivocation proof against an honest witness; ADOPT now honours the key's own earlier votes (§5.4). The explorer treats an honest key's equivocation as a violation.
 
 ## 9. Recommended policies (non-normative)
 

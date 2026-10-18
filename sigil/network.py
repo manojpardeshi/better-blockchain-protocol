@@ -75,10 +75,14 @@ class Network:
         if len(sigs) < quorum(len(cur["witnesses"])):
             raise RuntimeError("not enough live witnesses to rotate")
         self.registry.add_chain(cid, chain + [{"body": nxt, "sigs": sigs}])
+        old = {w.pk: w for w in self.all_witnesses(cid)}
         ws = []
         for kp in new_keys:
             w = witness_cls(kp, self.registry, self.clock)
-            w.adopt(cid, nxt["version"], snapshots)
+            own = []  # a re-used key brings its own votes, even if it did not sign (SPEC §5.4)
+            if kp.pk in old and kp.pk not in sigs:
+                own = [{s: [{"kind": "vote", "vote": v} for v in r.votes] for s, r in old[kp.pk].records.items()}]
+            w.adopt(cid, nxt["version"], snapshots + own)
             ws.append(w)
         self.members[cid] = ws
         return nxt["version"]
