@@ -48,5 +48,5 @@ def verify(pk: str, tag: str, obj, sig: str) -> bool:
             bytes.fromhex(sig), signing_message(tag, obj)
         )
         return True
-    except (InvalidSignature, ValueError, TypeError):
+    except (InvalidSignature, ValueError, TypeError, RecursionError):
         return False

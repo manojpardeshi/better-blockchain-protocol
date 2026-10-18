@@ -174,8 +174,15 @@ def _containers(obj, path=()):
     return out
 
 
+def _short(v) -> str:
+    try:
+        return str(v)[:64]
+    except RecursionError:  # deep_nest values exceed the interpreter's repr depth (Python < 3.12)
+        return "deep"
+
+
 def _retype(rng, v):
-    choices = [None, True, False, 0, -1, 10**100, "", str(v)[:64], [v], {"x": v}, [], {}]
+    choices = [None, True, False, 0, -1, 10**100, "", _short(v), [v], {"x": v}, [], {}]
     if isinstance(v, bool):
         choices.append(int(v))
     elif isinstance(v, int):

@@ -125,6 +125,8 @@ def evaluate(lock: dict, unlock: dict, sigil: str, tid: str, now: int | None) ->
     """
     if not well_formed(lock) or not isinstance(unlock, dict):
         return False
+    if not isinstance(sigil, str) or not isinstance(tid, str):
+        return False
     msg = unlock_message(sigil, tid)
 
     def field(name, kind):
