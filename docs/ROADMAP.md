@@ -7,11 +7,11 @@ Status legend: ⬜ not started · 🟨 in progress · ✅ done
 ## Phase 0: Harden v0
 | | Item | Why |
 |---|---|---|
-| 🟨 | [#2] Durable witness storage (write-ahead log; fsync before every vote, release or freeze) | A witness that crashes and forgets a vote can equivocate. This is the top safety gap for real deployment |
-| 🟨 | [#3] Safe pledge release in wallets after a failed seal | Today a seal rejected before binding leaves the coin unusable |
-| 🟨 | [#4] Model checker: membership rotation and multiple constellations | Extend the adversarial search beyond one charter and one constellation |
-| 🟨 | [#5] Fuzz the holder-side validator | Malicious dossiers must only ever produce `InvalidDossier` |
-| 🟨 | [#6] TLA+ specification of the witness protocol, checked with TLC | Machine-checked safety theorem, with a mutation check to show the model catches bugs |
+| ✅ | [#2] Durable witness storage (write-ahead log; fsync before every vote, release or freeze) | A witness that crashes and forgets a vote can equivocate. This is the top safety gap for real deployment |
+| ✅ | [#3] Safe pledge release in wallets after a failed seal | Today a seal rejected before binding leaves the coin unusable |
+| ✅ | [#4] Model checker: membership rotation and multiple constellations | Extend the adversarial search beyond one charter and one constellation |
+| ✅ | [#5] Fuzz the holder-side validator | Malicious dossiers must only ever produce `InvalidDossier` |
+| ✅ | [#6] TLA+ specification of the witness protocol, checked with TLC | Machine-checked safety theorem, with a mutation check to show the model catches bugs |
 | ⬜ | [#7] Deep confirmation (SPEC §9) implemented in the wallet | Detects long-range forgery by retired witnesses |
 
 ## Phase 1: Real network (#8)
