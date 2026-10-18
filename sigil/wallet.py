@@ -254,8 +254,30 @@ class Wallet:
     def transact(self, refs: list, outputs: list, *, extra_unlocks: dict | None = None, memo: str = "") -> str:
         header, body, _ = self.prepare(refs, outputs, memo)
         unlocks = self.authorise(header, body, extra_unlocks)
-        self.seal(header, body, unlocks)
+        try:
+            self.seal(header, body, unlocks)
+        except SealFailed:
+            for s, _g in header["inputs"]:
+                self.unpledge_if_unbound(s)
+            raise
         return self.finalise(header, body, unlocks)
+
+    def unpledge_if_unbound(self, sigil: str) -> bool:
+        """Drop a pledge only if every witness of the home provably holds no vote for it."""
+        pledge = self.pledged.get(sigil)
+        h = next((h for h in self.holdings.values() if h["sigil"] == sigil), None)
+        if pledge is None or h is None:
+            return False
+        gen, tid = pledge
+        for w in self.network.all_witnesses(h["parcel"]["home"]):
+            if w.pk in self.network.down:
+                return False  # unreachable: it might hold a vote
+            st = w.status(sigil)
+            if (st["gen"] == gen and st["tid"] == tid) or any(
+                    v["gen"] == gen and v["tid"] == tid for v in st["votes"]):
+                return False
+        del self.pledged[sigil]
+        return True
 
     # -------------------------------------------------------------- recovery
 

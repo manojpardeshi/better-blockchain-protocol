@@ -89,7 +89,6 @@ try:
     carol.transact([held["ref"]], out)
 except SealFailed:
     print("carol's time-locked parcel cannot move yet")
-carol.pledged.clear()
 net.clock.advance(86_400)
 carol.transact([held["ref"]], out)
 print("one day later (by the witnesses' clocks) it moves")
