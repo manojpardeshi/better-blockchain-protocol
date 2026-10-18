@@ -111,6 +111,8 @@ A death proof for transition `(header, tid)` names an input `[s, g] ∈ header.i
 
 Per sigil, a witness stores `Record{gen=0, tid=null, header=null, vote=null, log=[], votes=[]}`.
 
+A witness MUST make its records (and its frozen flag) durable before it releases a SPEND vote, a RELEASE result or a FREEZE response, so that a crash and restart can never lead it to vote twice at one `(sigil, gen)`.
+
 ### 5.1 SPEND(req)
 `req = {sigil, header, home, lock, salt, unlock, stamp?}`
 

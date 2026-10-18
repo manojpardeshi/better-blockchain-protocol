@@ -10,9 +10,13 @@ Per sigil an honest witness keeps a generation counter and at most one
 binding per generation. It votes at most once per ``(sigil, generation)``.
 A binding is only abandoned (generation bumped) when shown a death proof
 that the bound transition can never be sealed. See docs/SPEC.md §5.
+
+With a ``store`` (``sigil.store.WitnessStore``) every state change is made
+durable *before* the witness answers, and a restarted witness reloads it,
+so a crash can never make it forget a vote and equivocate.
 """
 
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 
 from .charter import Registry, charter_hash, sign_charter
 from .crypto import KeyPair
@@ -20,6 +24,7 @@ from .locks import evaluate
 from .model import sigil_of, transition_id, vote_payload
 from .proofs import proves_dead
 from .stamps import StampMint
+from .store import WitnessStore
 
 
 class Rejected(Exception):
@@ -46,6 +51,10 @@ class Record:
     log: list = field(default_factory=list)    # evidence handed to successors on rotation
     votes: list = field(default_factory=list)  # every vote we ever cast on this sigil
 
+    def copy(self) -> "Record":
+        """A working copy; log entries are never mutated, so the lists are copied shallowly."""
+        return Record(self.gen, self.tid, self.header, self.vote, list(self.log), list(self.votes))
+
 
 def authorises(sigil: str, auth: dict) -> tuple[int, str] | None:
     """Validate an owner authorisation; return the (gen, tid) it binds, or None."""
@@ -69,7 +78,8 @@ def authorises(sigil: str, auth: dict) -> tuple[int, str] | None:
 
 
 class Witness:
-    def __init__(self, kp: KeyPair, registry: Registry, clock, *, stamp_mint: StampMint | None = None):
+    def __init__(self, kp: KeyPair, registry: Registry, clock, *, stamp_mint: StampMint | None = None,
+                 store: WitnessStore | None = None):
         self.kp = kp
         self.pk = kp.pk
         self.registry = registry
@@ -79,13 +89,44 @@ class Witness:
         self.version: int | None = None
         self.frozen = False
         self.records: dict[str, Record] = {}
+        self.store = store
+        if store is not None:
+            self._restore()
+
+    # ------------------------------------------------------------ durability
+
+    def _restore(self) -> None:
+        state = self.store.load()
+        if state["pk"] is None:
+            self.store.append([("pk", "", self.pk)])
+        elif state["pk"] != self.pk:
+            raise ValueError("store belongs to a different witness key")
+        if state["member"] is not None:
+            self.cid, self.version = state["member"]
+        self.frozen = state["frozen"]
+        self.records = {s: Record(**r) for s, r in state["records"].items()}
+        if self.stamps is not None:
+            self.stamps.mark_redeemed(state["stamps"])
+
+    def _persist(self, *entries: tuple[str, str, object]) -> None:
+        """Make ``entries`` durable (no-op without a store). Callers mutate state only afterwards."""
+        if self.store is not None:
+            self.store.append(list(entries))
+
+    @staticmethod
+    def _rec(sigil: str, rec: Record) -> tuple[str, str, dict]:
+        return ("record", sigil, asdict(rec))
 
     # ------------------------------------------------------------ membership
 
-    def join(self, cid: str, version: int) -> None:
+    def _check_member(self, cid: str, version: int) -> None:
         charter = self.registry.charter(cid, version)
         if charter is None or self.pk not in charter["witnesses"]:
             raise ValueError("not a member of this charter")
+
+    def join(self, cid: str, version: int) -> None:
+        self._check_member(cid, version)
+        self._persist(("member", "", [cid, version]))
         self.cid, self.version = cid, version
 
     def _vote(self, sigil: str, gen: int, tid: str) -> dict:
@@ -105,8 +146,10 @@ class Witness:
         """
         if self.cid is None or self.frozen:
             raise Rejected("witness not active")
-        if self.stamps is not None and not self.stamps.redeem(req.get("stamp")):
-            raise Rejected("missing or spent stamp")
+        if self.stamps is not None:
+            if not self.stamps.redeem(req.get("stamp")):
+                raise Rejected("missing or spent stamp")
+            self._persist(("stamp", req["stamp"]["serial"], True))
         sigil = req.get("sigil")
         if req.get("home") != self.cid:
             raise Rejected("sigil does not live here")
@@ -120,7 +163,8 @@ class Witness:
         if not evaluate(auth["lock"], auth["unlock"], sigil, tid, int(self.clock())):
             raise Rejected("lock not satisfied now")
 
-        rec = self.records.setdefault(sigil, Record())
+        old = self.records.get(sigil)
+        rec = old.copy() if old is not None else Record()
         if gen < rec.gen:
             raise Rejected("stale generation")
         if gen > rec.gen:
@@ -135,6 +179,9 @@ class Witness:
         if rec.vote is None:
             rec.vote = self._vote(sigil, gen, tid)
             rec.votes.append(rec.vote)
+        if rec != old:
+            self._persist(self._rec(sigil, rec))  # durable before the vote leaves
+            self.records[sigil] = rec
         return rec.vote
 
     # --------------------------------------------------------------- release
@@ -153,9 +200,12 @@ class Witness:
             raise Rejected("nothing to release")
         if not proves_dead(rec.header, rec.tid, proof, self.registry):
             raise Rejected("invalid death proof")
+        rec = rec.copy()
         rec.log.append({"kind": "release", "gen": rec.gen, "tid": rec.tid, "header": rec.header, "proof": proof})
         rec.gen += 1
         rec.tid = rec.header = rec.vote = None
+        self._persist(self._rec(sigil, rec))
+        self.records[sigil] = rec
         return rec.gen
 
     # ----------------------------------------------------------------- query
@@ -182,6 +232,7 @@ class Witness:
             raise Rejected("witness not active")
         if next_charter["prev"] != charter_hash(self.registry.charter(self.cid, self.version)):
             raise Rejected("charter does not extend ours")
+        self._persist(("frozen", "", True))
         self.frozen = True
         return sign_charter(self.kp, next_charter), {s: list(r.log) for s, r in self.records.items()}
 
@@ -193,7 +244,8 @@ class Witness:
         predecessor can omit evidence (covered by the union) but never
         invent it.
         """
-        self.join(cid, version)
+        self._check_member(cid, version)
+        records: dict[str, Record] = {}
         evidence: dict[str, list] = {}
         for snap in snapshots:
             for sigil, log in snap.items():
@@ -225,4 +277,9 @@ class Witness:
                 rec.gen, rec.tid, rec.header = g, t, h
             elif len(alive) > 1:
                 rec.tid = CONTESTED  # the owner signed two live spends before rotation
-            self.records[sigil] = rec
+            records[sigil] = rec
+        # Membership and inherited records land in one atomic batch: a crash
+        # must never leave us active but missing a binding.
+        self._persist(("member", "", [cid, version]), *(self._rec(s, r) for s, r in records.items()))
+        self.cid, self.version = cid, version
+        self.records.update(records)
