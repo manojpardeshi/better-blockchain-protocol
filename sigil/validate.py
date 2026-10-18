@@ -55,7 +55,7 @@ class Dossier:
         if tx is None:
             raise InvalidDossier(f"missing transition {r['tx'][:12]}")
         outs = tx["body"]["outputs"]
-        if not isinstance(r["i"], int) or not 0 <= r["i"] < len(outs):
+        if not isinstance(r["i"], int) or isinstance(r["i"], bool) or not 0 <= r["i"] < len(outs):
             raise InvalidDossier("output index out of range")
         p = dict(outs[r["i"]])
         p["asset"] = resolve_asset(p["asset"], r["tx"])
@@ -122,6 +122,11 @@ class TrustPolicy:
         return True
 
 
+# Anything a hostile dossier can provoke while being walked; always reported
+# as InvalidDossier, never leaked to the caller.
+_MALFORMED = (KeyError, TypeError, ValueError, AttributeError, IndexError, RecursionError)
+
+
 def _amount_ok(x) -> bool:
     return isinstance(x, int) and not isinstance(x, bool) and x > 0
 
@@ -140,32 +145,50 @@ class Verifier:
         self._epoch = policy.epoch
 
     def verify_parcel(self, dossier: Dossier, r: dict) -> dict:
-        for cid, chain in dossier.charters.items():
-            try:
-                self.policy.registry.add_chain(cid, chain)  # ignores chains we already know
-            except ValueError as e:
-                raise InvalidDossier(str(e)) from e
-        self.verify_transition(dossier, r["tx"])
-        return dossier.output(r)
+        try:
+            for cid, chain in dossier.charters.items():
+                try:
+                    self.policy.registry.add_chain(cid, chain)  # ignores chains we already know
+                except ValueError as e:
+                    raise InvalidDossier(str(e)) from e
+            self._verify(dossier, r["tx"])
+            return dossier.output(r)
+        except _MALFORMED as e:
+            raise InvalidDossier(f"malformed dossier: {type(e).__name__}") from e
 
     def verify_transition(self, dossier: Dossier, tid: str) -> None:
+        try:
+            self._verify(dossier, tid)
+        except _MALFORMED as e:
+            raise InvalidDossier(f"malformed dossier: {type(e).__name__}") from e
+
+    def _verify(self, dossier: Dossier, tid: str) -> None:
         if self._epoch != self.policy.epoch:  # trust changed: re-verify from scratch
             self._ok.clear()
             self._epoch = self.policy.epoch
-        stack = [tid]
+        if not isinstance(tid, str):
+            raise InvalidDossier("transition id must be a string")
+        stack, expanded = [tid], set()
         while stack:
             cur = stack[-1]
             if cur in self._ok:
                 stack.pop()
                 continue
             tx = dossier.transitions.get(cur)
-            if tx is None:
+            if not isinstance(tx, dict):
                 raise InvalidDossier(f"missing transition {cur[:12]}")
             try:
                 pending = [r["tx"] for r in tx["body"]["inputs"] if r["tx"] not in self._ok]
             except (KeyError, TypeError) as e:
                 raise InvalidDossier("malformed inputs") from e
+            if not all(isinstance(p, str) for p in pending):
+                raise InvalidDossier("malformed inputs")
             if pending:
+                # Ancestors were pushed once already and are still not
+                # verified: the history loops back on itself.
+                if cur in expanded:
+                    raise InvalidDossier(f"cyclic history at {cur[:12]}")
+                expanded.add(cur)
                 stack.extend(pending)
                 continue
             self._check(dossier, cur, tx)
@@ -183,8 +206,8 @@ class Verifier:
             if b["genesis"] is not None:
                 return self._check_genesis(b, h)
             self._check_spend(d, tid, h, b, unlocks)
-        except (KeyError, TypeError, ValueError) as e:
-            raise InvalidDossier(f"malformed transition: {e}") from e
+        except _MALFORMED as e:
+            raise InvalidDossier(f"malformed transition: {type(e).__name__}") from e
 
     @staticmethod
     def _parcel_ok(o: dict) -> bool:
