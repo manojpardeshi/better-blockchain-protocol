@@ -42,12 +42,16 @@ class StampMint:
         return pow(blinded, self._d, self.n)
 
     def redeem(self, stamp) -> bool:
-        if not isinstance(stamp, dict) or stamp.get("serial") in self._redeemed:
+        if not isinstance(stamp, dict) or not isinstance(stamp.get("serial"), str) or stamp["serial"] in self._redeemed:
             return False
         if not verify_stamp(self.public, stamp):
             return False
         self._redeemed.add(stamp["serial"])
         return True
+
+    def mark_redeemed(self, serials) -> None:
+        """Restore serials redeemed before a restart (see ``sigil.store``)."""
+        self._redeemed.update(serials)
 
 
 def blind(public: dict, serial: str) -> tuple[int, int]:
