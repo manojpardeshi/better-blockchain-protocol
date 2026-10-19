@@ -60,6 +60,23 @@ alice.pay(bob, usd, 250)                # sealed in one round trip, verified by 
 assert bob.balance(usd) == 250
 ```
 
+## CLI quickstart
+
+A file-based wallet for a real network (`sigil/cli.py`). `directory.json` lists witness URLs per constellation (see [docs/WIRE.md](docs/WIRE.md)). Every command prints JSON.
+
+```sh
+S="python -m sigil.cli --directory directory.json"
+$S --wallet alice init --home <cid>
+$S --wallet bob   init --home <cid>
+$S --wallet alice issue USD 1000                  # -> {"asset": "<id>", ...}
+$S --wallet bob   address > bob-addr.json         # bob gives this to alice
+$S --wallet alice pay bob-addr.json <id> 300 --out payment.json
+$S --wallet bob   receive payment.json [--deep]   # verifies, then takes custody
+$S --wallet bob   balance; $S --wallet bob assets; $S --wallet bob export-dossier
+```
+
+Payments are handed from holder to holder as files; no server stores them. Receiving the same payment twice is a no-op; a tampered or already-spent payment is rejected. **Back up the wallet directory**: it holds your key seeds and your dossier, and in Sigil the dossier is the money. There is no ledger to recover it from.
+
 ## Repository layout
 
 | Path | What |

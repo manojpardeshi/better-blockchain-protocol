@@ -107,6 +107,7 @@ class Wallet:
         self.policy = TrustPolicy(network.registry, trusted)
         self.verifier = Verifier(self.policy)
         self.keys: dict[str, KeyPair] = {}
+        self.seeds: dict[str, str] = {}       # pk -> hex seed (KeyPair.from_seed), for persistence
         self.dossier = Dossier()
         self.holdings: dict[str, dict] = {}   # parcel id -> {"ref", "parcel", "sigil", "gen"}
         self.pledged: dict[str, tuple] = {}   # sigil -> (gen, tid) we authorised; never sign twice
@@ -123,8 +124,10 @@ class Wallet:
     # ------------------------------------------------------------- receiving
 
     def fresh_key(self) -> KeyPair:
-        kp = KeyPair.generate()
+        seed = secrets.token_hex(32)
+        kp = KeyPair.from_seed(bytes.fromhex(seed))
         self.keys[kp.pk] = kp
+        self.seeds[kp.pk] = seed
         return kp
 
     def address(self, home: str | None = None, lock: dict | None = None) -> dict:
