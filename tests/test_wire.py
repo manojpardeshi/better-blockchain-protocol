@@ -1,14 +1,17 @@
 """Wallets talking to witnesses over real HTTP (wire protocol v0)."""
 
 import json
+import tempfile
 import unittest
 import urllib.request
 
-from sigil import InvalidDossier, Network, SealFailed, Wallet
+from sigil import InvalidDossier, KeyPair, Network, SealFailed, Wallet
 from sigil import model
+from sigil.charter import charter_body, constellation_id
 from sigil.server import RemoteNetwork, RemoteWitness, WitnessServer
+from sigil.store import WitnessStore
 from sigil.swap import atomic_swap
-from sigil.witness import Conflict, Rejected
+from sigil.witness import Conflict, Rejected, Witness
 from tests.test_security import manual_spend
 
 
@@ -22,6 +25,23 @@ class WireTests(unittest.TestCase):
                         for cid in (self.X, self.Y)}
         self.addCleanup(lambda: [s.stop() for ss in self.servers.values() for s in ss])
         self.net = RemoteNetwork({cid: [s.url for s in ss] for cid, ss in self.servers.items()})
+
+    def test_durable_witness_serves_over_http(self):
+        """Regression: a store opened on one thread must serve the handler threads."""
+        sim = Network()
+        kp = KeyPair.generate()
+        body = charter_body("durable", 0, [kp.pk], None)
+        cid = constellation_id(body)
+        sim.registry.add_chain(cid, [{"body": body, "sigs": {}}])
+        w = Witness(kp, sim.registry, sim.clock, store=WitnessStore(f"{tempfile.mkdtemp()}/w.db"))
+        w.join(cid, 0)
+        srv = WitnessServer(w).start()
+        self.addCleanup(srv.stop)
+        net = RemoteNetwork({cid: [srv.url]})
+        alice, bob = Wallet("alice", net, cid), Wallet("bob", net, cid)
+        coin = alice.issue("C", 5)
+        alice.pay(bob, coin, 2)
+        self.assertEqual(bob.balance(coin), 2)
 
     def test_charters_are_fetched_and_verified(self):
         self.assertEqual(self.net.registry.chain(self.X), self.sim.registry.chain(self.X))

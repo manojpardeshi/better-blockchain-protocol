@@ -19,7 +19,6 @@ import argparse
 import json
 import os
 import signal
-import sqlite3
 import sys
 import threading
 import time
@@ -107,35 +106,15 @@ def load_mint(path: str, bits: int = 2048) -> StampMint:
     """
     if not os.path.exists(path):
         mint = StampMint(bits)
-        _write_private(path, {"n": format(mint.n, "x"), "e": format(mint.e, "x"), "d": format(mint._d, "x")})
+        _write_private(path, {k: format(v, "x") for k, v in mint.numbers().items()})
         return mint
     with open(path) as f:
         k = json.load(f)
-    mint = StampMint.__new__(StampMint)  # StampMint has no load-from-numbers constructor
-    mint.n, mint.e, mint._d = int(k["n"], 16), int(k["e"], 16), int(k["d"], 16)
-    mint._redeemed = set()  # redeemed serials come back from the witness store
-    return mint
+    # Redeemed serials come back from the witness store.
+    return StampMint.from_numbers(int(k["n"], 16), int(k["e"], 16), int(k["d"], 16))
 
 
 # --------------------------------------------------------------------- run
-
-class ServedStore(WitnessStore):
-    """A ``WitnessStore`` usable from the HTTP server's handler threads.
-
-    ``WitnessStore`` opens its SQLite connection in the default
-    same-thread-only mode, but ``WitnessServer`` answers each request on a
-    new thread (one call at a time, under its lock). Same durability
-    settings: WAL, ``synchronous=FULL``, one transaction per append.
-    TODO: drop this once ``WitnessStore`` passes ``check_same_thread=False``.
-    """
-
-    def __init__(self, path: str):
-        super().__init__(path)
-        self.db.close()
-        self.db = sqlite3.connect(path, isolation_level=None, check_same_thread=False)
-        self.db.execute("PRAGMA journal_mode=WAL")
-        self.db.execute("PRAGMA synchronous=FULL")
-
 
 def build_witness(key: str, registry: str, cid: str, store: str, stamps: bool = False) -> Witness:
     kp = load_key(key)
@@ -143,7 +122,7 @@ def build_witness(key: str, registry: str, cid: str, store: str, stamps: bool = 
     if cid not in reg:
         raise SystemExit(f"constellation {cid} is not in {registry}")
     mint = load_mint(store + ".stamps.json") if stamps else None
-    w = Witness(kp, reg, lambda: int(time.time()), stamp_mint=mint, store=ServedStore(store))
+    w = Witness(kp, reg, lambda: int(time.time()), stamp_mint=mint, store=WitnessStore(store))
     if w.cid is None:
         # First start: join the newest charter version that lists us.
         chain = reg.chain(cid)

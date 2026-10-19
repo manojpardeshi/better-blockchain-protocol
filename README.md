@@ -43,7 +43,7 @@ Requires Python ≥ 3.10 and the `cryptography` package.
 ```bash
 pip install cryptography
 python3 examples/demo.py             # guided tour: payments, blindness, double-spend, swaps, timelocks, rotation
-python3 -m unittest discover -v      # 75 tests, including fuzzing and adversarial model checking
+python3 -m unittest discover -v      # 100 tests, including fuzzing, model checking and a multi-process testnet
 SIGIL_MODEL_SEEDS=3000 SIGIL_MODEL_STEPS=200 python3 -m unittest tests.test_model_check   # deeper search
 ```
 

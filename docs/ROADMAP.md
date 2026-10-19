@@ -17,11 +17,11 @@ Status legend: ⬜ not started · 🟨 in progress · ✅ done
 ## Phase 1: Real network (#8)
 | | Item |
 |---|---|
-| ⬜ | Wire protocol: message schemas (protobuf/CBOR) over HTTP/2 or QUIC |
-| ⬜ | Witness server daemon with a durable store |
-| ⬜ | Wallet CLI: keys, receive, pay, balance, dossier export and import |
-| ⬜ | Gossip for charters and equivocation proofs |
-| ⬜ | Multi-process local testnet (docker-compose) and a crash/restart harness |
+| ✅ | Wire protocol v0: JSON over HTTP (`docs/WIRE.md`); binary encoding over HTTP/2 or QUIC moves to Phase 2 |
+| ✅ | Witness server daemon with a durable store (`python -m sigil.witnessd`) |
+| ✅ | Wallet CLI: keys, receive, pay, balance, dossier export and import (`python -m sigil.cli`) |
+| ✅ | Gossip for charters and equivocation proofs (`sigil/gossip.py`) |
+| ✅ | Multi-process local testnet and a SIGKILL crash/restart harness (`testnet/`); docker-compose written but not yet run |
 
 ## Phase 2: Performance, Rust (#9)
 | | Item |
