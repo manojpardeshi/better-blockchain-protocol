@@ -88,6 +88,14 @@ def find_death_proof(network: Network, header: dict, tid: str, parcels: dict) ->
     return None
 
 
+def _status(w, sigil: str) -> dict | None:
+    """A witness's STATUS for ``sigil``, or None if it could not be asked."""
+    try:
+        return w.status(sigil)
+    except Rejected:
+        return None
+
+
 class Wallet:
     def __init__(self, name: str, network: Network, home: str | None = None, *, trusted=None,
                  deep_threshold: int | None = None):
@@ -106,6 +114,11 @@ class Wallet:
 
     def __repr__(self):
         return f"Wallet({self.name})"
+
+    def _size(self, cid: str) -> int:
+        """Members of a constellation's current charter (not just those reachable)."""
+        charter = self.network.registry.latest(cid)
+        return len(charter["witnesses"]) if charter else len(self.network.all_witnesses(cid))
 
     # ------------------------------------------------------------- receiving
 
@@ -135,8 +148,9 @@ class Wallet:
             if not keys_in(p["lock"]) & set(self.keys):
                 raise InvalidDossier("parcel is not addressed to us")
             s = model.sigil_of(p)
-            bound = sum(1 for w in self.network.witnesses(p["home"]) if w.status(s)["tid"] is not None)
-            if bound > faults(len(self.network.all_witnesses(p["home"]))):
+            bound = sum(1 for w in self.network.witnesses(p["home"])
+                        if (_status(w, s) or {}).get("tid") is not None)
+            if bound > faults(self._size(p["home"])):
                 raise InvalidDossier("parcel's sigil is already consumed")
             self.dossier.merge(dossier)
             self.holdings[model.parcel_id(r)] = {"ref": r, "parcel": p, "sigil": s, "gen": 0}
@@ -168,7 +182,9 @@ class Wallet:
                 for w in self.network.witnesses(home):
                     if w.pk not in current:
                         continue
-                    st = w.status(s)
+                    st = _status(w, s)
+                    if st is None:
+                        continue
                     if st["gen"] == g and st["tid"] == tid:
                         ok += 1
                 if ok <= faults(len(current)):
@@ -320,13 +336,18 @@ class Wallet:
         if pledge is None or h is None:
             return False
         gen, tid = pledge
-        for w in self.network.all_witnesses(h["parcel"]["home"]):
-            if w.pk in self.network.down:
+        home = h["parcel"]["home"]
+        answered = 0
+        for w in self.network.all_witnesses(home):
+            st = None if w.pk in self.network.down else _status(w, sigil)
+            if st is None:
                 return False  # unreachable: it might hold a vote
-            st = w.status(sigil)
             if (st["gen"] == gen and st["tid"] == tid) or any(
                     v["gen"] == gen and v["tid"] == tid for v in st["votes"]):
                 return False
+            answered += 1
+        if answered < self._size(home):
+            return False  # some member could not even be contacted
         del self.pledged[sigil]
         return True
 
@@ -350,7 +371,7 @@ class Wallet:
                     gens.append(w.release(s, proof))
                 except Rejected:
                     pass
-            if len(gens) >= quorum(len(self.network.all_witnesses(home))):
+            if len(gens) >= quorum(self._size(home)):
                 h["gen"] = max(gens)
                 del self.pledged[s]
                 released.append(s)

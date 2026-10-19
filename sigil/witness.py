@@ -147,6 +147,8 @@ class Witness:
         """
         if self.cid is None or self.frozen:
             raise Rejected("witness not active")
+        if not isinstance(req, dict):
+            raise Rejected("malformed request")
         if self.stamps is not None:
             if not self.stamps.redeem(req.get("stamp")):
                 raise Rejected("missing or spent stamp")
