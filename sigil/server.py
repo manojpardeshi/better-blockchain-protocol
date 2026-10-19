@@ -19,9 +19,11 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from .charter import Registry
+from .gossip import GossipStore
 from .witness import Conflict, Rejected, Witness
 
 MAX_BODY = 1 << 20
+MAX_RESPONSE = 16 << 20   # largest gossip snapshot a client reads from one witness
 
 
 # ------------------------------------------------------------------ server
@@ -32,6 +34,9 @@ class WitnessServer:
     def __init__(self, witness: Witness, host: str = "127.0.0.1", port: int = 0):
         self.witness = witness
         self._lock = threading.Lock()
+        # Gossip shares the witness's registry: a verified rotation learned
+        # by gossip is immediately what the witness serves and checks against.
+        self.gossip = GossipStore(witness.registry)
         server = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -44,6 +49,11 @@ class WitnessServer:
                 if self.path == "/v0/charters":
                     reg = server.witness.registry
                     return self._reply(200, {"ok": {cid: reg.chain(cid) for cid in reg.ids()}})
+                if self.path == "/v0/proofs":
+                    with server._lock:
+                        snap = {"proofs": list(server.gossip.proofs.values()),
+                                "forks": list(server.gossip.forks.values())}
+                    return self._reply(200, {"ok": snap})
                 self._reply(404, {"error": "bad_request", "message": "unknown path", "vote": None})
 
             def do_POST(self):
@@ -99,6 +109,8 @@ class WitnessServer:
                 return w.status(body["sigil"])
             if method == "sell_stamp":
                 return format(w.sell_stamp(int(body["blinded"], 16)), "x")
+            if method == "gossip":
+                return self.gossip.merge(body)
         raise ValueError(f"unknown method {method!r}")
 
     def start(self) -> "WitnessServer":
@@ -139,6 +151,7 @@ class RemoteWitness:
     def __init__(self, url: str, timeout: float = 5.0):
         self.url = url.rstrip("/")
         self.timeout = timeout
+        self.max_response = MAX_RESPONSE  # gossip pulls only: a peer cannot make us buffer more
         info = self._get("info")
         self.pk, self.cid, self.version = info["pk"], info["constellation"], info["version"]
         self.stamps = _RemoteStamps(_pub_in(info["stamps"])) if info["stamps"] else None
@@ -184,6 +197,35 @@ class RemoteWitness:
 
     def charters(self) -> dict:
         return self._get("charters")
+
+    # Gossip (docs/WIRE.md "Gossip"). Nothing pulled is trusted: the caller
+    # admits it through a ``GossipStore``, which verifies every item.
+
+    def _get_capped(self, path: str):
+        try:
+            with urllib.request.urlopen(f"{self.url}/v0/{path}", timeout=self.timeout) as r:
+                data = r.read(self.max_response + 1)
+            if len(data) > self.max_response:
+                raise ValueError("response too large")
+            return json.loads(data)["ok"]
+        except (urllib.error.URLError, OSError, ValueError, KeyError, TypeError) as e:
+            raise Unreachable(f"{self.url}: {e}") from e
+
+    def proofs(self) -> dict:
+        """The ``{proofs, forks}`` the witness holds."""
+        return self._get_capped("proofs")
+
+    def pull(self) -> dict:
+        """Everything the witness can gossip: ``{charters, proofs, forks}``."""
+        out = self._get_capped("proofs")
+        if not isinstance(out, dict):
+            raise Unreachable(f"{self.url}: malformed proofs reply")
+        out["charters"] = self._get_capped("charters")
+        return out
+
+    def gossip(self, msg: dict) -> dict:
+        """Offer ``{charters, proofs, forks}``; returns the counts the witness accepted."""
+        return self._call("gossip", msg)
 
 
 class RemoteNetwork:
