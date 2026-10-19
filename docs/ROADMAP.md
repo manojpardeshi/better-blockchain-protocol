@@ -12,7 +12,7 @@ Status legend: ⬜ not started · 🟨 in progress · ✅ done
 | ✅ | [#4] Model checker: membership rotation and multiple constellations | Extend the adversarial search beyond one charter and one constellation |
 | ✅ | [#5] Fuzz the holder-side validator | Malicious dossiers must only ever produce `InvalidDossier` |
 | ✅ | [#6] TLA+ specification of the witness protocol, checked with TLC | Machine-checked safety theorem, with a mutation check to show the model catches bugs |
-| ⬜ | [#7] Deep confirmation (SPEC §9) implemented in the wallet | Detects long-range forgery by retired witnesses |
+| ✅ | [#7] Deep confirmation (SPEC §9) implemented in the wallet | Detects long-range forgery by retired witnesses |
 
 ## Phase 1: Real network (#8)
 | | Item |
