@@ -43,7 +43,7 @@ Requires Python ≥ 3.10 and the `cryptography` package.
 ```bash
 pip install cryptography
 python3 examples/demo.py             # guided tour: payments, blindness, double-spend, swaps, timelocks, rotation
-python3 -m unittest discover -v      # 41 tests, including adversarial model checking
+python3 -m unittest discover -v      # 75 tests, including fuzzing and adversarial model checking
 SIGIL_MODEL_SEEDS=3000 SIGIL_MODEL_STEPS=200 python3 -m unittest tests.test_model_check   # deeper search
 ```
 
@@ -75,7 +75,7 @@ assert bob.balance(usd) == 250
 | `sigil/charter.py` | Constellation charters and membership rotation |
 | `sigil/stamps.py` | Blind RSA stamps for paying witnesses |
 | `sigil/network.py` | In-process simulated network with fault injection |
-| `tests/` | Payments, security, recovery, rotation, adversarial model checking |
+| `tests/` | Payments, security, recovery, rotation, durability, deep confirmation, fuzzing, adversarial model checking |
 
 ## Status
 

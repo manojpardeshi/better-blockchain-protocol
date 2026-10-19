@@ -89,8 +89,11 @@ def find_death_proof(network: Network, header: dict, tid: str, parcels: dict) ->
 
 
 class Wallet:
-    def __init__(self, name: str, network: Network, home: str | None = None, *, trusted=None):
+    def __init__(self, name: str, network: Network, home: str | None = None, *, trusted=None,
+                 deep_threshold: int | None = None):
         self.name = name
+        self.deep_threshold = deep_threshold  # receipts this large get deep confirmation (None: never)
+        self._confirmed: set[tuple] = set()   # (sigil, gen, tid) already deep-confirmed
         self.network = network
         self.home = home
         self.policy = TrustPolicy(network.registry, trusted)
@@ -116,11 +119,17 @@ class Wallet:
         home = home or self.home
         return {"home": home, "lock": lock or locks.sig(self.fresh_key().pk), "salt": secrets.token_hex(16)}
 
-    def receive(self, dossier: Dossier, refs: list) -> list:
-        """Verify incoming parcels end-to-end and take custody of them."""
+    def receive(self, dossier: Dossier, refs: list, *, deep: bool | None = None) -> list:
+        """Verify incoming parcels end-to-end and take custody of them.
+
+        ``deep`` forces deep confirmation on or off; by default it runs for
+        parcels of at least ``deep_threshold``.
+        """
         received = []
         for r in refs:
             p = self.verifier.verify_parcel(dossier, r)
+            if deep or (deep is None and self.deep_threshold is not None and p["amount"] >= self.deep_threshold):
+                self.deep_confirm(dossier, [r["tx"]])
             if not self.policy.trusts(p["home"]):
                 raise InvalidDossier("parcel lives in a constellation we do not trust")
             if not keys_in(p["lock"]) & set(self.keys):
@@ -133,6 +142,38 @@ class Wallet:
             self.holdings[model.parcel_id(r)] = {"ref": r, "parcel": p, "sigil": s, "gen": 0}
             received.append(p)
         return received
+
+    def deep_confirm(self, dossier: Dossier, tids) -> None:
+        """Check a dossier's history against the *current* witnesses (SPEC §9).
+
+        Seals stay valid after their charter is retired, so retired witness
+        keys, colluding with an owner, could forge a seal for a sigil that was
+        really consumed elsewhere. For every consumed input in the ancestry of
+        ``tids`` we ask the current members of its home and require at least
+        ``f + 1`` of them to report the sigil bound to the claimed transition
+        at the claimed generation: at least one honest current witness vouches
+        for it, and honest witnesses inherit every real binding on rotation.
+        """
+        anc = dossier.ancestry(tids)
+        for tid, tx in anc.transitions.items():
+            for r, (s, g) in zip(tx["body"]["inputs"], tx["header"]["inputs"]):
+                if (s, g, tid) in self._confirmed:
+                    continue
+                home = dossier.output(r)["home"]
+                members = self.network.registry.latest(home)
+                if members is None:
+                    raise InvalidDossier(f"unknown constellation {home[:12]}")
+                current = set(members["witnesses"])
+                ok = 0
+                for w in self.network.witnesses(home):
+                    if w.pk not in current:
+                        continue
+                    st = w.status(s)
+                    if st["gen"] == g and st["tid"] == tid:
+                        ok += 1
+                if ok <= faults(len(current)):
+                    raise InvalidDossier(f"deep confirmation failed for {s[:12]} in {tid[:12]}")
+                self._confirmed.add((s, g, tid))
 
     def watch(self, dossier: Dossier, r: dict) -> dict:
         """Track a parcel we may be able to unlock under some condition (e.g. a bond)."""

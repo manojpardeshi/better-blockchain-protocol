@@ -200,7 +200,7 @@ To accept a received parcel, the holder MUST also trust its `home`.
 
 ## 9. Recommended policies (non-normative)
 
-* **Deep confirmation.** For high-value receipts, query the current charter's STATUS for each sigil in the dossier and require each to be bound to the claimed tid. This detects long-range forgery by retired witnesses.
+* **Deep confirmation.** Seals remain valid after their charter retires, so retired witness keys colluding with an owner could forge a seal for a sigil really consumed elsewhere (a long-range forgery). For high-value receipts, for every consumed input `[s, g]` of every transition `tid` in the received parcel's ancestry, query STATUS(s) at the *current* charter of `s`'s home and require at least *f*+1 current members to report `gen = g` and `tid` bound. With at most *f* faulty current members, at least one honest witness then vouches for the binding, and honest witnesses inherit every real binding on rotation (§5.4), so a forgery fails. Wallets cache confirmed `(s, g, tid)` triples. The reference wallet runs it for receipts at or above a configurable `deep_threshold`.
 * **Bond homes.** Home witness bonds in a constellation other than the witness's own, with unbonding longer than the witness's term plus the deep-confirmation horizon.
 * **Payment size.** Accept large payments only into homes with larger *n* and stronger bonds.
 
