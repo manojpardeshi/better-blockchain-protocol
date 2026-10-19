@@ -12,13 +12,13 @@ These are the only cryptographic facts the protocol relies on:
 
 from .charter import Registry, quorum
 from .crypto import verify
-from .model import vote_payload, votes_of_seal
+from .model import sigil_of, vote_payload, votes_of_seal
 
 
 def verify_vote(v: dict) -> bool:
     try:
         return verify(v["witness"], "vote", vote_payload(v), v["sig"])
-    except (KeyError, TypeError):
+    except (KeyError, TypeError, RecursionError):
         return False
 
 
@@ -44,7 +44,7 @@ def _counted_witnesses(votes: list, registry: Registry, convicted=frozenset()) -
 def verify_seal(seal: dict, registry: Registry, convicted=frozenset()) -> bool:
     try:
         counted, charter = _counted_witnesses(votes_of_seal(seal), registry, convicted)
-    except (KeyError, TypeError):
+    except (KeyError, TypeError, RecursionError):
         return False
     return charter is not None and len(counted) >= quorum(len(charter["witnesses"]))
 
@@ -55,7 +55,7 @@ def verify_equivocation(proof: dict) -> bool:
         a, b = proof["a"], proof["b"]
         same = all(a[k] == b[k] for k in ("witness", "constellation", "sigil", "gen"))
         return same and a["tid"] != b["tid"] and verify_vote(a) and verify_vote(b)
-    except (KeyError, TypeError):
+    except (KeyError, TypeError, RecursionError):
         return False
 
 
@@ -67,10 +67,20 @@ def proves_dead(header: dict, tid: str, proof: dict, registry: Registry) -> bool
     generation (``kind == "seal"``), or a quorum of witnesses voted for
     other transitions at that generation (``kind == "votes"``), then quorum
     intersection guarantees ``tid`` never collects a seal for that input.
+
+    The evidence only counts if it comes from the target sigil's *home*
+    constellation: the proof reveals the target's ``{home, lock, salt}``,
+    which must hash to the named sigil, so the home cannot be faked. A
+    seal from any other constellation (anyone can create one) proves
+    nothing about the target.
     """
     try:
         target, gen = proof["sigil"], proof["gen"]
         if [target, gen] not in header["inputs"]:
+            return False
+        p = proof["parcel"]
+        home = p["home"]
+        if sigil_of(p) != target:
             return False
         if proof["kind"] == "seal":
             seal = proof["seal"]
@@ -78,14 +88,16 @@ def proves_dead(header: dict, tid: str, proof: dict, registry: Registry) -> bool
                 seal["sigil"] == target
                 and seal["gen"] == gen
                 and seal["tid"] != tid
+                and seal["constellation"] == home
                 and verify_seal(seal, registry)
             )
         if proof["kind"] == "votes":
             votes = proof["votes"]
-            if any(v["sigil"] != target or v["gen"] != gen or v["tid"] == tid for v in votes):
+            if any(v["sigil"] != target or v["gen"] != gen or v["tid"] == tid
+                   or v["constellation"] != home for v in votes):
                 return False
             counted, charter = _counted_witnesses(votes, registry)
             return charter is not None and len(counted) >= quorum(len(charter["witnesses"]))
-    except (KeyError, TypeError):
+    except (KeyError, TypeError, RecursionError):
         return False
     return False

@@ -106,7 +106,7 @@ def well_formed(lock, depth: int = 0, budget: list | None = None) -> bool:
             return isinstance(lock["witness"], str) and len(lock) == 2
         if op in ("all", "any"):
             return (
-                isinstance(lock["of"], list) and lock["of"] and len(lock) == 2
+                isinstance(lock["of"], list) and len(lock["of"]) > 0 and len(lock) == 2
                 and all(well_formed(x, depth + 1, budget) for x in lock["of"])
             )
         if op == "never":
@@ -123,10 +123,17 @@ def evaluate(lock: dict, unlock: dict, sigil: str, tid: str, now: int | None) ->
     transition pass ``None``: time conditions were already enforced by the
     witnesses that sealed it and are treated as satisfied.
     """
-    if not well_formed(lock):
+    if not well_formed(lock) or not isinstance(unlock, dict):
+        return False
+    if not isinstance(sigil, str) or not isinstance(tid, str):
         return False
     msg = unlock_message(sigil, tid)
-    sigs = unlock.get("sigs", {})
+
+    def field(name, kind):
+        x = unlock.get(name)
+        return x if isinstance(x, kind) else kind()
+
+    sigs, preimages, equivocations = field("sigs", dict), field("preimages", dict), field("equivocations", list)
 
     def has_sig(pk):
         s = sigs.get(pk)
@@ -143,15 +150,16 @@ def evaluate(lock: dict, unlock: dict, sigil: str, tid: str, now: int | None) ->
         if op == "before":
             return now is None or now < node["t"]
         if op == "hash":
-            pre = unlock.get("preimages", {}).get(node["h"])
+            pre = preimages.get(node["h"])
             try:
                 return isinstance(pre, str) and hash_preimage(pre) == node["h"]
             except ValueError:
                 return False
         if op == "equivocation":
             return any(
-                p.get("a", {}).get("witness") == node["witness"] and verify_equivocation(p)
-                for p in unlock.get("equivocations", [])
+                isinstance(p.get("a"), dict) and p["a"].get("witness") == node["witness"]
+                and verify_equivocation(p)
+                for p in equivocations
                 if isinstance(p, dict)
             )
         if op == "all":

@@ -153,7 +153,6 @@ class WitnessTests(unittest.TestCase):
         out = [model.parcel(self.X, self.usd, 10, c["lock"], c["salt"])]
         with self.assertRaises(SealFailed):
             self.bob.transact([held["ref"]], out)
-        self.bob.pledged.clear()  # nothing was bound: the attempt left no trace
         self.net.clock.advance(3600)
         self.bob.transact([held["ref"]], out)
 
@@ -203,7 +202,6 @@ class WitnessTests(unittest.TestCase):
         coin = a.issue("C", 5)
         with self.assertRaises(SealFailed):
             a.pay(b, coin, 1)
-        a.pledged.clear()
         a.buy_stamps(X, 1)
         a.pay(b, coin, 1)
         # A stamp is single use.

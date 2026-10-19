@@ -55,16 +55,26 @@ def request_seal(network: Network, req: dict, stamp_for=None) -> dict:
     raise SealFailed(req["sigil"], [v for vs in by_version.values() for v in vs], conflicts)
 
 
-def find_death_proof(network: Network, header: dict, tid: str) -> dict | None:
-    """Look for evidence that ``tid`` can never be sealed."""
+def find_death_proof(network: Network, header: dict, tid: str, parcels: dict) -> dict | None:
+    """Look for evidence that ``tid`` can never be sealed.
+
+    ``parcels`` maps input sigils to their parcels (at least ``home``,
+    ``lock`` and ``salt``); a proof can only cite an input whose parcel we
+    know, because witnesses check the evidence comes from its home.
+    """
     for s, g in header["inputs"]:
+        if s not in parcels:
+            continue
+        p = parcels[s]
+        target = {"home": p["home"], "lock": p["lock"], "salt": p["salt"]}
         votes = [v for v in network.find_votes(s) if v["gen"] == g and verify_vote(v)]
         groups: dict[tuple, dict] = defaultdict(dict)
         for v in votes:
             if v["tid"] != tid:
                 groups[(v["constellation"], v["version"], v["tid"])][v["witness"]] = v
         for (cid, version, t), vs in groups.items():
-            proof = {"kind": "seal", "sigil": s, "gen": g, "seal": model.seal_from_votes(list(vs.values()))}
+            proof = {"kind": "seal", "sigil": s, "gen": g, "parcel": target,
+                     "seal": model.seal_from_votes(list(vs.values()))}
             if proves_dead(header, tid, proof, network.registry):
                 return proof
         others: dict[tuple, dict] = defaultdict(dict)
@@ -72,7 +82,7 @@ def find_death_proof(network: Network, header: dict, tid: str) -> dict | None:
             if v["tid"] != tid:
                 others[(v["constellation"], v["version"])][v["witness"]] = v
         for vs in others.values():
-            proof = {"kind": "votes", "sigil": s, "gen": g, "votes": list(vs.values())}
+            proof = {"kind": "votes", "sigil": s, "gen": g, "parcel": target, "votes": list(vs.values())}
             if proves_dead(header, tid, proof, network.registry):
                 return proof
     return None
@@ -254,15 +264,37 @@ class Wallet:
     def transact(self, refs: list, outputs: list, *, extra_unlocks: dict | None = None, memo: str = "") -> str:
         header, body, _ = self.prepare(refs, outputs, memo)
         unlocks = self.authorise(header, body, extra_unlocks)
-        self.seal(header, body, unlocks)
+        try:
+            self.seal(header, body, unlocks)
+        except SealFailed:
+            for s, _g in header["inputs"]:
+                self.unpledge_if_unbound(s)
+            raise
         return self.finalise(header, body, unlocks)
+
+    def unpledge_if_unbound(self, sigil: str) -> bool:
+        """Drop a pledge only if every witness of the home provably holds no vote for it."""
+        pledge = self.pledged.get(sigil)
+        h = next((h for h in self.holdings.values() if h["sigil"] == sigil), None)
+        if pledge is None or h is None:
+            return False
+        gen, tid = pledge
+        for w in self.network.all_witnesses(h["parcel"]["home"]):
+            if w.pk in self.network.down:
+                return False  # unreachable: it might hold a vote
+            st = w.status(sigil)
+            if (st["gen"] == gen and st["tid"] == tid) or any(
+                    v["gen"] == gen and v["tid"] == tid for v in st["votes"]):
+                return False
+        del self.pledged[sigil]
+        return True
 
     # -------------------------------------------------------------- recovery
 
     def abort(self, header: dict) -> list:
         """Recover our inputs from a transition that can never complete."""
         tid = model.transition_id(header)
-        proof = find_death_proof(self.network, header, tid)
+        proof = find_death_proof(self.network, header, tid, self._parcels_for(header))
         if proof is None:
             raise ValueError("no proof that the transition is dead")
         released = []
@@ -282,6 +314,17 @@ class Wallet:
                 del self.pledged[s]
                 released.append(s)
         return released
+
+    def _parcels_for(self, header: dict) -> dict:
+        """The parcels behind a header's input sigils, as far as our dossier knows them."""
+        wanted, found = {s for s, _ in header["inputs"]}, {}
+        for tid, tx in self.dossier.transitions.items():
+            for i in range(len(tx["body"]["outputs"])):
+                p = self.dossier.output(model.ref(tid, i))
+                s = model.sigil_of(p)
+                if s in wanted:
+                    found[s] = p
+        return found
 
     # ----------------------------------------------------------------- stamps
 
