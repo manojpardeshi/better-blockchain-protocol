@@ -1,0 +1,63 @@
+# A 4-witness Sigil constellation, one container per witness.
+#
+#   docker compose up -d --build
+#   docker compose run --rm --entrypoint cat init /net/directory.json > directory.json
+#   docker compose kill -s SIGKILL witness2 && docker compose start witness2   # crash + restart
+#   docker compose down        # keeps state; `down -v` wipes keys and stores
+#
+# `init` creates the keys, the genesis charter and directory.json once, in the
+# shared `net` volume. Each witness keeps its durable store in its own volume.
+# Witnesses are published on host ports 7001-7004. See testnet/README.md.
+
+x-witness: &witness
+  build: .
+  image: sigil-witness
+  depends_on:
+    init:
+      condition: service_completed_successfully
+  entrypoint: ["sh", "-c"]
+  restart: unless-stopped
+  stop_signal: SIGTERM
+  stop_grace_period: 10s
+
+services:
+  init:
+    build: .
+    image: sigil-witness
+    entrypoint: ["sh", "/app/testnet/docker-init.sh"]
+    environment:
+      N: "4"
+      NAME: orion
+    volumes:
+      - net:/net
+
+  witness1:
+    <<: *witness
+    command: ["exec python -m sigil.witnessd run --key /net/keys/w1.json --registry /net/registry.json --constellation $$(cat /net/cid) --store /data/witness.db --host 0.0.0.0 --port 7000"]
+    ports: ["127.0.0.1:7001:7000"]
+    volumes: ["net:/net:ro", "data1:/data"]
+
+  witness2:
+    <<: *witness
+    command: ["exec python -m sigil.witnessd run --key /net/keys/w2.json --registry /net/registry.json --constellation $$(cat /net/cid) --store /data/witness.db --host 0.0.0.0 --port 7000"]
+    ports: ["127.0.0.1:7002:7000"]
+    volumes: ["net:/net:ro", "data2:/data"]
+
+  witness3:
+    <<: *witness
+    command: ["exec python -m sigil.witnessd run --key /net/keys/w3.json --registry /net/registry.json --constellation $$(cat /net/cid) --store /data/witness.db --host 0.0.0.0 --port 7000"]
+    ports: ["127.0.0.1:7003:7000"]
+    volumes: ["net:/net:ro", "data3:/data"]
+
+  witness4:
+    <<: *witness
+    command: ["exec python -m sigil.witnessd run --key /net/keys/w4.json --registry /net/registry.json --constellation $$(cat /net/cid) --store /data/witness.db --host 0.0.0.0 --port 7000"]
+    ports: ["127.0.0.1:7004:7000"]
+    volumes: ["net:/net:ro", "data4:/data"]
+
+volumes:
+  net:
+  data1:
+  data2:
+  data3:
+  data4:
