@@ -28,7 +28,9 @@ from .encoding import canonical
 
 class WitnessStore:
     def __init__(self, path: str):
-        self.db = sqlite3.connect(path, isolation_level=None)
+        # Callers serialise access (WitnessServer holds one lock per witness),
+        # but its handler threads differ per request.
+        self.db = sqlite3.connect(path, isolation_level=None, check_same_thread=False)
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA synchronous=FULL")
         self.db.execute(

@@ -32,6 +32,18 @@ class StampMint:
         self.n, self.e, self._d = nums.public_numbers.n, nums.public_numbers.e, nums.d
         self._redeemed: set[str] = set()
 
+    @classmethod
+    def from_numbers(cls, n: int, e: int, d: int) -> "StampMint":
+        """Restore a mint from its saved key (stamps sold before a restart stay valid)."""
+        mint = cls.__new__(cls)
+        mint.n, mint.e, mint._d = n, e, d
+        mint._redeemed = set()
+        return mint
+
+    def numbers(self) -> dict:
+        """The private key, for the operator to persist (keep it secret)."""
+        return {"n": self.n, "e": self.e, "d": self._d}
+
     @property
     def public(self) -> dict:
         return {"n": self.n, "e": self.e}
