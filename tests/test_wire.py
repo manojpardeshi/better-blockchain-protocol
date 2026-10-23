@@ -58,10 +58,13 @@ class WireTests(unittest.TestCase):
         self.assertEqual((alice.balance(gold), bob.balance(usd)), (2, 400))
 
     def test_stamps_over_http(self):
-        alice, bob = Wallet("alice", self.net, self.Y), Wallet("bob", self.net, self.Y)
+        clock = self.sim.clock  # the witnesses' clock
+        alice, bob = Wallet("alice", self.net, self.Y, clock=clock), Wallet("bob", self.net, self.Y)
         coin = alice.issue("C", 5)
         with self.assertRaises(SealFailed):
             alice.pay(bob, coin, 1)
+        # The failed spend's pledge holds the coin until its authorisation expires.
+        clock.advance(alice.pledge_ttl + alice.max_skew + 1)
         alice.buy_stamps(self.Y, 1)
         alice.pay(bob, coin, 1)
 
@@ -88,7 +91,7 @@ class WireTests(unittest.TestCase):
             alice.pay(bob, usd, 3)
 
     def test_unreachable_witness_keeps_pledge(self):
-        alice = Wallet("alice", self.net, self.X)
+        alice = Wallet("alice", self.net, self.X, clock=self.sim.clock)
         usd = alice.issue("USD", 10)
         refs, _ = alice.select(usd, 10)
         a = alice.address()
@@ -96,7 +99,9 @@ class WireTests(unittest.TestCase):
         alice.authorise(header, body)
         s = header["inputs"][0][0]
         self.servers[self.X][3].stop()
+        self.sim.clock.advance(alice.pledge_ttl + alice.max_skew + 1)  # expiry alone is not enough
         self.assertFalse(alice.unpledge_if_unbound(s))  # can't prove the stopped witness holds no vote
+        self.assertIn(s, alice.pledged)
 
     def test_malformed_requests_are_rejected_not_crashing(self):
         url = self.servers[self.X][0].url

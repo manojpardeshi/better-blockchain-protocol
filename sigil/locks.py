@@ -54,21 +54,23 @@ def never() -> dict:
     return {"op": "never"}
 
 
-def empty_unlock() -> dict:
-    return {"sigs": {}, "preimages": {}, "equivocations": []}
+def empty_unlock(expires: int | None = None) -> dict:
+    return {"sigs": {}, "preimages": {}, "equivocations": [], "expires": expires}
 
 
 def merge_unlocks(*unlocks) -> dict:
     out = empty_unlock()
     for u in unlocks:
+        if out["expires"] is None:
+            out["expires"] = u.get("expires")
         out["sigs"].update(u.get("sigs", {}))
         out["preimages"].update(u.get("preimages", {}))
         out["equivocations"].extend(u.get("equivocations", []))
     return out
 
 
-def sign_unlock(kp: KeyPair, sigil: str, tid: str) -> str:
-    return kp.sign("unlock", unlock_message(sigil, tid))
+def sign_unlock(kp: KeyPair, sigil: str, tid: str, expires: int) -> str:
+    return kp.sign("unlock", unlock_message(sigil, tid, expires))
 
 
 def keys_in(lock: dict) -> set:
@@ -127,7 +129,7 @@ def evaluate(lock: dict, unlock: dict, sigil: str, tid: str, now: int | None) ->
         return False
     if not isinstance(sigil, str) or not isinstance(tid, str):
         return False
-    msg = unlock_message(sigil, tid)
+    msg = unlock_message(sigil, tid, unlock.get("expires"))
 
     def field(name, kind):
         x = unlock.get(name)

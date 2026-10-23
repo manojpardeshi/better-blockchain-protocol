@@ -13,12 +13,13 @@ from tests.adversary import Equivocator, Silent
 def manual_spend(wallet, refs, outputs, memo=""):
     """Build and sign a transition *without* the wallet's anti-equivocation guard."""
     header, body, tid = wallet.prepare(refs, outputs, memo)
+    expires = wallet.clock() + wallet.pledge_ttl
     unlocks = {}
     for r, (s, _) in zip(refs, header["inputs"]):
         p = wallet.dossier.output(r)
-        u = locks.empty_unlock()
+        u = locks.empty_unlock(expires)
         for pk in locks.keys_in(p["lock"]) & set(wallet.keys):
-            u["sigs"][pk] = locks.sign_unlock(wallet.keys[pk], s, tid)
+            u["sigs"][pk] = locks.sign_unlock(wallet.keys[pk], s, tid, expires)
         unlocks[s] = u
     reqs = []
     for r, (s, _) in zip(refs, header["inputs"]):
@@ -118,7 +119,7 @@ class TheftTests(unittest.TestCase):
         p = eve.dossier.output(refs[0])
         s = model.sigil_of(p)
         req = {"sigil": s, "header": header, "home": evil, "lock": p["lock"], "salt": p["salt"],
-               "unlock": locks.empty_unlock()}
+               "unlock": locks.empty_unlock(net.clock() + 600)}
         eve.dossier.add_seal(request_seal(net, req))  # the corrupt witnesses happily seal it
         eve.dossier.add_transition(header, body, {})
         with self.assertRaises(InvalidDossier) as ctx:
@@ -172,8 +173,9 @@ class WitnessTests(unittest.TestCase):
         h, b, tid = self.alice.prepare(refs, [])
         p = self.alice.dossier.output(refs[0])
         s = model.sigil_of(p)
-        u = locks.empty_unlock()
-        u["sigs"][p["lock"]["pk"]] = locks.sign_unlock(self.bob.fresh_key(), s, tid)
+        exp = self.net.clock() + 600
+        u = locks.empty_unlock(exp)
+        u["sigs"][p["lock"]["pk"]] = locks.sign_unlock(self.bob.fresh_key(), s, tid, exp)
         req = {"sigil": s, "header": h, "home": self.X, "lock": p["lock"], "salt": p["salt"], "unlock": u}
         for w in self.net.witnesses(self.X):
             with self.assertRaises(Rejected):
@@ -202,6 +204,8 @@ class WitnessTests(unittest.TestCase):
         coin = a.issue("C", 5)
         with self.assertRaises(SealFailed):
             a.pay(b, coin, 1)
+        # The failed spend's pledge holds the coin until its authorisation expires.
+        net.clock.advance(a.pledge_ttl + a.max_skew + 1)
         a.buy_stamps(X, 1)
         a.pay(b, coin, 1)
         # A stamp is single use.
