@@ -70,6 +70,9 @@ def authorises(sigil: str, auth: dict) -> tuple[int, str] | None:
         gen = gens[0]
         if not isinstance(gen, int) or isinstance(gen, bool) or gen < 0:
             return None
+        exp = auth["unlock"].get("expires")
+        if not isinstance(exp, int) or isinstance(exp, bool):
+            return None
         tid = transition_id(h)
         if not evaluate(auth["lock"], auth["unlock"], sigil, tid, None):
             return None
@@ -175,6 +178,10 @@ class Witness:
                 raise Rejected("bound at an earlier generation; release it first")
             rec.gen = gen  # we never voted at the skipped generations: abstaining is safe
         if rec.tid is None:
+            # Never *newly* bind on an expired authorisation: once it has
+            # expired, an owner can safely conclude a failed spend is dead.
+            if int(self.clock()) > auth["unlock"]["expires"]:
+                raise Rejected("authorisation expired")
             rec.tid, rec.header = tid, auth["header"]
             rec.log.append({"kind": "bind", "gen": gen, "auth": auth})
         if rec.tid != tid:

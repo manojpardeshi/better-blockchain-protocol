@@ -74,9 +74,14 @@ def transition_id(h: dict) -> str:
     return digest("transition", h)
 
 
-def unlock_message(sigil: str, tid: str) -> dict:
-    """What a lock's signatures sign: 'consume <sigil> in <transition>'."""
-    return {"sigil": sigil, "tid": tid}
+def unlock_message(sigil: str, tid: str, expires) -> dict:
+    """What a lock's signatures sign: 'consume <sigil> in <transition>, if bound by <expires>'.
+
+    ``expires`` (a time) bounds when a witness may *newly* bind the sigil
+    for this authorisation, so an owner whose spend failed knows when no
+    delayed request can still bind it (SPEC §5.1).
+    """
+    return {"sigil": sigil, "tid": tid, "expires": expires}
 
 
 # ------------------------------------------------------------ votes/seals
