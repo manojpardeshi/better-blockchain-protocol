@@ -86,7 +86,11 @@ def load(wallet_dir: str, network) -> Wallet:
         w.keys[pk], w.seeds[pk] = kp, seed
     w.dossier = dossier
     w.holdings = state["holdings"]
-    w.pledged = {s: tuple(v) for s, v in state["pledged"].items()}
+    # Pledges are (gen, tid, expires). Older wallets stored (gen, tid): those
+    # authorisations carry no expiry, which current witnesses refuse to newly
+    # bind, so expires=0 is safe (release still needs every witness's status).
+    w.pledged = {s: tuple(v) if len(v) == 3 else (v[0], v[1], 0)
+                 for s, v in state["pledged"].items()}
     w.stamps = defaultdict(list, {pk: list(v) for pk, v in state["stamps"].items()})
     w._confirmed = {tuple(c) for c in state["confirmed"]}
     return w
