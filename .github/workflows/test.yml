@@ -31,7 +31,9 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: ~/.cache/sigil-tla
-          key: tla2tools-1.8.0
+          key: tla2tools-1.8.0-tlapm-1.6.0-pre
+      # Runs the unbounded TLAPS safety proof (SigilProofs.tla) and the
+      # bounded TLC models with their mutation tests; see docs/VERIFICATION.md.
       - run: formal/check.sh
 
   rust:
