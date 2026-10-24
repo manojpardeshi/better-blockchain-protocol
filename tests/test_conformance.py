@@ -417,6 +417,61 @@ class KnownBugTests(unittest.TestCase):
                   and verify_seal(seal_a, net.registry) and verify_seal(seal_g, net.registry))
         self.assertFalse(double, "sigil s was consumed by two complete transitions after rotation")
 
+    @unittest.expectedFailure
+    def test_freeze_commits_to_a_single_successor_charter(self):
+        """BUG (sigil/witness.py Witness.freeze): a frozen witness will sign
+        MORE THAN ONE successor charter, so honest witnesses can be made to
+        certify two conflicting version-(v+1) charters, each reaching a v0
+        quorum -- a charter fork.
+
+        SPEC Section 3.7 says 'version v+1 MUST be signed by a quorum of
+        version v's witnesses', and the whitepaper describes rotation as
+        'a quorum of them signs THE new charter'. Nothing stops an honest
+        frozen witness from also signing a second, attacker-chosen successor
+        with entirely different membership. Both forks then verify
+        (charter.verify_chain), and a victim that adopts the attacker's fork
+        has its 'current charter' -- the one SPEC Section 9 deep confirmation
+        trusts -- populated with attacker keys, defeating deep confirmation.
+
+        SUGGESTED FIX: make FREEZE bind to one successor. Persist the frozen
+        successor's charter_hash; a later freeze of a DIFFERENT next_charter
+        must be refused (and the same one may return the stored signature):
+
+            if self.frozen:
+                if charter_hash(next_charter) != self._frozen_for:
+                    raise Rejected("already frozen for a different successor")
+                return sign_charter(self.kp, next_charter), <stored snapshot>
+            ...
+            self._persist(("frozen", "", True), ("frozen_for", "", charter_hash(next_charter)))
+
+        This test asks each honest witness to freeze for successor A and then
+        for a DIFFERENT successor B; it asserts the second freeze is refused.
+        """
+        from sigil.charter import charter_body, charter_hash, quorum
+        from sigil.crypto import verify
+
+        net = Network()
+        X = net.create_constellation("orion", 4)
+        ws = net.witnesses(X)
+        cur = net.registry.charter(X, 0)
+        ch = charter_hash(cur)
+        cA = charter_body("orion", 1, [KeyPair.generate().pk for _ in range(4)], ch)
+        cB = charter_body("orion", 1, [KeyPair.generate().pk for _ in range(4)], ch)
+
+        second_refused = 0
+        sigsB = {}
+        for w in ws:
+            w.freeze(cA)                       # commit to successor A
+            try:
+                sigsB[w.pk], _ = w.freeze(cB)  # a DIFFERENT successor must be refused
+            except Rejected:
+                second_refused += 1
+        members = set(cur["witnesses"])
+        okB = sum(verify(pk, "charter", cB, s) for pk, s in sigsB.items() if pk in members)
+        # Correct behaviour: every second freeze refused, so B never reaches a quorum.
+        self.assertTrue(second_refused == len(ws) and okB < quorum(4),
+                        "honest witnesses signed a second, conflicting successor charter")
+
 
 if __name__ == "__main__":
     unittest.main()
