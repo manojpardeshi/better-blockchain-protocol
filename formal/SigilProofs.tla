@@ -668,4 +668,177 @@ LEMMA SpendInv ==
 
 <1>. QED BY <1>T, <1>S, <1>E, <1>V, <1>B, <1>R DEF Inv
 
+(* -------------------------------------------------------------- Release  *)
+LEMMA ReleaseInv ==
+    ASSUME Inv, NEW w0 \in Honest, NEW s0 \in Sigils, Release(w0, s0)
+    PROVE  Inv'
+<1> DEFINE tb == bound[w0][s0]
+<1>i. TypeOK /\ VotesShape /\ HonestNoEquiv /\ VoteBelowGen /\ BoundVote /\ ReleaseDiscipline
+    BY DEF Inv
+<1>1. tb # NoTid /\ DeathProofExistsV(votes, tb) BY DEF Release, DeathProofExists
+<1>2. tb \in Tids BY <1>1, <1>i DEF TypeOK
+<1>3. /\ gen'   = [gen   EXCEPT ![w0][s0] = @ + 1]
+      /\ bound' = [bound EXCEPT ![w0][s0] = NoTid]
+      /\ votes' = votes
+    BY DEF Release
+<1>4. gen[w0][s0] \in Nat BY <1>i DEF TypeOK
+<1>5. \A w \in Honest, s \in Sigils :
+        gen'[w][s] = IF w = w0 /\ s = s0 THEN gen[w0][s0] + 1 ELSE gen[w][s]
+    BY <1>i, <1>3 DEF TypeOK
+<1>6. \A w \in Honest, s \in Sigils :
+        bound'[w][s] = IF w = w0 /\ s = s0 THEN NoTid ELSE bound[w][s]
+    BY <1>i, <1>3 DEF TypeOK
+
+<1>T. TypeOK'
+    <2>1. gen' \in [Honest -> [Sigils -> Nat]] BY <1>i, <1>3, <1>4 DEF TypeOK
+    <2>2. bound' \in [Honest -> [Sigils -> Tids \cup {NoTid}]] BY <1>i, <1>3 DEF TypeOK
+    <2>. QED BY <2>1, <2>2, <1>3, <1>i DEF TypeOK
+<1>S. VotesShape' BY <1>3, <1>i DEF VotesShape
+<1>E. HonestNoEquiv' BY <1>3, <1>i DEF HonestNoEquiv, HVote
+<1>V. VoteBelowGen'
+    <2> SUFFICES ASSUME NEW w \in Honest, NEW s \in Sigils, NEW g \in Nat, NEW t \in Tids,
+                        HVote(w, s, g, t) \in votes'
+                 PROVE  g <= gen'[w][s]
+        BY DEF VoteBelowGen
+    <2>1. g <= gen[w][s] BY <1>3, <1>i DEF VoteBelowGen
+    <2>2. gen[w][s] \in Nat BY <1>i DEF TypeOK
+    <2>. QED BY <2>1, <2>2, <1>4, <1>5, SMT
+<1>B. BoundVote'
+    <2> SUFFICES ASSUME NEW w \in Honest, NEW s \in Sigils
+                 PROVE  /\ (bound'[w][s] # NoTid => HVote(w, s, gen'[w][s], bound'[w][s]) \in votes')
+                        /\ (bound'[w][s] = NoTid => \A t \in Tids : HVote(w, s, gen'[w][s], t) \notin votes')
+        BY DEF BoundVote
+    <2>1. CASE w = w0 /\ s = s0
+        <3>1. bound'[w][s] = NoTid /\ gen'[w][s] = gen[w0][s0] + 1 BY <2>1, <1>5, <1>6
+        <3>2. \A t \in Tids : HVote(w0, s0, gen[w0][s0] + 1, t) \notin votes
+            <4> SUFFICES ASSUME NEW t \in Tids, HVote(w0, s0, gen[w0][s0] + 1, t) \in votes
+                         PROVE  FALSE
+                OBVIOUS
+            <4>1. gen[w0][s0] + 1 <= gen[w0][s0] BY <1>i, <1>4 DEF VoteBelowGen
+            <4>. QED BY <4>1, <1>4, SMT
+        <3>. QED BY <3>1, <3>2, <2>1, <1>3
+    <2>2. CASE ~(w = w0 /\ s = s0)
+        <3>1. bound'[w][s] = bound[w][s] /\ gen'[w][s] = gen[w][s] BY <2>2, <1>5, <1>6
+        <3>. QED BY <3>1, <1>3, <1>i DEF BoundVote
+    <2>. QED BY <2>1, <2>2
+<1>R. ReleaseDiscipline'
+    <2> SUFFICES ASSUME NEW w \in Honest, NEW s \in Sigils, NEW g \in Nat, NEW t \in Tids,
+                        HVote(w, s, g, t) \in votes', g < gen'[w][s]
+                 PROVE  DeathProofExistsV(votes', t)
+        BY DEF ReleaseDiscipline, DeathProofExists
+    <2>0. HVote(w, s, g, t) \in votes BY <1>3
+    <2>g. gen[w][s] \in Nat BY <1>i DEF TypeOK
+    <2>1. CASE g < gen[w][s]
+        <3>1. DeathProofExistsV(votes, t) BY <2>1, <2>0, <1>i DEF ReleaseDiscipline, DeathProofExists
+        <3>. QED BY <3>1, <1>3
+    <2>2. CASE ~(g < gen[w][s])
+        \* Then (w, s) = (w0, s0) and g = gen[w0][s0]: the released binding.
+        <3>1. w = w0 /\ s = s0 BY <2>2, <1>5, <2>g, SMT
+        <3>2. g = gen[w0][s0] BY <2>2, <3>1, <1>5, <1>4, SMT
+        <3>3. HVote(w0, s0, gen[w0][s0], tb) \in votes BY <1>1, <1>i DEF BoundVote
+        <3>4. t = tb BY <3>1, <3>2, <3>3, <2>0, <1>2, <1>4, <1>i DEF HonestNoEquiv
+        <3>. QED BY <3>4, <1>1, <1>3
+    <2>. QED BY <2>1, <2>2
+<1>. QED BY <1>T, <1>S, <1>E, <1>V, <1>B, <1>R DEF Inv
+
+(* -------------------------------------------------------------- ByzVote  *)
+LEMMA ByzVoteInv ==
+    ASSUME Inv, NEW b \in Byz, NEW s1 \in Sigils, NEW g1 \in Nat, NEW t1 \in Tids,
+           ByzVote(b, s1, g1, t1)
+    PROVE  Inv'
+<1> DEFINE bv == Vote(ConsOf(b), b, s1, g1, t1)
+<1>i. TypeOK /\ VotesShape /\ HonestNoEquiv /\ VoteBelowGen /\ BoundVote /\ ReleaseDiscipline
+    BY DEF Inv
+<1>1. votes' = votes \cup {bv} /\ gen' = gen /\ bound' = bound BY DEF ByzVote
+<1>2. b \in Witnesses /\ b \notin Honest BY HonestByzDisjoint DEF Witnesses
+<1>3. ConsOf(b) \in Cons BY <1>2, ConsOfType
+\* No honest vote is the new Byzantine vote: only b signs as b.
+<1>4. \A w \in Honest, s \in Sigils, g \in Nat, t \in Tids :
+        HVote(w, s, g, t) \in votes' <=> HVote(w, s, g, t) \in votes
+    <2> SUFFICES ASSUME NEW w \in Honest, NEW s \in Sigils, NEW g \in Nat, NEW t \in Tids
+                 PROVE  HVote(w, s, g, t) \in votes' <=> HVote(w, s, g, t) \in votes
+        OBVIOUS
+    <2>1. HVote(w, s, g, t) # bv
+        <3>1. HVote(w, s, g, t).wit = w /\ bv.wit = b BY VoteFields DEF HVote
+        <3>. QED BY <3>1, <1>2
+    <2>. QED BY <2>1, <1>1
+<1>5. votes \subseteq votes' BY <1>1
+<1>T. TypeOK'
+    <2>1. bv \in VoteSpace BY <1>2, <1>3 DEF VoteSpace, Vote
+    <2>. QED BY <2>1, <1>1, <1>i DEF TypeOK
+<1>S. VotesShape'
+    <2> SUFFICES ASSUME NEW v \in votes', v.wit \in Honest
+                 PROVE  v.con = ConsOf(v.wit) /\ Home[v.sgl] = ConsOf(v.wit)
+        BY DEF VotesShape
+    <2>1. v # bv BY <1>2, VoteFields
+    <2>. QED BY <2>1, <1>1, <1>i DEF VotesShape
+<1>E. HonestNoEquiv' BY <1>4, <1>i DEF HonestNoEquiv
+<1>V. VoteBelowGen' BY <1>4, <1>1, <1>i DEF VoteBelowGen
+<1>B. BoundVote'
+    <2> SUFFICES ASSUME NEW w \in Honest, NEW s \in Sigils
+                 PROVE  /\ (bound'[w][s] # NoTid => HVote(w, s, gen'[w][s], bound'[w][s]) \in votes')
+                        /\ (bound'[w][s] = NoTid => \A t \in Tids : HVote(w, s, gen'[w][s], t) \notin votes')
+        BY DEF BoundVote
+    <2>1. gen[w][s] \in Nat /\ bound[w][s] \in Tids \cup {NoTid} BY <1>i DEF TypeOK
+    <2>. QED BY <2>1, <1>1, <1>4, <1>5, <1>i DEF BoundVote
+<1>R. ReleaseDiscipline'
+    <2> SUFFICES ASSUME NEW w \in Honest, NEW s \in Sigils, NEW g \in Nat, NEW t \in Tids,
+                        HVote(w, s, g, t) \in votes', g < gen'[w][s]
+                 PROVE  DeathProofExistsV(votes', t)
+        BY DEF ReleaseDiscipline, DeathProofExists
+    <2>1. DeathProofExistsV(votes, t) BY <1>1, <1>4, <1>i DEF ReleaseDiscipline, DeathProofExists
+    <2>. QED BY <2>1, <1>5, DeathMonotone
+<1>. QED BY <1>T, <1>S, <1>E, <1>V, <1>B, <1>R DEF Inv
+
+(* ------------------------------------------------------------- stuttering *)
+LEMMA StutterInv ==
+    ASSUME Inv, UNCHANGED vars
+    PROVE  Inv'
+<1>1. gen' = gen /\ bound' = bound /\ votes' = votes BY DEF vars
+<1>. QED BY <1>1
+         DEF Inv, TypeOK, VotesShape, HonestNoEquiv, VoteBelowGen, BoundVote,
+             ReleaseDiscipline, DeathProofExists
+
+LEMMA NextInv == Inv /\ [Next]_vars => Inv'
+<1>. SUFFICES ASSUME Inv, [Next]_vars PROVE Inv' OBVIOUS
+<1>1. CASE \E w \in Honest, s \in Sigils, t \in Tids : Spend(w, s, t)
+    BY <1>1, SpendInv
+<1>2. CASE \E w \in Honest, s \in Sigils : Release(w, s)
+    BY <1>2, ReleaseInv
+<1>3. CASE \E b \in Byz, s \in Sigils, g \in Nat, t \in Tids : ByzVote(b, s, g, t)
+    BY <1>3, ByzVoteInv
+<1>4. CASE UNCHANGED vars
+    BY <1>4, StutterInv
+<1>. QED BY <1>1, <1>2, <1>3, <1>4 DEF Next
+
+-----------------------------------------------------------------------------
+(* =====================  MAIN THEOREMS (unbounded)  ======================= *)
+
+THEOREM SpecInv == Spec => []Inv
+<1>1. Init => Inv BY InitInv
+<1>2. Inv /\ [Next]_vars => Inv' BY NextInv
+<1>. QED BY <1>1, <1>2, PTL DEF Spec
+
+(* SPEC Section 8, Theorem: no sigil is an input of two different complete *)
+(* transitions -- in every reachable state, for any number of witnesses,   *)
+(* sigils, transitions, generations and constellations.                     *)
+THEOREM SpecSafety == Spec => []Safety
+<1>1. Inv => Safety BY Inv_Safety
+<1>. QED BY <1>1, SpecInv, PTL
+
+(* SPEC Section 8, Lemma 1.                                                *)
+THEOREM SpecOneSealPerGen == Spec => []OneSealPerGen
+<1>1. Inv => OneSealPerGen BY Inv_OneSealPerGen
+<1>. QED BY <1>1, SpecInv, PTL
+
+(* SPEC Section 8, Lemma 2 (with the home-constellation binding of 3.9).   *)
+THEOREM SpecDeathProofsSound == Spec => []DeathProofsSound
+<1>1. Inv => DeathProofsSound BY Inv_DeathProofsSound
+<1>. QED BY <1>1, SpecInv, PTL
+
+(* SPEC Section 5.1, last sentence: honest keys never equivocate.          *)
+THEOREM SpecHonestNoEquiv == Spec => []HonestNoEquiv
+<1>1. Inv => HonestNoEquiv BY DEF Inv
+<1>. QED BY <1>1, SpecInv, PTL
+
 ================================================================================
