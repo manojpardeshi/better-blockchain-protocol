@@ -31,9 +31,9 @@ import time
 import traceback
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from common import RUST_BIN, Cluster, compat_wallet_class, manual_spend, stock_wallet_signs_expiry  # noqa: E402
+from common import RUST_BIN, Cluster, manual_spend  # noqa: E402
 
-from sigil import locks, model  # noqa: E402
+from sigil import Wallet, locks, model  # noqa: E402
 from sigil.server import RemoteNetwork, RemoteWitness  # noqa: E402
 from sigil.swap import atomic_swap, propose_swap  # noqa: E402
 from sigil.validate import InvalidDossier  # noqa: E402
@@ -63,7 +63,7 @@ def check(name):
 class Interop:
     def __init__(self, cluster: Cluster, X: str, Y: str, Z: str):
         self.c, self.X, self.Y, self.Z = cluster, X, Y, Z
-        self.W = compat_wallet_class()
+        self.W = Wallet
 
     def net(self) -> RemoteNetwork:
         return RemoteNetwork(self.c.directory(), timeout=5)
@@ -294,7 +294,6 @@ def main(argv=None):
     args = ap.parse_args(argv)
     if not os.path.exists(RUST_BIN):
         raise SystemExit(f"{RUST_BIN} not found: cargo build --release --manifest-path rust/Cargo.toml")
-    print(f"wallet: {'stock sigil.wallet.Wallet' if stock_wallet_signs_expiry() else 'CompatWallet (expires-format authorise; stock Wallet still signs {sigil, tid})'}")
     tmp = tempfile.mkdtemp(prefix="sigil-interop-")
     c = Cluster(tmp)
     try:

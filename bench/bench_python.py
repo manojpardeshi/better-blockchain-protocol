@@ -18,9 +18,9 @@ import tempfile
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from common import Cluster, compat_wallet_class  # noqa: E402
+from common import Cluster  # noqa: E402
 
-from sigil import Network, model  # noqa: E402
+from sigil import Network, Wallet, model  # noqa: E402
 from sigil.charter import Registry, charter_body, constellation_id, quorum  # noqa: E402
 from sigil.crypto import KeyPair  # noqa: E402
 from sigil.locks import empty_unlock, sig, sign_unlock  # noqa: E402
@@ -101,7 +101,7 @@ def bench_seal(args):
 
 def bench_dossier(args):
     """A coin passed back and forth L times: verify the received parcel from scratch."""
-    W = compat_wallet_class()
+    W = Wallet
     lengths = sorted(int(x) for x in args.lengths.split(","))
     net = Network()
     X = net.create_constellation("orion", n=4)
@@ -139,7 +139,7 @@ def bench_dossier(args):
 
 
 def bench_latency(args):
-    W = compat_wallet_class()
+    W = Wallet
     tmp = tempfile.mkdtemp(prefix="sigil-latency-")
     c = Cluster(tmp)
     try:

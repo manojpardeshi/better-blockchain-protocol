@@ -4,13 +4,9 @@
   (``python -m sigil.witnessd keygen/genesis``), so the Rust witness is always started from
   files in the reference's formats, then runs each witness as a Rust (``sigil-witness run``)
   or Python (``python -m sigil.witnessd run``) process.
-* ``compat_wallet_class`` returns a ``Wallet`` that signs owner authorisations in the
-  ``unlock_message = {sigil, tid, expires}`` format (SPEC §5.1 as of 4f52887). The stock
-  wallet is used unchanged if it already does; otherwise ``authorise`` is overridden with an
-  equivalent that passes ``expires`` to the 4-argument ``locks.sign_unlock``.
+* ``manual_spend`` signs a transition without the wallet's anti-equivocation guard.
 """
 
-import inspect
 import json
 import os
 import signal
@@ -26,7 +22,6 @@ if ROOT not in sys.path:
 
 from sigil import locks, model  # noqa: E402
 from sigil.locks import keys_in  # noqa: E402
-from sigil.wallet import Wallet  # noqa: E402
 
 RUST_BIN = os.environ.get("SIGIL_WITNESS_BIN", os.path.join(ROOT, "rust", "target", "release", "sigil-witness"))
 AUTH_TTL = 600  # seconds an owner authorisation may newly bind a sigil
@@ -52,41 +47,11 @@ def witnessd(*args: str) -> str:
 
 # ------------------------------------------------------------------ wallet
 
-def stock_wallet_signs_expiry() -> bool:
-    """Does ``Wallet.authorise`` already produce expires-format unlocks?"""
-    src = inspect.getsource(Wallet.authorise)
-    return "expires" in src
-
-
 def unlock_for(keys: list, sigil: str, tid: str, expires: int) -> dict:
     u = locks.empty_unlock(expires)
     for kp in keys:
         u["sigs"][kp.pk] = locks.sign_unlock(kp, sigil, tid, expires)
     return u
-
-
-class CompatWallet(Wallet):
-    """``Wallet`` whose ``authorise`` signs ``{sigil, tid, expires}`` (same guard as the stock one)."""
-
-    def authorise(self, header: dict, body: dict, extra: dict | None = None) -> dict:
-        tid = model.transition_id(header)
-        expires = int(self.network.clock()) + AUTH_TTL if hasattr(self.network, "clock") else int(time.time()) + AUTH_TTL
-        unlocks = {}
-        for r, (s, g) in zip(body["inputs"], header["inputs"]):
-            h = self.holdings.get(model.parcel_id(r))
-            if h is None:
-                continue
-            prior = self.pledged.get(s)
-            if prior is not None and prior[0] == g and prior[1] != tid:
-                raise ValueError("refusing to equivocate: sigil already pledged")
-            u = unlock_for([self.keys[pk] for pk in keys_in(h["parcel"]["lock"]) & set(self.keys)], s, tid, expires)
-            unlocks[s] = locks.merge_unlocks(u, (extra or {}).get(s, {}))
-            self.pledged[s] = (g, tid)
-        return unlocks
-
-
-def compat_wallet_class():
-    return Wallet if stock_wallet_signs_expiry() else CompatWallet
 
 
 def manual_spend(wallet, refs: list, outputs: list, memo: str = "", expires: int | None = None):
