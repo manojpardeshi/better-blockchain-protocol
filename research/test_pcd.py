@@ -14,7 +14,6 @@ import os
 import random
 import unittest
 
-from research._compat import ensure_wallet_signs_expiry
 from research.pcd import (
     HolderPolicy, IdealBackend, InputWitness, ProofObject, ProofRejected, Statement, StepInvalid,
     TranscriptBackend, gather_confirmations, output_commitment, prove_history, step, witness_for,
@@ -25,7 +24,6 @@ from sigil.swap import atomic_swap
 from sigil.validate import Dossier
 
 FUZZ = int(os.environ.get("SIGIL_PCD_FUZZ", "150"))
-ensure_wallet_signs_expiry()  # no-op once the reference wallet signs expiries itself
 
 
 def received(wallet: Wallet, tid: str, i: int = 0) -> tuple[dict, dict]:

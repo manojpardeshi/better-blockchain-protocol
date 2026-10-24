@@ -47,7 +47,7 @@ from collections import Counter
 from dataclasses import dataclass, field
 
 try:
-    from research import _compat  # noqa: F401  (sys.path, wallet shim)
+    from research import _compat  # noqa: F401  (puts the repo root on sys.path)
 except ImportError:  # pragma: no cover
     import _compat  # noqa: F401
 

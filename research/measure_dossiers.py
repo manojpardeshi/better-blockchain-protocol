@@ -36,15 +36,13 @@ import time
 import zlib
 
 try:
-    from research._compat import ensure_wallet_signs_expiry
+    from research import _compat  # noqa: F401  (puts the repo root on sys.path)
 except ImportError:  # run as a script from inside research/
-    from _compat import ensure_wallet_signs_expiry
+    import _compat  # noqa: F401
 
 from sigil import Network, TrustPolicy, Verifier, Wallet, model
 from sigil.swap import atomic_swap
 from sigil.validate import Dossier
-
-PATCHED = ensure_wallet_signs_expiry()
 
 
 # ----------------------------------------------------------------- metrics
@@ -254,7 +252,7 @@ def main(argv=None):
     args = ap.parse_args(argv)
     q = args.quick
     want = set(args.only or ["chain", "fanin", "economy", "committee"])
-    res = {"patched_wallet_expiry": PATCHED}
+    res = {}
     t0 = time.time()
     if "chain" in want:
         res["chain"] = scenario_chain(16 if q else 512)
@@ -287,7 +285,7 @@ def main(argv=None):
     if args.json:
         with open(args.json, "w") as f:
             json.dump(res, f, indent=1)
-    print(f"\n(done in {res['elapsed_s']} s; wallet expiry shim active: {PATCHED})")
+    print(f"\n(done in {res['elapsed_s']} s)")
     return res
 
 
