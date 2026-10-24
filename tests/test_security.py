@@ -4,7 +4,7 @@ import unittest
 from sigil import InvalidDossier, Network, SealFailed, Wallet
 from sigil import locks, model
 from sigil.encoding import hash_preimage
-from sigil.proofs import verify_equivocation, verify_seal
+from sigil.proofs import proves_dead, verify_equivocation, verify_seal
 from sigil.wallet import request_seal
 from sigil.witness import Conflict, Rejected
 from tests.adversary import Equivocator, Silent
@@ -212,6 +212,47 @@ class WitnessTests(unittest.TestCase):
         w = net.witnesses(X)[0]
         st = {"serial": "ab" * 16, "sig": "1"}
         self.assertFalse(w.stamps.redeem(st))
+
+
+class SealFieldOverrideTests(unittest.TestCase):
+    """Regression: vote entries inside a seal must not override the seal's own fields."""
+
+    def setUp(self):
+        self.net = Network()
+        self.X = self.net.create_constellation("orion")
+        self.alice, self.bob = Wallet("alice", self.net, self.X), Wallet("bob", self.net, self.X)
+        self.usd = self.alice.issue("USD", 10)
+
+    def _real_seal(self):
+        tid = self.alice.pay(self.bob, self.usd, 3)
+        return next(s for s in self.alice.dossier.seals.values() if s["tid"] == tid), tid
+
+    def test_entries_cannot_retarget_a_seal(self):
+        seal, tid = self._real_seal()
+        forged = dict(seal, tid="00" * 32,
+                      votes=[dict(v, tid=tid) for v in seal["votes"]])
+        self.assertFalse(verify_seal(forged, self.net.registry))
+
+    def test_entries_cannot_move_a_seal_to_another_constellation(self):
+        evil = self.net.create_constellation("evil")
+        mallory = Wallet("mallory", self.net, evil)
+        coin = mallory.issue("M", 1)
+        tid = mallory.pay(Wallet("m2", self.net, evil), coin, 1)
+        seal = next(s for s in mallory.dossier.seals.values() if s["tid"] == tid)
+        forged = dict(seal, constellation=self.X,
+                      votes=[dict(v, constellation=evil) for v in seal["votes"]])
+        self.assertFalse(verify_seal(forged, self.net.registry))
+
+    def test_entries_cannot_forge_a_death_proof(self):
+        seal, tid = self._real_seal()
+        tx = self.alice.dossier.transitions[tid]
+        header = tx["header"]
+        s, gen = header["inputs"][0]
+        parcel = self.alice.dossier.output(tx["body"]["inputs"][0])
+        self.assertEqual(model.sigil_of(parcel), s)
+        forged = dict(seal, tid="00" * 32, votes=[dict(v, tid=tid) for v in seal["votes"]])
+        proof = {"kind": "seal", "sigil": s, "gen": gen, "seal": forged, "parcel": parcel}
+        self.assertFalse(proves_dead(header, tid, proof, self.net.registry))
 
 
 if __name__ == "__main__":

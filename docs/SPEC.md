@@ -72,7 +72,7 @@ vote = {constellation, version, witness: pk, sigil, gen, tid, time, sig}
        sig = Sig(witness_sk, "vote", vote without sig)
 seal = {constellation, version, sigil, gen, tid, votes: [{witness, time, sig}]}
 ```
-A seal is **valid** for a registry *R* and convicted set *X* if, for charter `R[constellation][version]`, at least `q` distinct members not in *X* have valid votes.
+A seal is **valid** for a registry *R* and convicted set *X* if, for charter `R[constellation][version]`, at least `q` distinct members not in *X* have valid votes. Each vote is rebuilt from the seal's own `constellation, version, sigil, gen, tid` plus the entry's `witness, time, sig`. Any other key in an entry is ignored and can never override a seal field.
 
 ### 3.7 Charter
 ```
