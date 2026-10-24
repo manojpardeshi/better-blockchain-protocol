@@ -1,0 +1,13 @@
+[package]
+name = "sigil-plonky2-pcd"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Research prototype: real recursive (PCD) proofs over a toy Sigil transition DAG, with Plonky2"
+
+[dependencies]
+plonky2 = "1.1.0"
+anyhow = "1"
+
+[profile.release]
+opt-level = 3
