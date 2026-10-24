@@ -1,0 +1,17 @@
+cyclic circuit: fixed point after 1 refinement(s)
+circuit: zk=true gates=13192 (padded 2^15), public inputs=86, build 101.9s
+genesis proved in 6.57s
+16 hops proved; last in 7.76s
+merge (2 child proofs) proved in 6.68s
+holder accepts: transitions in ancestry tree = 21, homes mask = 0b11111110, tid = e6a68aebcd50e3ef…
+  [ok] inflation is unprovable
+  [ok] spend without the owner's key is unprovable
+  [ok] duplicate input is unprovable
+  [ok] input not created by the child proof is unprovable
+  [ok] holder rejects a parcel not committed by the proof
+  [ok] tampered public inputs fail verification
+  [ok] holder policy rejects untrusted homes in the ancestry
+  [ok] same policy accepts a history that avoids that home
+  [ok] minting an existing asset via a fake genesis is unprovable
+  [ok] input without a valid ancestry proof is unprovable
+RESULT {"zk": true, "degree_bits": 15, "gates": 13192, "build_s": 101.93, "prove_genesis_s": 6.57, "prove_hop_median_s": 8.75, "prove_merge_s": 6.68, "proof_bytes": 156068, "compressed_bytes": 143912, "verify_ms_median": 6.86, "ancestry_transitions": 21, "hops": 16, "negative_checks_passed": true}
