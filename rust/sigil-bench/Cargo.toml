@@ -1,0 +1,15 @@
+[package]
+name = "sigil-bench"
+description = "Benchmarks for the Sigil witness: in-process votes/s, HTTP load generator, seal verification"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+sigil-witness = { path = "../sigil-witness" }
+ed25519-dalek.workspace = true
+rand.workspace = true
+hex.workspace = true
+clap.workspace = true

@@ -62,9 +62,9 @@ Lock := {op:"sig",  pk}                 signature by pk
 ```
 Objects MUST have exactly the listed keys. Depth ≤ 8, nodes ≤ 64. Evaluation is total and linear.
 
-**Unlock** = `{sigs: {pk: sig}, preimages: {h: hex}, equivocations: [proof]}`. Signatures are `Sig(sk, "unlock", {sigil, tid})`.
+**Unlock** = `{sigs: {pk: sig}, preimages: {h: hex}, equivocations: [proof], expires: int}`. Signatures are `Sig(sk, "unlock", {sigil, tid, expires})`. `expires` is a time (seconds, same scale as `after`/`before`) chosen by the owner. It bounds when a witness may *newly* bind the sigil for this authorisation (§5.1), so an owner whose spend failed knows when no delayed request can still bind it (§4). All signatures in one unlock cover the same `expires`.
 
-`eval(lock, unlock, sigil, tid, now)`: standard boolean semantics. When `now` is null (holder re-check), `after` and `before` evaluate to true.
+`eval(lock, unlock, sigil, tid, now)`: standard boolean semantics; signatures are checked over `{sigil, tid, unlock.expires}`, so changing `expires` invalidates them. When `now` is null (holder re-check), `after` and `before` evaluate to true. Holders do not check `expires` against any clock: once a binding exists, it may keep being voted and sealed after expiry.
 
 ### 3.6 Vote and seal
 ```
@@ -72,7 +72,7 @@ vote = {constellation, version, witness: pk, sigil, gen, tid, time, sig}
        sig = Sig(witness_sk, "vote", vote without sig)
 seal = {constellation, version, sigil, gen, tid, votes: [{witness, time, sig}]}
 ```
-A seal is **valid** for a registry *R* and convicted set *X* if, for charter `R[constellation][version]`, at least `q` distinct members not in *X* have valid votes.
+A seal is **valid** for a registry *R* and convicted set *X* if, for charter `R[constellation][version]`, at least `q` distinct members not in *X* have valid votes. Each vote is rebuilt from the seal's own `constellation, version, sigil, gen, tid` plus the entry's `witness, time, sig`. Any other key in an entry is ignored and can never override a seal field.
 
 ### 3.7 Charter
 ```
@@ -104,10 +104,15 @@ The evidence MUST come from the target sigil's home. Constellations are permissi
 
 ## 4. Holder obligations
 
-1. A holder MUST NOT authorise two different transitions that consume the same sigil at the same generation.
+1. A holder MUST NOT authorise two different transitions that consume the same sigil at the same generation, except after releasing a pledge under rule 3. Re-authorising the *same* transition (for example with a later `expires`) is allowed; it is not equivocation.
 2. A holder MUST NOT authorise a transition at generation *g*+1 for a sigil until a quorum of its home has released generation *g*.
-3. Receiving addresses MUST use fresh salts. A recipient SHOULD check that the received sigil is unbound at its home (at most *f* witnesses report a binding).
-4. A holder SHOULD keep verified-transition caches and MUST clear them when its trust policy changes.
+3. **Pledge release.** An authorisation of `(s, g, T)` that the holder failed to seal (a *pledge*) may be released, and a different transition of `s` at `g` authorised, only when both hold:
+   * *expiry:* by the holder's clock, `now > E + skew`, where `E` is the latest `expires` it ever signed for `(s, g, T)` and `skew` bounds how far any honest witness's clock may lag the holder's (v0 default: 120 s). Then no honest witness will newly bind `s` to `T` (§5.1), however late a request arrives;
+   * *no binding:* every member of the home's current charter answered STATUS, and none reports a binding to, or a vote for, `T` at `g`. An unreachable member might hold one.
+
+   Without the expiry condition, a request delayed in flight could bind `s` to `T` after the holder checked, and the holder would then authorise two transitions (rule 1). If a binding exists, the pledge stays: the holder may still complete `T` (re-authorising it with a fresh `expires`) or recover via a death proof (§5.2).
+4. Receiving addresses MUST use fresh salts. A recipient SHOULD check that the received sigil is unbound at its home (at most *f* witnesses report a binding).
+5. A holder SHOULD keep verified-transition caches and MUST clear them when its trust policy changes.
 
 ## 5. Witness protocol
 
@@ -120,13 +125,13 @@ A witness MUST make its records (and its frozen flag) durable before it releases
 
 1. If inactive or frozen → reject. If stamps are required and `stamp` is missing, invalid or already redeemed → reject; otherwise redeem it.
 2. `home` MUST equal this constellation's id.
-3. **Authorisation:** `sigil({home, lock, salt}) = sigil`; `sigil` occurs exactly once in `header.inputs` with generation `g` (a non-negative integer); all header sigils are distinct; `tid = H("transition", header)`; `eval(lock, unlock, sigil, tid, now)` holds with the witness's clock.
+3. **Authorisation:** `sigil({home, lock, salt}) = sigil`; `sigil` occurs exactly once in `header.inputs` with generation `g` (a non-negative integer); all header sigils are distinct; `unlock.expires` is an integer; `tid = H("transition", header)`; `eval(lock, unlock, sigil, tid, now)` holds with the witness's clock.
 4. Let `r` = record(sigil).
    * `g < r.gen` → reject (stale).
    * `g > r.gen`: if `r.tid ≠ null` → reject (release first). Otherwise set `r.gen = g`. Skipping generations without voting is abstention and is safe.
-   * If `r.tid = null`: bind `r.tid = tid`, `r.header = header`, append `{kind:"bind", gen:g, auth:{home, lock, salt, unlock, header}}` to `r.log`.
+   * If `r.tid = null`: if `now > unlock.expires` by the witness's clock → reject (authorisation expired); a witness MUST NOT newly bind a sigil on an expired authorisation. Otherwise bind `r.tid = tid`, `r.header = header`, append `{kind:"bind", gen:g, auth:{home, lock, salt, unlock, header}}` to `r.log`.
    * If `r.tid ≠ tid` → reply **Conflict** carrying the existing vote.
-   * Otherwise return `r.vote`, creating and recording it on first use.
+   * Otherwise return `r.vote`, creating and recording it on first use. (Re-voting an existing binding is allowed after expiry.)
 
 A witness MUST NOT sign two votes with the same `(constellation, sigil, gen)` and different `tid`.
 
@@ -177,6 +182,8 @@ To accept a received parcel, the holder MUST also trust its `home`.
 | Stamp signatures | RSA-FDH, ≥ 2048-bit modulus (1024 allowed only in tests) |
 | Fault bound | *f* = ⌊(*n*−1)/3⌋, *q* = *n* − *f* |
 | Lock limits | depth 8, 64 nodes |
+| Authorisation lifetime (wallet default) | `expires` = now + 600 s |
+| Clock-skew margin for pledge release (wallet default) | 120 s |
 
 ## 8. Safety argument
 

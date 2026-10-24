@@ -1,0 +1,77 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 460" width="760" height="460" font-family="system-ui, -apple-system, Segoe UI, sans-serif" role="img" aria-label="Dossier size against history length, log-log">
+<rect width="760" height="460" fill="#fcfcfb"/>
+<text x="78" y="24" font-size="15" font-weight="600" fill="#0b0b0b">Dossier size vs. history length (n = 4, canonical JSON)</text>
+<text x="78" y="41" font-size="12" fill="#52514e">y: bytes the payee receives · x: transitions so far (chain, fan-in: the coin’s own</text>
+<text x="78" y="56" font-size="12" fill="#52514e">history; economy: every transition in the economy) · both axes log</text>
+<line x1="78.0" x2="78.0" y1="66" y2="402" stroke="#e6e5e1" stroke-width="1"/>
+<text x="78.0" y="420" font-size="11" fill="#8a8984" text-anchor="middle">1</text>
+<line x1="218.8" x2="218.8" y1="66" y2="402" stroke="#e6e5e1" stroke-width="1"/>
+<text x="218.8" y="420" font-size="11" fill="#8a8984" text-anchor="middle">10</text>
+<line x1="359.5" x2="359.5" y1="66" y2="402" stroke="#e6e5e1" stroke-width="1"/>
+<text x="359.5" y="420" font-size="11" fill="#8a8984" text-anchor="middle">100</text>
+<line x1="500.3" x2="500.3" y1="66" y2="402" stroke="#e6e5e1" stroke-width="1"/>
+<text x="500.3" y="420" font-size="11" fill="#8a8984" text-anchor="middle">1,000</text>
+<line x1="78" x2="585" y1="380.0" y2="380.0" stroke="#e6e5e1" stroke-width="1"/>
+<text x="70" y="384.0" font-size="11" fill="#8a8984" text-anchor="end">1 KB</text>
+<line x1="78" x2="585" y1="307.0" y2="307.0" stroke="#e6e5e1" stroke-width="1"/>
+<text x="70" y="311.0" font-size="11" fill="#8a8984" text-anchor="end">10 KB</text>
+<line x1="78" x2="585" y1="234.0" y2="234.0" stroke="#e6e5e1" stroke-width="1"/>
+<text x="70" y="238.0" font-size="11" fill="#8a8984" text-anchor="end">100 KB</text>
+<line x1="78" x2="585" y1="161.0" y2="161.0" stroke="#e6e5e1" stroke-width="1"/>
+<text x="70" y="165.0" font-size="11" fill="#8a8984" text-anchor="end">1 MB</text>
+<line x1="78" x2="585" y1="88.0" y2="88.0" stroke="#e6e5e1" stroke-width="1"/>
+<text x="70" y="92.0" font-size="11" fill="#8a8984" text-anchor="end">10 MB</text>
+<text x="332" y="444" font-size="12" fill="#52514e" text-anchor="middle">transitions in the history</text>
+<line x1="78.0" y1="352.0" x2="585.0" y2="89.0" stroke="#8a8984" stroke-width="1.5" stroke-dasharray="5 4"/>
+<line x1="86.5" x2="117.2" y1="117.0" y2="117.0" stroke="#8a8984" stroke-width="1.5" stroke-dasharray="5 4"/>
+<text x="123.4" y="121.0" font-size="11" fill="#52514e">dossier = whole history (≈ 2.4 KB per transition)</text>
+<line x1="78" x2="585" y1="219.9" y2="219.9" stroke="#52514e" stroke-width="1.5"/>
+<text x="86.5" y="213.9" font-size="11" fill="#52514e">Plonky2 toy PCD proof (ZK): 156 KB, any history</text>
+<line x1="78" x2="585" y1="380.0" y2="380.0" stroke="#52514e" stroke-width="1.5"/>
+<text x="86.5" y="374.0" font-size="11" fill="#52514e">PCD statement + 32-byte ideal proof: ≈1 KB</text>
+<path d="M120.4,337.3 L145.2,321.8 L176.4,303.7 L212.3,283.8 L251.2,262.9 L291.7,241.5 L333.2,219.8 L375.1,198.0 L417.2,176.0 L459.5,154.1" fill="none" stroke="#2a78d6" stroke-width="2" stroke-linejoin="round"/>
+<circle cx="120.4" cy="337.3" r="4.5" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="145.2" cy="321.8" r="4.5" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="176.4" cy="303.7" r="4.5" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="212.3" cy="283.8" r="4.5" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="251.2" cy="262.9" r="4.5" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="291.7" cy="241.5" r="4.5" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="333.2" cy="219.8" r="4.5" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="375.1" cy="198.0" r="4.5" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="417.2" cy="176.0" r="4.5" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="459.5" cy="154.1" r="4.5" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<path d="M300.4,234.7 L385.9,189.7 L470.8,145.4" fill="none" stroke="#eb6834" stroke-width="2" stroke-linejoin="round"/>
+<rect x="295.9" y="230.2" width="9" height="9" rx="1.5" fill="#eb6834" stroke="#fcfcfb" stroke-width="2"/>
+<rect x="381.4" y="185.2" width="9" height="9" rx="1.5" fill="#eb6834" stroke="#fcfcfb" stroke-width="2"/>
+<rect x="466.3" y="140.9" width="9" height="9" rx="1.5" fill="#eb6834" stroke="#fcfcfb" stroke-width="2"/>
+<path d="M390.5,234.1 L423.7,233.0 L445.2,230.0 L461.0,287.9 L473.5,203.5 L484.0,245.2 L492.9,163.1 L500.6,146.7 L507.5,151.1 L513.7,145.6 L519.3,148.9 L524.5,120.6 L529.2,115.3 L533.6,128.6 L537.7,111.2 L541.6,108.5 L545.2,103.1 L548.6,102.9 L551.9,98.8 L554.9,94.1" fill="none" stroke="#1baf7a" stroke-width="2" stroke-linejoin="round"/>
+<path d="M390.5,228.6 L396.0,238.6 L385.0,238.6 Z" fill="#1baf7a" stroke="#fcfcfb" stroke-width="2"/>
+<path d="M423.7,227.5 L429.2,237.5 L418.2,237.5 Z" fill="#1baf7a" stroke="#fcfcfb" stroke-width="2"/>
+<path d="M445.2,224.5 L450.7,234.5 L439.7,234.5 Z" fill="#1baf7a" stroke="#fcfcfb" stroke-width="2"/>
+<path d="M461.0,282.4 L466.5,292.4 L455.5,292.4 Z" fill="#1baf7a" stroke="#fcfcfb" stroke-width="2"/>
+<path d="M473.5,198.0 L479.0,208.0 L468.0,208.0 Z" fill="#1baf7a" stroke="#fcfcfb" stroke-width="2"/>
+<path d="M484.0,239.7 L489.5,249.7 L478.5,249.7 Z" fill="#1baf7a" stroke="#fcfcfb" stroke-width="2"/>
+<path d="M492.9,157.6 L498.4,167.6 L487.4,167.6 Z" fill="#1baf7a" stroke="#fcfcfb" stroke-width="2"/>
+<path d="M500.6,141.2 L506.1,151.2 L495.1,151.2 Z" fill="#1baf7a" stroke="#fcfcfb" stroke-width="2"/>
+<path d="M507.5,145.6 L513.0,155.6 L502.0,155.6 Z" fill="#1baf7a" stroke="#fcfcfb" stroke-width="2"/>
+<path d="M513.7,140.1 L519.2,150.1 L508.2,150.1 Z" fill="#1baf7a" stroke="#fcfcfb" stroke-width="2"/>
+<path d="M519.3,143.4 L524.8,153.4 L513.8,153.4 Z" fill="#1baf7a" stroke="#fcfcfb" stroke-width="2"/>
+<path d="M524.5,115.1 L530.0,125.1 L519.0,125.1 Z" fill="#1baf7a" stroke="#fcfcfb" stroke-width="2"/>
+<path d="M529.2,109.8 L534.7,119.8 L523.7,119.8 Z" fill="#1baf7a" stroke="#fcfcfb" stroke-width="2"/>
+<path d="M533.6,123.1 L539.1,133.1 L528.1,133.1 Z" fill="#1baf7a" stroke="#fcfcfb" stroke-width="2"/>
+<path d="M537.7,105.7 L543.2,115.7 L532.2,115.7 Z" fill="#1baf7a" stroke="#fcfcfb" stroke-width="2"/>
+<path d="M541.6,103.0 L547.1,113.0 L536.1,113.0 Z" fill="#1baf7a" stroke="#fcfcfb" stroke-width="2"/>
+<path d="M545.2,97.6 L550.7,107.6 L539.7,107.6 Z" fill="#1baf7a" stroke="#fcfcfb" stroke-width="2"/>
+<path d="M548.6,97.4 L554.1,107.4 L543.1,107.4 Z" fill="#1baf7a" stroke="#fcfcfb" stroke-width="2"/>
+<path d="M551.9,93.3 L557.4,103.3 L546.4,103.3 Z" fill="#1baf7a" stroke="#fcfcfb" stroke-width="2"/>
+<path d="M554.9,88.6 L560.4,98.6 L549.4,98.6 Z" fill="#1baf7a" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="601.0" cy="74.0" r="4.5" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<text x="613" y="78" font-size="11" fill="#0b0b0b">one parcel,</text>
+<text x="613" y="92" font-size="11" fill="#0b0b0b">hop after hop</text>
+<rect x="596.5" y="113.5" width="9" height="9" rx="1.5" fill="#eb6834" stroke="#fcfcfb" stroke-width="2"/>
+<text x="613" y="122" font-size="11" fill="#0b0b0b">4-ary consolidation</text>
+<text x="613" y="136" font-size="11" fill="#0b0b0b">of 8-hop coins</text>
+<path d="M601.0,156.5 L606.5,166.5 L595.5,166.5 Z" fill="#1baf7a" stroke="#fcfcfb" stroke-width="2"/>
+<text x="613" y="166" font-size="11" fill="#0b0b0b">24-wallet economy,</text>
+<text x="613" y="180" font-size="11" fill="#0b0b0b">2 assets, swaps</text>
+</svg>

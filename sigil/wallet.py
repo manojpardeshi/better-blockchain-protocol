@@ -6,6 +6,7 @@ and recovering parcels from failed multi-party transitions.
 """
 
 import secrets
+import time
 from collections import defaultdict
 
 from . import locks, model
@@ -98,8 +99,16 @@ def _status(w, sigil: str) -> dict | None:
 
 class Wallet:
     def __init__(self, name: str, network: Network, home: str | None = None, *, trusted=None,
-                 deep_threshold: int | None = None):
+                 deep_threshold: int | None = None, clock=None, pledge_ttl: int = 600,
+                 max_skew: int = 120):
         self.name = name
+        # Our clock bounds every authorisation we sign: a witness never newly
+        # binds a sigil after ``expires`` by its own clock (SPEC §5.1), so
+        # once ``expires + max_skew`` has passed on ours, a spend that failed
+        # can no longer be completed by a delayed request (SPEC §4).
+        self.clock = clock or getattr(network, "clock", None) or (lambda: int(time.time()))
+        self.pledge_ttl = pledge_ttl
+        self.max_skew = max_skew
         self.deep_threshold = deep_threshold  # receipts this large get deep confirmation (None: never)
         self._confirmed: set[tuple] = set()   # (sigil, gen, tid) already deep-confirmed
         self.network = network
@@ -110,7 +119,7 @@ class Wallet:
         self.seeds: dict[str, str] = {}       # pk -> hex seed (KeyPair.from_seed), for persistence
         self.dossier = Dossier()
         self.holdings: dict[str, dict] = {}   # parcel id -> {"ref", "parcel", "sigil", "gen"}
-        self.pledged: dict[str, tuple] = {}   # sigil -> (gen, tid) we authorised; never sign twice
+        self.pledged: dict[str, tuple] = {}   # sigil -> (gen, tid, expires) we authorised; never sign twice
         self.stamps: dict[str, list] = defaultdict(list)
 
     def __repr__(self):
@@ -240,7 +249,14 @@ class Wallet:
 
     # --------------------------------------------------------------- spending
 
+    def release_expired_pledges(self) -> list:
+        """Drop every pledge that has expired and provably bound nothing."""
+        now = int(self.clock())
+        return [s for s, (_g, _t, exp) in list(self.pledged.items())
+                if now > exp + self.max_skew and self.unpledge_if_unbound(s)]
+
     def select(self, asset: str, amount: int) -> tuple[list, int]:
+        self.release_expired_pledges()
         picked, total = [], 0
         for h in sorted(self.holdings.values(), key=lambda h: -h["parcel"]["amount"]):
             if h["parcel"]["asset"] == asset and h["parcel"]["lock"]["op"] == "sig" and h["sigil"] not in self.pledged:
@@ -278,21 +294,32 @@ class Wallet:
         return hd, b, model.transition_id(hd)
 
     def authorise(self, header: dict, body: dict, extra: dict | None = None) -> dict:
-        """Sign for our own inputs. Refuses to ever sign two spends of one sigil."""
+        """Sign for our own inputs. Refuses to ever sign two spends of one sigil.
+
+        Each authorisation expires ``pledge_ttl`` seconds from now: no
+        witness will newly bind the sigil for it after that. Re-authorising
+        the same transition is allowed and extends the expiry.
+        """
         tid = model.transition_id(header)
+        expires = int(self.clock()) + self.pledge_ttl
         unlocks = {}
         for r, (s, g) in zip(body["inputs"], header["inputs"]):
             h = self.holdings.get(model.parcel_id(r))
             if h is None:
                 continue
             prior = self.pledged.get(s)
+            if prior is not None and prior[0] == g and prior[1] != tid and self.unpledge_if_unbound(s):
+                prior = None  # the earlier pledge expired and provably bound nothing
             if prior is not None and prior[0] == g and prior[1] != tid:
                 raise ValueError("refusing to equivocate: sigil already pledged")
-            u = locks.empty_unlock()
+            u = locks.empty_unlock(expires)
             for pk in keys_in(h["parcel"]["lock"]) & set(self.keys):
-                u["sigs"][pk] = sign_unlock(self.keys[pk], s, tid)
+                u["sigs"][pk] = sign_unlock(self.keys[pk], s, tid, expires)
             unlocks[s] = locks.merge_unlocks(u, (extra or {}).get(s, {}))
-            self.pledged[s] = (g, tid)
+            # An earlier authorisation of this tid may still be in flight:
+            # the pledge lasts until the latest one we ever signed expires.
+            keep = prior[2] if prior is not None and prior[:2] == (g, tid) else expires
+            self.pledged[s] = (g, tid, max(keep, expires))
         return unlocks
 
     def seal(self, header: dict, body: dict, unlocks: dict) -> list:
@@ -333,12 +360,20 @@ class Wallet:
         return self.finalise(header, body, unlocks)
 
     def unpledge_if_unbound(self, sigil: str) -> bool:
-        """Drop a pledge only if every witness of the home provably holds no vote for it."""
+        """Drop a pledge only once it is provably dead (SPEC §4).
+
+        That needs both: our authorisation has expired with margin for clock
+        skew (``now > expires + max_skew``), so no delayed request can still
+        newly bind the sigil; and every member of the home answered and
+        none holds a binding or vote for it.
+        """
         pledge = self.pledged.get(sigil)
         h = next((h for h in self.holdings.values() if h["sigil"] == sigil), None)
         if pledge is None or h is None:
             return False
-        gen, tid = pledge
+        gen, tid, expires = pledge
+        if int(self.clock()) <= expires + self.max_skew:
+            return False  # a request still in flight could bind it
         home = h["parcel"]["home"]
         answered = 0
         for w in self.network.all_witnesses(home):

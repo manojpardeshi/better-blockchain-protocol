@@ -107,8 +107,10 @@ def seal_from_votes(votes: list) -> dict:
 
 
 def votes_of_seal(seal: dict) -> list:
+    # Only a vote's own fields come from its entry; any other key in the entry
+    # is ignored, so an entry can never override what the seal claims.
     common = {k: seal[k] for k in ("constellation", "version", "sigil", "gen", "tid")}
-    return [dict(common, **v) for v in seal["votes"]]
+    return [{**common, "witness": v["witness"], "time": v["time"], "sig": v["sig"]} for v in seal["votes"]]
 
 
 def seal_key(sigil: str, tid: str) -> str:

@@ -1,0 +1,4 @@
+[toolchain]
+# plonky2_field uses #![feature(specialization)].
+channel = "nightly"
+profile = "minimal"
