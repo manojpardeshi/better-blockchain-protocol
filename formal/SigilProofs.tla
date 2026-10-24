@@ -87,9 +87,9 @@ VARIABLES
 
 vars == <<gen, bound, votes>>
 
-VoteSpace ==
-    { Vote(c, w, s, g, t) :
-        c \in Cons, w \in Witnesses, s \in Sigils, g \in Nat, t \in Tids }
+(* Every well-typed vote record (equivalently: the image of Vote over       *)
+(* Cons \X Witnesses \X Sigils \X Nat \X Tids).                             *)
+VoteSpace == [con : Cons, wit : Witnesses, sgl : Sigils, gnr : Nat, trn : Tids]
 
 (* The core predicates are parameterised by the vote set V so that we can   *)
 (* reason about how they change as votes accumulate (votes only ever grow). *)
@@ -476,5 +476,196 @@ THEOREM Inv_Safety == Inv => Safety
         <3>nc. ~Complete(tLo) BY <3>dp, <3>tt, <1>dps DEF DeathProofsSound
         <3>. QED BY <3>nc, <1>se1, <1>se2, <2>2 DEF Complete, CompleteV
     <2>. QED BY <2>1, <2>2
+
+-----------------------------------------------------------------------------
+(* ============  PART D: Inv is an inductive invariant of Spec  ============ *)
+
+LEMMA ConsOfType ==
+    ASSUME NEW w \in Witnesses
+    PROVE  ConsOf(w) \in Cons /\ w \in Members[ConsOf(w)]
+BY EveryWitnessPlaced DEF ConsOf
+
+LEMMA GenOfSpec ==
+    ASSUME NEW t \in Tids, NEW s \in SigilsOf(t)
+    PROVE  GenOf(t, s) \in Nat /\ <<s, GenOf(t, s)>> \in Header[t]
+<1>1. PICK p \in Header[t] : s = p[1] BY DEF SigilsOf
+<1>2. p \in Sigils \X Nat BY HeaderType DEF ValidHeader
+<1>3. <<s, p[2]>> \in Header[t] /\ p[2] \in Nat BY <1>1, <1>2
+<1>4. \E g \in Nat : <<s, g>> \in Header[t] BY <1>3
+<1>. QED BY <1>4 DEF GenOf
+
+(* Vote records are equal iff all five fields are.                         *)
+LEMMA VoteEq ==
+    ASSUME NEW c, NEW w, NEW s, NEW g, NEW t,
+           NEW c2, NEW w2, NEW s2, NEW g2, NEW t2
+    PROVE  Vote(c, w, s, g, t) = Vote(c2, w2, s2, g2, t2)
+             <=> (c = c2 /\ w = w2 /\ s = s2 /\ g = g2 /\ t = t2)
+BY DEF Vote
+
+LEMMA VoteFields ==
+    ASSUME NEW c, NEW w, NEW s, NEW g, NEW t
+    PROVE  /\ Vote(c, w, s, g, t).con = c
+           /\ Vote(c, w, s, g, t).wit = w
+           /\ Vote(c, w, s, g, t).sgl = s
+BY DEF Vote
+
+LEMMA InitInv == Init => Inv
+<1>. SUFFICES ASSUME Init PROVE Inv OBVIOUS
+<1>1. TypeOK BY TidsNoTid DEF Init, TypeOK
+<1>2. votes = {} BY DEF Init
+<1>3. VotesShape /\ HonestNoEquiv /\ VoteBelowGen /\ ReleaseDiscipline
+    BY <1>2 DEF VotesShape, HonestNoEquiv, VoteBelowGen, ReleaseDiscipline
+<1>4. BoundVote BY <1>2 DEF Init, BoundVote
+<1>. QED BY <1>1, <1>3, <1>4 DEF Inv
+
+(* ---------------------------------------------------------------- Spend  *)
+LEMMA SpendInv ==
+    ASSUME Inv, NEW w0 \in Honest, NEW s0 \in Sigils, NEW t0 \in Tids,
+           Spend(w0, s0, t0)
+    PROVE  Inv'
+<1> DEFINE g0 == GenOf(t0, s0)
+           c0 == ConsOf(w0)
+           nv == Vote(c0, w0, s0, g0, t0)
+<1>i. TypeOK /\ VotesShape /\ HonestNoEquiv /\ VoteBelowGen /\ BoundVote /\ ReleaseDiscipline
+    BY DEF Inv
+<1>1. s0 \in SigilsOf(t0) /\ Home[s0] = c0 BY DEF Spend
+<1>2. g0 \in Nat /\ <<s0, g0>> \in Header[t0] BY <1>1, GenOfSpec
+<1>3. c0 \in Cons /\ w0 \in Members[c0] BY ConsOfType DEF Witnesses
+<1>4. \/ g0 > gen[w0][s0] /\ bound[w0][s0] = NoTid
+      \/ g0 = gen[w0][s0] /\ bound[w0][s0] \in {NoTid, t0}
+    BY DEF Spend
+<1>5. /\ gen'   = [gen   EXCEPT ![w0][s0] = g0]
+      /\ bound' = [bound EXCEPT ![w0][s0] = t0]
+      /\ votes' = votes \cup {nv}
+    BY DEF Spend
+<1>6. gen[w0][s0] \in Nat /\ g0 >= gen[w0][s0] BY <1>i, <1>2, <1>4 DEF TypeOK
+<1>7. \A w \in Honest, s \in Sigils :
+        gen'[w][s] = IF w = w0 /\ s = s0 THEN g0 ELSE gen[w][s]
+    BY <1>i, <1>5 DEF TypeOK
+<1>8. \A w \in Honest, s \in Sigils :
+        bound'[w][s] = IF w = w0 /\ s = s0 THEN t0 ELSE bound[w][s]
+    BY <1>i, <1>5 DEF TypeOK
+<1>9. \A w \in Honest, s \in Sigils, g \in Nat, t \in Tids :
+        HVote(w, s, g, t) \in votes'
+          <=> (HVote(w, s, g, t) \in votes \/ (w = w0 /\ s = s0 /\ g = g0 /\ t = t0))
+    <2> SUFFICES ASSUME NEW w \in Honest, NEW s \in Sigils, NEW g \in Nat, NEW t \in Tids
+                 PROVE  HVote(w, s, g, t) \in votes'
+                          <=> (HVote(w, s, g, t) \in votes \/ (w = w0 /\ s = s0 /\ g = g0 /\ t = t0))
+        OBVIOUS
+    <2>1. HVote(w, s, g, t) = nv <=> (w = w0 /\ s = s0 /\ g = g0 /\ t = t0)
+        <3>1. HVote(w, s, g, t) = nv <=> (ConsOf(w) = c0 /\ w = w0 /\ s = s0 /\ g = g0 /\ t = t0)
+            BY VoteEq DEF HVote
+        <3>. QED BY <3>1
+    <2>. QED BY <2>1, <1>5
+<1>10. votes \subseteq votes' BY <1>5
+<1>ndt. t0 # NoTid BY TidsNoTid
+
+<1>T. TypeOK'
+    <2>1. gen' \in [Honest -> [Sigils -> Nat]] BY <1>i, <1>5, <1>2 DEF TypeOK
+    <2>2. bound' \in [Honest -> [Sigils -> Tids \cup {NoTid}]] BY <1>i, <1>5 DEF TypeOK
+    <2>3. nv \in VoteSpace
+        <3>1. w0 \in Witnesses BY DEF Witnesses
+        <3>. QED BY <3>1, <1>2, <1>3 DEF VoteSpace, Vote
+    <2>4. votes' \subseteq VoteSpace BY <1>i, <1>5, <2>3 DEF TypeOK
+    <2>. QED BY <2>1, <2>2, <2>4 DEF TypeOK
+
+<1>S. VotesShape'
+    <2> SUFFICES ASSUME NEW v \in votes', v.wit \in Honest
+                 PROVE  v.con = ConsOf(v.wit) /\ Home[v.sgl] = ConsOf(v.wit)
+        BY DEF VotesShape
+    <2>1. CASE v \in votes BY <2>1, <1>i DEF VotesShape
+    <2>2. CASE v = nv
+        <3>1. v.con = c0 /\ v.wit = w0 /\ v.sgl = s0 BY <2>2, VoteFields
+        <3>. QED BY <3>1, <1>1
+    <2>. QED BY <2>1, <2>2, <1>5
+
+<1>E. HonestNoEquiv'
+    <2> SUFFICES ASSUME NEW w \in Honest, NEW s \in Sigils, NEW g \in Nat,
+                        NEW t1 \in Tids, NEW t2 \in Tids,
+                        HVote(w, s, g, t1) \in votes', HVote(w, s, g, t2) \in votes'
+                 PROVE  t1 = t2
+        BY DEF HonestNoEquiv
+    \* A pre-existing vote of w0 on s0 at g0 can only be for t0.
+    <2>0. ASSUME NEW u \in Tids, HVote(w0, s0, g0, u) \in votes PROVE u = t0
+        <3>1. g0 <= gen[w0][s0] BY <2>0, <1>i, <1>2 DEF VoteBelowGen
+        <3>2. g0 = gen[w0][s0] BY <3>1, <1>6, <1>2, SMT
+        <3>3. bound[w0][s0] \in {NoTid, t0} BY <3>2, <1>4, <1>6, <1>2, SMT
+        <3>4. CASE bound[w0][s0] = NoTid
+            BY <3>4, <3>2, <2>0, <1>i DEF BoundVote
+        <3>5. CASE bound[w0][s0] = t0
+            <4>1. HVote(w0, s0, gen[w0][s0], t0) \in votes BY <3>5, <1>ndt, <1>i DEF BoundVote
+            <4>. QED BY <4>1, <3>2, <2>0, <1>i, <1>2 DEF HonestNoEquiv
+        <3>. QED BY <3>3, <3>4, <3>5
+    <2>1. CASE HVote(w, s, g, t1) \in votes /\ HVote(w, s, g, t2) \in votes
+        BY <2>1, <1>i DEF HonestNoEquiv
+    <2>2. CASE (w = w0 /\ s = s0 /\ g = g0 /\ t1 = t0) /\ (w = w0 /\ s = s0 /\ g = g0 /\ t2 = t0)
+        BY <2>2
+    <2>3. CASE (w = w0 /\ s = s0 /\ g = g0 /\ t1 = t0) /\ HVote(w, s, g, t2) \in votes
+        BY <2>3, <2>0
+    <2>4. CASE HVote(w, s, g, t1) \in votes /\ (w = w0 /\ s = s0 /\ g = g0 /\ t2 = t0)
+        BY <2>4, <2>0
+    <2>. QED BY <2>1, <2>2, <2>3, <2>4, <1>9
+
+<1>V. VoteBelowGen'
+    <2> SUFFICES ASSUME NEW w \in Honest, NEW s \in Sigils, NEW g \in Nat, NEW t \in Tids,
+                        HVote(w, s, g, t) \in votes'
+                 PROVE  g <= gen'[w][s]
+        BY DEF VoteBelowGen
+    <2>1. CASE w = w0 /\ s = s0 /\ g = g0 /\ t = t0
+        BY <2>1, <1>7, <1>2, SMT
+    <2>2. CASE HVote(w, s, g, t) \in votes
+        <3>1. g <= gen[w][s] BY <2>2, <1>i DEF VoteBelowGen
+        <3>2. gen[w][s] \in Nat BY <1>i DEF TypeOK
+        <3>. QED BY <3>1, <3>2, <1>7, <1>6, <1>2, SMT
+    <2>. QED BY <2>1, <2>2, <1>9
+
+<1>B. BoundVote'
+    <2> SUFFICES ASSUME NEW w \in Honest, NEW s \in Sigils
+                 PROVE  /\ (bound'[w][s] # NoTid => HVote(w, s, gen'[w][s], bound'[w][s]) \in votes')
+                        /\ (bound'[w][s] = NoTid => \A t \in Tids : HVote(w, s, gen'[w][s], t) \notin votes')
+        BY DEF BoundVote
+    <2>1. CASE w = w0 /\ s = s0
+        <3>1. bound'[w][s] = t0 /\ gen'[w][s] = g0 BY <2>1, <1>7, <1>8
+        <3>2. HVote(w, s, g0, t0) \in votes' BY <2>1, <1>9, <1>2
+        <3>. QED BY <3>1, <3>2, <1>ndt
+    <2>2. CASE ~(w = w0 /\ s = s0)
+        <3>1. bound'[w][s] = bound[w][s] /\ gen'[w][s] = gen[w][s] BY <2>2, <1>7, <1>8
+        <3>2. gen[w][s] \in Nat /\ bound[w][s] \in Tids \cup {NoTid} BY <1>i DEF TypeOK
+        <3>3. bound[w][s] # NoTid => HVote(w, s, gen[w][s], bound[w][s]) \in votes'
+            BY <1>i, <1>10 DEF BoundVote
+        <3>4. bound[w][s] = NoTid => \A t \in Tids : HVote(w, s, gen[w][s], t) \notin votes'
+            <4> SUFFICES ASSUME bound[w][s] = NoTid, NEW t \in Tids
+                         PROVE  HVote(w, s, gen[w][s], t) \notin votes'
+                OBVIOUS
+            <4>1. HVote(w, s, gen[w][s], t) \notin votes BY <1>i DEF BoundVote
+            <4>. QED BY <4>1, <2>2, <3>2, <1>9
+        <3>. QED BY <3>1, <3>3, <3>4
+    <2>. QED BY <2>1, <2>2
+
+<1>R. ReleaseDiscipline'
+    <2> SUFFICES ASSUME NEW w \in Honest, NEW s \in Sigils, NEW g \in Nat, NEW t \in Tids,
+                        HVote(w, s, g, t) \in votes', g < gen'[w][s]
+                 PROVE  DeathProofExistsV(votes', t)
+        BY DEF ReleaseDiscipline, DeathProofExists
+    <2>1. CASE w = w0 /\ s = s0 /\ g = g0 /\ t = t0
+        BY <2>1, <1>7, <1>2, SMT
+    <2>2. CASE HVote(w, s, g, t) \in votes
+        <3>0. gen[w][s] \in Nat BY <1>i DEF TypeOK
+        <3>1. g <= gen[w][s] BY <2>2, <1>i DEF VoteBelowGen
+        <3>2. CASE g < gen[w][s]
+            <4>1. DeathProofExistsV(votes, t) BY <3>2, <2>2, <1>i DEF ReleaseDiscipline, DeathProofExists
+            <4>. QED BY <4>1, <1>10, DeathMonotone
+        <3>3. CASE g = gen[w][s]
+            \* Then g < gen'[w][s] forces (w, s) = (w0, s0) and a jump, which
+            \* happens only while unbound -- yet w0 voted at gen: impossible.
+            <4>1. w = w0 /\ s = s0 BY <3>3, <1>7, SMT
+            <4>2. g0 > gen[w0][s0] BY <3>3, <4>1, <1>7, <1>2, <3>0, SMT
+            <4>3. bound[w0][s0] = NoTid BY <4>2, <1>4, <1>6, <1>2, SMT
+            <4>4. HVote(w0, s0, gen[w0][s0], t) \notin votes BY <4>3, <1>i DEF BoundVote
+            <4>. QED BY <4>4, <4>1, <3>3, <2>2
+        <3>. QED BY <3>1, <3>2, <3>3, <3>0, SMT
+    <2>. QED BY <2>1, <2>2, <1>9
+
+<1>. QED BY <1>T, <1>S, <1>E, <1>V, <1>B, <1>R DEF Inv
 
 ================================================================================
