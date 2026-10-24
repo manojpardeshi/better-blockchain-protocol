@@ -250,4 +250,231 @@ LEMMA HonestInBothQuorums ==
     <2>4. w \in Honest BY <2>2, <2>3 DEF Witnesses
     <2>. QED BY <2>1, <2>2, <2>4
 
+-----------------------------------------------------------------------------
+(* ===================  PART B: the inductive invariant  =================== *)
+
+(* HVote(w,s,g,t): the vote an honest witness w (in constellation ConsOf(w))*)
+(* casts to bind s at g to t.  Only w itself can produce it.                *)
+HVote(w, s, g, t) == Vote(ConsOf(w), w, s, g, t)
+
+TypeOK ==
+    /\ gen   \in [Honest -> [Sigils -> Nat]]
+    /\ bound \in [Honest -> [Sigils -> Tids \cup {NoTid}]]
+    /\ votes \subseteq VoteSpace
+
+(* Every honest witness's vote carries its own constellation, and names a   *)
+(* sigil homed there (SPEC 5.1 step 2).                                     *)
+VotesShape ==
+    \A v \in votes :
+        v.wit \in Honest => /\ v.con = ConsOf(v.wit)
+                            /\ Home[v.sgl] = ConsOf(v.wit)
+
+(* An honest witness never signs two tids at one (sigil, gen)  (SPEC 5.1).  *)
+HonestNoEquiv ==
+    \A w \in Honest, s \in Sigils, g \in Nat, t1, t2 \in Tids :
+        (HVote(w, s, g, t1) \in votes /\ HVote(w, s, g, t2) \in votes) => t1 = t2
+
+(* An honest witness only ever voted at generations <= its current one.     *)
+VoteBelowGen ==
+    \A w \in Honest, s \in Sigils, g \in Nat, t \in Tids :
+        HVote(w, s, g, t) \in votes => g <= gen[w][s]
+
+(* The binding at the current generation reflects exactly the vote cast     *)
+(* there: bound <=> a vote at gen[w][s].                                    *)
+BoundVote ==
+    \A w \in Honest, s \in Sigils :
+        /\ (bound[w][s] # NoTid => HVote(w, s, gen[w][s], bound[w][s]) \in votes)
+        /\ (bound[w][s] = NoTid => \A t \in Tids : HVote(w, s, gen[w][s], t) \notin votes)
+
+(* THE release discipline (SPEC 5.2): an honest witness only advanced past   *)
+(* a generation at which it had voted t by RELEASING, which required a       *)
+(* valid death proof for t -- a timeless fact, still present now.           *)
+ReleaseDiscipline ==
+    \A w \in Honest, s \in Sigils, g \in Nat, t \in Tids :
+        (HVote(w, s, g, t) \in votes /\ g < gen[w][s]) => DeathProofExists(t)
+
+Inv ==
+    /\ TypeOK
+    /\ VotesShape
+    /\ HonestNoEquiv
+    /\ VoteBelowGen
+    /\ BoundVote
+    /\ ReleaseDiscipline
+
+(* ---- Monotonicity: every relevant predicate only strengthens as votes    *)
+(* accumulate.  Needed because Spend and ByzVote only ever ADD votes.       *)
+
+LEMMA VotersMonotone ==
+    ASSUME NEW V1, NEW V2, V1 \subseteq V2,
+           NEW c \in Cons, NEW s, NEW g, NEW t
+    PROVE  /\ VotersV(V1, c, s, g, t) \subseteq VotersV(V2, c, s, g, t)
+           /\ AgainstV(V1, c, s, g, t) \subseteq AgainstV(V2, c, s, g, t)
+BY DEF VotersV, AgainstV
+
+LEMMA CardMonotoneQuorum ==
+    ASSUME NEW c \in Cons, NEW X, NEW Y, X \subseteq Y, Y \subseteq Members[c],
+           Cardinality(X) >= Quorum[c]
+    PROVE  Cardinality(Y) >= Quorum[c]
+<1>1. IsFiniteSet(Members[c]) BY MembersFinite
+<1>2. IsFiniteSet(Y) /\ IsFiniteSet(X) BY <1>1, FS_Subset
+<1>3. Cardinality(X) <= Cardinality(Y) BY <1>2, FS_Subset
+<1>4. Cardinality(X) \in Nat /\ Cardinality(Y) \in Nat BY <1>2, FS_CardinalityType
+<1>. QED BY <1>3, <1>4, QuorumType, SMT
+
+LEMMA SealedByMonotone ==
+    ASSUME NEW V1, NEW V2, V1 \subseteq V2,
+           NEW c \in Cons, NEW s \in Sigils, NEW g \in Nat, NEW t \in Tids,
+           SealedByV(V1, c, s, g, t)
+    PROVE  SealedByV(V2, c, s, g, t)
+<1>1. VotersV(V1, c, s, g, t) \subseteq VotersV(V2, c, s, g, t) BY VotersMonotone
+<1>2. VotersV(V2, c, s, g, t) \subseteq Members[c] BY DEF VotersV
+<1>. QED BY <1>1, <1>2, CardMonotoneQuorum DEF SealedByV
+
+LEMMA AgainstMonotone ==
+    ASSUME NEW V1, NEW V2, V1 \subseteq V2,
+           NEW c \in Cons, NEW s \in Sigils, NEW g \in Nat, NEW t \in Tids,
+           Cardinality(AgainstV(V1, c, s, g, t)) >= Quorum[c]
+    PROVE  Cardinality(AgainstV(V2, c, s, g, t)) >= Quorum[c]
+<1>1. AgainstV(V1, c, s, g, t) \subseteq AgainstV(V2, c, s, g, t) BY VotersMonotone
+<1>2. AgainstV(V2, c, s, g, t) \subseteq Members[c] BY DEF AgainstV
+<1>. QED BY <1>1, <1>2, CardMonotoneQuorum
+
+LEMMA DeathMonotone ==
+    ASSUME NEW V1, NEW V2, V1 \subseteq V2, NEW t \in Tids,
+           DeathProofExistsV(V1, t)
+    PROVE  DeathProofExistsV(V2, t)
+<1>1. PICK p \in Header[t] :
+        \/ \E u \in Tids : u # t /\ SealedV(V1, p[1], p[2], u)
+        \/ Cardinality(AgainstV(V1, Home[p[1]], p[1], p[2], t)) >= Quorum[Home[p[1]]]
+    BY DEF DeathProofExistsV
+<1>2. p \in Sigils \X Nat BY HeaderType DEF ValidHeader
+<1>3. p[1] \in Sigils /\ p[2] \in Nat BY <1>2
+<1>4. Home[p[1]] \in Cons BY <1>3, HomeType
+<1>. QED
+    <2>1. CASE \E u \in Tids : u # t /\ SealedV(V1, p[1], p[2], u)
+        <3>1. PICK u \in Tids : u # t /\ SealedV(V1, p[1], p[2], u) BY <2>1
+        <3>2. SealedV(V2, p[1], p[2], u)
+            BY <3>1, <1>3, <1>4, SealedByMonotone DEF SealedV
+        <3>. QED BY <3>1, <3>2 DEF DeathProofExistsV
+    <2>2. CASE Cardinality(AgainstV(V1, Home[p[1]], p[1], p[2], t)) >= Quorum[Home[p[1]]]
+        <3>1. Cardinality(AgainstV(V2, Home[p[1]], p[1], p[2], t)) >= Quorum[Home[p[1]]]
+            BY <2>2, <1>3, <1>4, AgainstMonotone
+        <3>. QED BY <3>1 DEF DeathProofExistsV
+    <2>. QED BY <1>1, <2>1, <2>2
+
+-----------------------------------------------------------------------------
+(* ============  PART C: the lemmas and theorem, from the invariant  ======= *)
+
+(* Two home seals for one (s, g) share an honest voter, who by              *)
+(* HonestNoEquiv voted for a single tid -- so the two seals agree.          *)
+THEOREM Inv_OneSealPerGen == Inv => OneSealPerGen
+<1>. SUFFICES ASSUME Inv,
+                     NEW s \in Sigils, NEW g \in Nat, NEW t1 \in Tids, NEW t2 \in Tids,
+                     Sealed(s, g, t1), Sealed(s, g, t2)
+              PROVE  t1 = t2
+    BY DEF OneSealPerGen
+<1> DEFINE c == Home[s]
+<1>c. c \in Cons BY HomeType
+<1>fb. FaultBounded(c) BY HomesFaultBounded
+<1>A. Voters(c, s, g, t1) \subseteq Members[c] /\ Cardinality(Voters(c, s, g, t1)) >= Quorum[c]
+    BY DEF Sealed, SealedV, SealedByV, Voters, VotersV
+<1>B. Voters(c, s, g, t2) \subseteq Members[c] /\ Cardinality(Voters(c, s, g, t2)) >= Quorum[c]
+    BY DEF Sealed, SealedV, SealedByV, Voters, VotersV
+<1>h. PICK w \in Voters(c, s, g, t1) \cap Voters(c, s, g, t2) : w \in Honest
+    BY <1>c, <1>fb, <1>A, <1>B, HonestInBothQuorums
+<1>w. w \in Members[c] /\ Vote(c, w, s, g, t1) \in votes /\ Vote(c, w, s, g, t2) \in votes
+    BY <1>h DEF Voters, VotersV
+<1>co. ConsOf(w) = c BY <1>c, <1>w, ConsOfSpec
+<1>. QED BY <1>h, <1>w, <1>co DEF Inv, HonestNoEquiv, HVote
+
+(* A transition with a death proof cannot also be complete.                 *)
+THEOREM Inv_DeathProofsSound == Inv => DeathProofsSound
+<1>. SUFFICES ASSUME Inv, NEW t \in Tids, DeathProofExists(t), Complete(t)
+              PROVE  FALSE
+    BY DEF DeathProofsSound
+<1>osg. OneSealPerGen BY Inv_OneSealPerGen
+<1>1. PICK p \in Header[t] :
+        \/ \E u \in Tids : u # t /\ Sealed(p[1], p[2], u)
+        \/ Cardinality(Against(Home[p[1]], p[1], p[2], t)) >= Quorum[Home[p[1]]]
+    BY DEF DeathProofExists, DeathProofExistsV, Sealed, SealedV, Against, AgainstV
+<1>2. p \in Sigils \X Nat BY HeaderType DEF ValidHeader
+<1>s. p[1] \in Sigils /\ p[2] \in Nat BY <1>2
+<1> DEFINE s == p[1] g == p[2] c == Home[s]
+<1>c. c \in Cons BY <1>s, HomeType
+<1>fb. FaultBounded(c) BY <1>s, HomesFaultBounded
+<1>sel. Sealed(s, g, t) BY <1>s, p \in Header[t] DEF Complete, CompleteV, Sealed, SealedV
+<1>. QED
+    <2>1. CASE \E u \in Tids : u # t /\ Sealed(s, g, u)
+        <3>1. PICK u \in Tids : u # t /\ Sealed(s, g, u) BY <2>1
+        <3>. QED BY <3>1, <1>sel, <1>s, <1>osg DEF OneSealPerGen
+    <2>2. CASE Cardinality(Against(c, s, g, t)) >= Quorum[c]
+        <3>A. Against(c, s, g, t) \subseteq Members[c] /\ Cardinality(Against(c, s, g, t)) >= Quorum[c]
+            BY <2>2 DEF Against, AgainstV
+        <3>B. Voters(c, s, g, t) \subseteq Members[c] /\ Cardinality(Voters(c, s, g, t)) >= Quorum[c]
+            BY <1>sel DEF Sealed, SealedV, SealedByV, Voters, VotersV
+        <3>h. PICK w \in Against(c, s, g, t) \cap Voters(c, s, g, t) : w \in Honest
+            BY <1>c, <1>fb, <3>A, <3>B, HonestInBothQuorums
+        <3>w. w \in Members[c] /\ Vote(c, w, s, g, t) \in votes
+            BY <3>h DEF Voters, VotersV
+        <3>u. PICK u \in Tids : u # t /\ Vote(c, w, s, g, u) \in votes
+            BY <3>h DEF Against, AgainstV
+        <3>co. ConsOf(w) = c BY <1>c, <3>w, ConsOfSpec
+        <3>. QED BY <3>h, <3>w, <3>u, <3>co, <1>s DEF Inv, HonestNoEquiv, HVote
+    <2>. QED BY <1>1, <2>1, <2>2
+
+(* ======================  THE SAFETY THEOREM (SPEC 8)  ==================== *)
+THEOREM Inv_Safety == Inv => Safety
+<1>. SUFFICES ASSUME Inv,
+                     NEW t1 \in Tids, NEW t2 \in Tids,
+                     t1 # t2, Complete(t1), Complete(t2),
+                     NEW s, s \in SigilsOf(t1) \cap SigilsOf(t2)
+              PROVE  FALSE
+    BY DEF Safety
+<1>osg. OneSealPerGen BY Inv_OneSealPerGen
+<1>dps. DeathProofsSound BY Inv_DeathProofsSound
+\* s is an input of both headers, at g1 and g2 respectively.
+<1>p1. PICK g1 \in Nat : <<s, g1>> \in Header[t1]
+    BY HeaderType DEF SigilsOf, ValidHeader
+<1>p2. PICK g2 \in Nat : <<s, g2>> \in Header[t2]
+    BY HeaderType DEF SigilsOf, ValidHeader
+<1>sg. s \in Sigils BY <1>p1, HeaderType DEF ValidHeader
+<1> DEFINE c == Home[s]
+<1>c. c \in Cons BY <1>sg, HomeType
+<1>fb. FaultBounded(c) BY <1>sg, HomesFaultBounded
+<1>se1. Sealed(s, g1, t1) BY <1>p1 DEF Complete, CompleteV, Sealed, SealedV
+<1>se2. Sealed(s, g2, t2) BY <1>p2 DEF Complete, CompleteV, Sealed, SealedV
+<1>. QED
+    <2>1. CASE g1 = g2
+        BY <2>1, <1>se1, <1>se2, <1>sg, <1>p1, <1>osg DEF OneSealPerGen
+    <2>2. CASE g1 # g2
+        \* WLOG the two generations are gLo < gHi; the honest voter in both
+        \* seals voted the lo-tid at gLo and the hi-tid at gHi.
+        <3> DEFINE gLo == IF g1 < g2 THEN g1 ELSE g2
+                   gHi == IF g1 < g2 THEN g2 ELSE g1
+                   tLo == IF g1 < g2 THEN t1 ELSE t2
+                   tHi == IF g1 < g2 THEN t2 ELSE t1
+        <3>lt. gLo \in Nat /\ gHi \in Nat /\ gLo < gHi BY <1>p1, <1>p2, <2>2, SMT
+        <3>tt. tLo \in Tids /\ tHi \in Tids OBVIOUS
+        <3>sl. Sealed(s, gLo, tLo) BY <1>se1, <1>se2
+        <3>sh. Sealed(s, gHi, tHi) BY <1>se1, <1>se2
+        <3>A. Voters(c, s, gLo, tLo) \subseteq Members[c] /\ Cardinality(Voters(c, s, gLo, tLo)) >= Quorum[c]
+            BY <3>sl DEF Sealed, SealedV, SealedByV, Voters, VotersV
+        <3>B. Voters(c, s, gHi, tHi) \subseteq Members[c] /\ Cardinality(Voters(c, s, gHi, tHi)) >= Quorum[c]
+            BY <3>sh DEF Sealed, SealedV, SealedByV, Voters, VotersV
+        <3>h. PICK w \in Voters(c, s, gLo, tLo) \cap Voters(c, s, gHi, tHi) : w \in Honest
+            BY <1>c, <1>fb, <3>A, <3>B, HonestInBothQuorums
+        <3>w. w \in Members[c] /\ Vote(c, w, s, gLo, tLo) \in votes /\ Vote(c, w, s, gHi, tHi) \in votes
+            BY <3>h DEF Voters, VotersV
+        <3>co. ConsOf(w) = c BY <1>c, <3>w, ConsOfSpec
+        \* The hi-vote puts w's generation at or above gHi, so strictly above gLo.
+        <3>vb. gHi <= gen[w][s] BY <3>w, <3>co, <3>tt, <3>lt, <1>sg, <3>h, Zenon DEF Inv, VoteBelowGen, HVote
+        <3>gn. gen[w][s] \in Nat BY <3>h, <1>sg DEF Inv, TypeOK
+        <3>g. gLo < gen[w][s] BY <3>vb, <3>lt, <3>gn, SMT
+        \* The lo-vote with an advanced generation forces a death proof for tLo.
+        <3>dp. DeathProofExists(tLo)
+            BY <3>w, <3>co, <3>tt, <3>lt, <3>g, <1>sg, <3>h DEF Inv, ReleaseDiscipline, HVote
+        <3>nc. ~Complete(tLo) BY <3>dp, <3>tt, <1>dps DEF DeathProofsSound
+        <3>. QED BY <3>nc, <1>se1, <1>se2, <2>2 DEF Complete, CompleteV
+    <2>. QED BY <2>1, <2>2
+
 ================================================================================
