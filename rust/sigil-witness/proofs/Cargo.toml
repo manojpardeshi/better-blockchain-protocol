@@ -1,0 +1,21 @@
+[package]
+name = "sigil-witness-proofs"
+description = "Machine-checked assurance for the Rust Sigil witness: refinement model, Kani proofs, bounded exhaustive checks, differential driver"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+# Standalone (not a member of rust/Cargo.toml) so the shipped workspace is unchanged.
+[workspace]
+
+[dependencies]
+sigil-witness = { path = ".." }
+arbitrary = { version = "1", features = ["derive"], optional = true }
+hex = "0.4"
+
+[features]
+fuzz = ["dep:arbitrary"]
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
