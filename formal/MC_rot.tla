@@ -23,5 +23,10 @@ RotHeader ==
           [] t = "Ta" -> {<<"s", 0>>}               \* conflicting single-input spend of s
           [] t = "Ty" -> {<<"x", 0>>}]              \* consumes x, which kills Tb
 
+\* Adds Tg = {(s,1)}: the owner's recovery spend of s at generation 1, so the
+\* sibling-mode check also covers release out of CONTESTED and respending.
+RotTids4   == RotTids \cup {"Tg"}
+RotHeader4 == [t \in RotTids4 |-> IF t = "Tg" THEN {<<"s", 1>>} ELSE RotHeader[t]]
+
 SymHonest == Permutations(Honest0) \cup Permutations(Honest1)
 =============================================================================

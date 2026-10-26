@@ -136,23 +136,24 @@ A witness MUST make its records (and its frozen flag) durable before it releases
 A witness MUST NOT sign two votes with the same `(constellation, sigil, gen)` and different `tid`.
 
 ### 5.2 RELEASE(sigil, proof)
-1. `r` = record(sigil). Require `r.tid` to be a transition (not null, not contested).
-2. Require `proof` to be a valid death proof for `(r.header, r.tid)` (§3.9).
-3. Append `{kind:"release", gen:r.gen, tid:r.tid, header:r.header, proof}` to `r.log`, then set `r.gen += 1` and clear `tid`, `header`, `vote` and `abstain`.
+1. `r` = record(sigil). Require `r.tid` to be a transition or contested (not null).
+2. If `r` is contested: require `proof` to be a valid death proof for at least one of `r.candidates` (§5.4). For each candidate `(g, tid, header)` it kills, append a `release` entry for it to `r.log`, remove it, and set `r.gen = max(r.gen, g+1)`. Once no candidate is left, clear `tid` and raise `r.gen` past every generation of the witness's own votes. Stop here.
+3. Otherwise require `proof` to be a valid death proof for `(r.header, r.tid)` (§3.9).
+4. Append `{kind:"release", gen:r.gen, tid:r.tid, header:r.header, proof}` to `r.log`, then set `r.gen += 1` and clear `tid`, `header`, `vote` and `abstain`.
 
 ### 5.3 STATUS(sigil)
 Return `{gen, tid, votes}`. `votes` is every vote this witness ever cast on the sigil. Anyone may query. It is used for death proofs and freshness checks.
 
 ### 5.4 FREEZE(next_charter) / ADOPT
-* FREEZE: require `next_charter.prev = H("charter", current body)`. Set frozen (no further votes or releases, ever). Return a signature on `next_charter` and the evidence `{sigil: log ‖ [{kind:"vote", vote} for every vote this witness cast on sigil]}`.
+* FREEZE: require `next_charter.prev = H("charter", current body)`. A witness freezes for exactly one successor: if already frozen for a different `next_charter`, reject. Persist `H("charter", next_charter)` and set frozen (no further votes or releases, ever). Return a signature on `next_charter` and the evidence `{sigil: log ‖ [{kind:"vote", vote} for every vote this witness cast on sigil]}`.
 * The new charter is valid once a quorum of current members have signed it.
 * ADOPT(snapshots), run by each member of the new version. For each sigil, collect the union of log entries from all snapshots, then:
   * keep `bind` entries whose `auth` passes §5.1 step 3 with `now = null`; each gives a pair `(g, tid)`;
   * collect `dead` = the tids of `release` entries whose death proof verifies against their stated header;
   * `alive` = kept bindings whose tid is not in `dead`;
   * `own` = the adopter's own earlier votes on the sigil: valid `vote` entries signed by its own key for this constellation, plus any it already holds (a re-used key MUST bring its own votes);
-  * exactly one alive `(g, tid)` → record `gen = g`, bound to `tid`; if `own` holds a vote at `g` for another tid, mark the record **abstain**: it never votes at `g` (a release still moves it on);
-  * more than one → record **contested** (rejects all spends and releases);
+  * exactly one alive `(g, tid)`, and no other kept binding at `g` → record `gen = g`, bound to `tid`; if `own` holds a vote at `g` for another tid, mark the record **abstain**: it never votes at `g` (a release still moves it on);
+  * otherwise, if any binding is alive → record **contested** with `candidates` = the alive `(g, tid, header)`, at `gen = max over kept bindings of (g+1 if dead else g)`. A contested record rejects all spends; RELEASE removes candidates as they are proven dead (§5.2). Two tids bound at one generation mean the owner equivocated there, and the evidence cannot show which one (if either) a quorum sealed. Inheriting the surviving one could seal a second tid at a generation whose sealed tid was later released;
   * none → record unbound at `gen = max over kept bindings of (g+1 if dead else g)`, raised to one past the highest generation in `own`, or 0.
 
   A witness therefore never signs two tids for one `(constellation, sigil, gen)`, even across charter versions, so §3.8 equivocation proofs cannot be manufactured against an honest key.
@@ -197,7 +198,7 @@ To accept a received parcel, the holder MUST also trust its `home`.
 *Case g₁ = g₂:* contradicts Lemma 1.
 *Case g₁ < g₂:* the seal for `(s, g₂, T₂)` has at least *f*+1 honest voters, and so does the seal for `(s, g₁, T₁)`. These two honest sets have sizes adding up to more than the *n* − *f* honest witnesses, so some honest witness *w* is in both. *w* voted `T₁` at `g₁` and later voted at `g₂ > g₁`. Since *w* was bound at `g₁`, it could only advance by RELEASE, which required a valid death proof for `T₁`. By Lemma 2, `T₁` is not complete. Contradiction. ∎
 
-**Rotation.** Every seal of version *v* shares at least one honest witness with the quorum *F* that froze and signed version *v*+1, and that witness's log contains the binding (with the owner's authorisation, which successors can verify). After freezing, at most *f* honest members of *v* are unfrozen, which is fewer than the *q* − *f* honest votes a new seal needs, so no new seal of version *v* can form. ADOPT therefore keeps every sealed binding as alive (or dead with proof). The **contested** state only arises when an owner authorised two transitions that were never proven dead.
+**Rotation.** Every seal of version *v* shares at least one honest witness with the quorum *F* that froze and signed version *v*+1, and that witness's log contains the binding (with the owner's authorisation, which successors can verify). After freezing, at most *f* honest members of *v* are unfrozen, which is fewer than the *q* − *f* honest votes a new seal needs, so no new seal of version *v* can form. ADOPT therefore keeps every sealed binding as alive (or dead with proof). If a sealed binding `(g, u)` is alive, the new version either binds `u` at `g` or is contested with `u` as a candidate, and leaves `g` only once `u` is proven dead. If `u` is dead, `(g, u)` is still in the evidence, so an alive sibling at `g` makes the record contested and otherwise the record is unbound past `g`. Either way the new version never votes a second tid at `g`. This rule is model-checked in `formal/MC_rot_sibling*.cfg`. The **contested** state only arises when an owner authorised two transitions at one generation.
 
 **Holders cannot be robbed by witnesses.** Rule 6.4 re-checks the owner's unlock, so even a seal produced by a fully corrupt quorum can't spend a parcel without its lock's signatures. Witnesses enforce time locks; holders accept time conditions on the quorum's word.
 

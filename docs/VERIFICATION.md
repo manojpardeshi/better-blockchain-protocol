@@ -14,8 +14,8 @@ Three kinds of evidence, in decreasing order of strength:
    step by step, against the abstract model the proof is about.
 
 Everything here is reproducible with `formal/check.sh` (TLAPS proof + TLC
-models) and `python -m unittest tests.test_conformance` (conformance + bug
-repros). The tools download pinned, SHA-256-checked binaries over TLS.
+models) and `python -m unittest tests.test_conformance` (conformance + rotation
+regression tests). The tools download pinned, SHA-256-checked binaries over TLS.
 
 ---
 
@@ -92,7 +92,10 @@ from TLC 1.8.0 on 4 cores. All of these run from `formal/check.sh`.
 | `MC_proofs_witness`, `MC_proofs_witness2` | `MC_proofs.tla` | non-vacuity: the proof's own spec reaches completions and releases | n=4, 2 sigils, 3 tids, gens 0..1 | **violated (expected)** | — |
 | `MC_proofs` *(opt-in, ≈5 min)* | `MC_proofs.tla` | the proved invariant and §8 hold on all reachable states of a concrete instance; every `ASSUME` is evaluated | same | hold | **774,144** |
 | `MC_rot` | `MC_rot.tla` | **charter rotation**: Safety, cross-version Lemma 1 (`OneSealAcrossVersions`) and honest non-equivocation across FREEZE/ADOPT, with the *fixed* ADOPT | 2 versions of C (n=4 q=3 each), sigils s,x, gens 0..1, eager Byz | hold | 44,746 (depth 19) |
-| `MC_rot_mutant` | `MC_rot.tla` | the **current** ADOPT (SPEC §5.4 / `witness.py`) | same | **violated (expected)** — reproduces the double-spend of §4, Bug 1 | ~4k (depth 10) |
+| `MC_rot_mutant` | `MC_rot.tla` | the **old** ADOPT (before the Bug 1 fix) | same | **violated (expected)** — reproduces the double-spend of §4, Bug 1 | ~4k (depth 10) |
+| `MC_rot_sibling` | `MC_rot.tla` | the **implemented** ADOPT (`AdoptMode = "sibling"`, SPEC §5.4 / `witness.py`): same-generation siblings make the sigil contested; contested release | same | hold | 11,916 |
+| `MC_rot_sibling4` | `MC_rot.tla` | as above, plus `Tg = {(s,1)}` (recovery spend at gen 1) | same + Tg | hold | ~28k |
+| `MC_rot_sibling_witness`, `…_witness2` | `MC_rot.tla` | non-vacuity: Tg completes after rotation; a contested record is released | same + Tg | **violated (expected)** | — |
 | `MC_expiry` | `SigilExpiry.tla` | **owner-signed expiry** + the wallet unpledge rule: with drifting clocks and arbitrarily delayed requests, once the wallet drops a pledge the tid can never be sealed | n=4 q=3, skew 1, `max_skew` 2, time 0..7 | hold | 113,030 |
 | `MC_expiry_mutant`, `MC_expiry_skew_mutant` | `SigilExpiry.tla` | witness ignores expiry / wallet margin `max_skew < 2·skew` | same | **violated (expected)** | — |
 | `MC_deep` | `SigilDeep.tla` | **deep confirmation** (SPEC §9): `f+1` current-charter confirmations ⇒ the binding is real, against a retired-key forgery; and the true binding is always confirmable | current n=4 f=1, threshold 2 | hold | 4 |
@@ -144,7 +147,7 @@ generation floor is caught, so the checks are not vacuous.
   60 steps) ≈ 3 s; scales via `SIGIL_CONFORMANCE_SEEDS` / `SIGIL_CONFORMANCE_STEPS`
   (120 × 150 ≈ 25 s) with no violation.
 * **With rotation**, conformance against the single-version model does not apply;
-  the two `KnownBugTests` below reproduce real defects.
+  `RotationRegressionTests` covers the two rotation bugs of §4.
 
 This links the verified model to the code for the single-version witness. It
 does **not** verify the wallet, the server, persistence, or the Rust witness.
@@ -153,11 +156,10 @@ does **not** verify the wallet, the server, persistence, or the Rust witness.
 
 ## 4. Bugs found
 
-Both are reproduced as `@expectedFailure` tests in `tests/test_conformance.py`
-(class `KnownBugTests`): they assert the *safe* behaviour, so they fail today
-and will pass once fixed. They are **not** fixed here (the reference code is out
-of scope for this work); the suggested fixes are below and in the test
-docstrings.
+Both are **fixed** in `sigil/witness.py`, and `tests/test_conformance.py`
+(class `RotationRegressionTests`) now holds them as regression tests: each
+fails against the old code and passes with the fix. The ADOPT test also covers
+the dual scenario below, and fails against the naive one-line patch.
 
 ### Bug 1 — ADOPT re-opens a consumed generation (safety: double-spend)
 
@@ -184,7 +186,20 @@ Since the inputs are identical but the correct outputs differ, **no function of
 "drop alive bindings below the floor" patch is therefore wrong (it breaks the
 second scenario; `MC_rot` found this).
 
-**Suggested fix (verified safe in the model).** ADOPT must key off the **seals**
+**Implemented fix.** ADOPT inherits a lone alive binding only if no other tid
+was bound at its generation. Otherwise the sigil becomes **contested** with the
+alive bindings as candidates, and RELEASE removes each candidate once it is
+proven dead (SPEC §5.2, §5.4). This needs no seals in the evidence. A sealed
+binding is always in the evidence (quorum intersection), so with siblings at its
+generation the new charter never votes there: it waits until every live
+candidate is dead. In both scenarios above this is safe: in the first, Tb's seal
+proves Ta dead and the owner recovers at generation 1; in the second, nothing
+proves Ta dead and s stays consumed by Ta. The cost is liveness for an owner who
+equivocated: an unsealed sibling that can never be proven dead keeps the sigil
+contested. `formal/MC_rot_sibling*.cfg` checks the rule (`AdoptMode =
+"sibling"`); the idealised seal-aware ADOPT below is kept as `MC_rot.cfg`.
+
+**Idealised alternative (verified safe in the model).** ADOPT could key off the **seals**
 that formed in the old version, not the raw bindings: the record for `(s,g)` is
 whatever tid a quorum *sealed* there (SPEC §8 Lemma 1 ⇒ at most one), advanced
 if that tid is dead; an unsealed bind is a mere attempt and is ignored. This
@@ -210,10 +225,10 @@ was tricked into certifying the attacker's successor). SPEC §3.7 ("v+1 MUST be
 signed by a quorum of v") and the whitepaper ("a quorum signs *the* new
 charter") both intend a single successor.
 
-**Suggested fix.** Make FREEZE bind to one successor: persist the frozen
-successor's `charter_hash`; a later `freeze` of a different `next_charter` is
-refused (the same one may return the stored signature). See the test docstring
-for the exact shape. *(Confidence: the double-signing is certainly unintended;
+**Fixed.** FREEZE binds to one successor: it persists the frozen successor's
+`charter_hash` and refuses a later `freeze` of a different `next_charter`
+(the same one is signed again). Stores written before the fix hold `true`, so
+their successor is unknown and any second freeze is refused. *(Confidence: the double-signing is certainly unintended;
 end-to-end exploitation additionally needs the victim to adopt the attacker's
 fork, which `verify_chain` currently accepts.)*
 
@@ -232,9 +247,10 @@ models assume the fixed semantics (a vote is counted only under the seal's own
 The results above concern the **witness protocol and its abstract model** under
 **idealised cryptography**. None of the following is verified:
 
-* **The ADOPT fix is not implemented** in `sigil/`. The proof covers a single
-  charter version; rotation safety is only *bounded*-checked, and only with the
-  *proposed* seal-aware ADOPT. The shipped ADOPT has Bug 1.
+* **Rotation is only bounded-checked.** The proof covers a single charter
+  version. The implemented ADOPT is model-checked for two versions, two
+  sigils, up to four transitions and generations 0..1, with the freezing
+  quorum's logs modelled as the full honest union.
 * **Wallet logic** (`sigil/wallet.py`): selection, authorisation, pledge
   bookkeeping, deep-confirmation orchestration, abort/recovery. Only the
   witness-facing *expiry* and *deep-confirmation counting* rules are modelled
@@ -263,8 +279,8 @@ single-version witness protocol's core safety theorem holds for all sizes under
 the stated assumptions (machine-checked); several rotation/expiry/confirmation
 properties hold on small instances (machine-checked, with mutation tests); the
 real witness code refines the proved model on non-rotation schedules (tested);
-and two concrete safety-relevant bugs in the reference code are reproduced, with
-fixes described.
+and two concrete safety-relevant bugs in the reference code were found,
+reproduced and fixed, with the fixed ADOPT model-checked.
 
 ---
 
@@ -278,7 +294,7 @@ formal/check.sh            # (TLAPS runs only with no config args)
 SIGIL_SKIP_TLAPS=1 formal/check.sh MC_rot.cfg MC_rot_mutant.cfg   # one TLC pair
 SIGIL_TLC_EXTRA=MC_proofs.cfg formal/check.sh                    # + the 5-min non-vacuity run
 
-# conformance of the real witness, and the two bug repros:
+# conformance of the real witness, and the rotation regression tests:
 python -m unittest tests.test_conformance
 SIGIL_CONFORMANCE_SEEDS=120 SIGIL_CONFORMANCE_STEPS=150 \
     python -m unittest tests.test_conformance.ConformanceTests

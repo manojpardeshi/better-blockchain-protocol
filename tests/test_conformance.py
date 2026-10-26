@@ -323,47 +323,22 @@ class ConformanceTests(unittest.TestCase):
         self.assertTrue(found, "the mirror failed to catch an amnesiac witness")
 
 
-class KnownBugTests(unittest.TestCase):
-    """Regression repros for defects the proof's scope does not cover.
+class RotationRegressionTests(unittest.TestCase):
+    """Regressions for two rotation bugs the bounded explorer found.
 
-    The TLAPS proof (formal/SigilProofs.tla) models a single charter version.
-    The real code also rotates charters (SPEC Section 5.4 ADOPT), which the
-    proof does not cover -- and the explorer below finds a genuine
-    double-spend there. These tests are marked expectedFailure: they ASSERT
-    the safe behaviour, so they fail today and will pass once the fix lands.
+    The TLAPS proof (formal/SigilProofs.tla) models one charter version.
+    Rotation (SPEC 5.4) is model-checked in formal/SigilRot.tla, whose
+    "sibling" mode is the ADOPT implemented in sigil/witness.py.
     """
 
-    @unittest.expectedFailure
-    def test_adopt_does_not_reopen_a_consumed_generation(self):
-        """BUG (sigil/witness.py Witness.adopt): a surviving same-generation
-        sibling binding re-opens a generation that a sealed-then-released
-        binding had already consumed, letting rotation create a SECOND seal
-        for one (sigil, gen) and a double consumption.
+    def _scenario(self, sealed: str):
+        """The owner equivocates on s at generation 0 with Tb = {(s,0),(x,0)}
+        and Ta = {(s,0)}. ``sealed`` names the one a quorum seals; one witness
+        binds the other. x is consumed by Ty, so Tb is provably dead, and the
+        witnesses bound to Tb release s. Then the constellation rotates.
 
-        Scenario (all witnesses honest; only the owner equivocates):
-          * sigil s and x. Tb = {(s,0),(x,0)}; Ta = {(s,0)}; Ty = {(x,0)};
-            Tg = {(s,1)}.
-          * A quorum binds and SEALS (s,0) -> Tb; one witness binds (s,0) -> Ta.
-          * x is consumed by Ty, so Tb is provably dead; the quorum releases s
-            to generation 1 (correct recovery).
-          * The constellation rotates (fresh keys). ADOPT sees (s,0)->Tb dead
-            and (s,0)->Ta alive, computes floor = 1, but the single-alive
-            branch sets gen = 0 (ignoring floor): all new witnesses re-bind Ta
-            at (s,0) and SEAL it -> Ta complete at (s,0).
-          * The retired v0 seal for Tb at (s,0) is still a valid death proof
-            for Ta, so the new witnesses release s to gen 1 and seal Tg at
-            (s,1) -> Tg complete.
-          * s is now consumed by Ta (gen 0) and Tg (gen 1): a double spend.
-
-        SUGGESTED FIX (one line in Witness.adopt): keep only alive bindings at
-        or above the floor, since a lower one was superseded by a
-        sealed-then-dead sibling:
-
-            alive = {(g, t): h for (g, t), h in binds.items()
-                     if t not in dead and g >= floor}
-
-        With the fix, the new witnesses adopt unbound at gen 1 and Ta can
-        never be sealed at (s,0); only Tg (s,1) consumes s.
+        Both orders leave ADOPT the same evidence, binds {(0,Tb), (0,Ta)} with
+        Tb dead, but need opposite outcomes, so ADOPT must not inherit Ta.
         """
         net = Network()
         X = net.create_constellation("orion", 4)
@@ -376,73 +351,79 @@ class KnownBugTests(unittest.TestCase):
 
         ps, s = mk("s")
         px, x = mk("x")
-
-        def tgt(p):
-            return {"home": p["home"], "lock": p["lock"], "salt": p["salt"]}
-
-        def hdr(inputs, tag):
-            return {"inputs": [list(i) for i in inputs], "body": tag * 64}
+        tgt = lambda p: {"home": p["home"], "lock": p["lock"], "salt": p["salt"]}
+        hdr = lambda inputs, tag: {"inputs": [list(i) for i in inputs], "body": tag * 64}
 
         def req(h, sigil, p):
-            t = model.transition_id(h)
             u = locks.empty_unlock(exp)
-            u["sigs"][owner.pk] = locks.sign_unlock(owner, sigil, t, exp)
-            return {"sigil": sigil, "header": h, "home": X,
-                    "lock": p["lock"], "salt": p["salt"], "unlock": u}
+            u["sigs"][owner.pk] = locks.sign_unlock(owner, sigil, model.transition_id(h), exp)
+            return {"sigil": sigil, "header": h, "home": X, "lock": p["lock"], "salt": p["salt"], "unlock": u}
 
-        k = net.witnesses(X)
-        tid = model.transition_id
         Ty, Tb, Ta, Tg = hdr([(x, 0)], "1"), hdr([(s, 0), (x, 0)], "2"), hdr([(s, 0)], "3"), hdr([(s, 1)], "4")
-
+        k = net.witnesses(X)
         seal_y = model.seal_from_votes([w.spend(req(Ty, x, px)) for w in k])
-        seal_b = model.seal_from_votes([w.spend(req(Tb, s, ps)) for w in k[:3]])
-        k[3].spend(req(Ta, s, ps))
+        quorum_tx, single_tx = (Tb, Ta) if sealed == "Tb" else (Ta, Tb)
+        seal_q = model.seal_from_votes([w.spend(req(quorum_tx, s, ps)) for w in k[:3]])
+        k[3].spend(req(single_tx, s, ps))
         dp_b = {"kind": "seal", "sigil": x, "gen": 0, "parcel": tgt(px), "seal": seal_y}
-        for w in k[:3]:
+        for w in (k[:3] if sealed == "Tb" else k[3:]):
             w.release(s, dp_b)
-
         net.rotate(X, [KeyPair.generate() for _ in range(4)])
-        new = net.witnesses(X)
 
-        seal_a = model.seal_from_votes([w.spend(req(Ta, s, ps)) for w in new])
-        dp_a = {"kind": "seal", "sigil": s, "gen": 0, "parcel": tgt(ps), "seal": seal_b}
-        for w in new:
-            try:
-                w.release(s, dp_a)
-            except Rejected:
-                pass
-        seal_g = model.seal_from_votes([w.spend(req(Tg, s, ps)) for w in new])
+        def try_seal(h):
+            votes = []
+            for w in net.witnesses(X):
+                try:
+                    votes.append(w.spend(req(h, s, ps)))
+                except (Rejected, Conflict):
+                    pass
+            seal = model.seal_from_votes(votes) if votes else None
+            return seal if seal and verify_seal(seal, net.registry) else None
 
-        double = (tid(Ta) != tid(Tg)
-                  and verify_seal(seal_a, net.registry) and verify_seal(seal_g, net.registry))
-        self.assertFalse(double, "sigil s was consumed by two complete transitions after rotation")
+        def release_all(proof):
+            for w in net.witnesses(X):
+                try:
+                    w.release(s, proof)
+                except Rejected:
+                    pass
 
-    @unittest.expectedFailure
+        return net, X, s, ps, tgt, (Ta, Tg), seal_q, try_seal, release_all
+
+    def test_adopt_does_not_reopen_a_consumed_generation(self):
+        """Tb sealed then released: the new charter must never seal Ta at (s,0).
+
+        The old ADOPT inherited the lone live binding Ta, so the new witnesses
+        sealed Ta at (s,0). Tb's old seal then proved Ta dead, s moved to
+        generation 1 and Tg was sealed too: s was consumed twice.
+        """
+        net, X, s, ps, tgt, (Ta, Tg), seal_b, try_seal, release_all = self._scenario("Tb")
+        for w in net.witnesses(X):
+            self.assertEqual(w.records[s].tid, CONTESTED)
+        self.assertIsNone(try_seal(Ta), "the new charter sealed a second tid at (s,0)")
+        # The owner recovers: Tb's seal proves Ta dead, so s moves on to generation 1.
+        release_all({"kind": "seal", "sigil": s, "gen": 0, "parcel": tgt(ps), "seal": seal_b})
+        self.assertIsNotNone(try_seal(Tg))
+        self.assertIsNone(try_seal(Ta))
+
+    def test_adopt_keeps_a_sealed_sibling(self):
+        """Dual case: Ta sealed, Tb released. s is consumed by Ta, so Tg must never be sealed."""
+        net, X, s, ps, tgt, (Ta, Tg), seal_a, try_seal, release_all = self._scenario("Ta")
+        self.assertIsNone(try_seal(Tg))
+        # Nothing proves Ta dead: the only other seal at (s,0) does not exist.
+        release_all({"kind": "seal", "sigil": s, "gen": 0, "parcel": tgt(ps), "seal": seal_a})
+        self.assertIsNone(try_seal(Tg), "s was consumed by Ta and again by Tg")
+        self.assertTrue(verify_seal(seal_a, net.registry))
+
     def test_freeze_commits_to_a_single_successor_charter(self):
-        """BUG (sigil/witness.py Witness.freeze): a frozen witness will sign
+        """Regression (sigil/witness.py Witness.freeze): a frozen witness signed
         MORE THAN ONE successor charter, so honest witnesses can be made to
         certify two conflicting version-(v+1) charters, each reaching a v0
         quorum -- a charter fork.
 
-        SPEC Section 3.7 says 'version v+1 MUST be signed by a quorum of
-        version v's witnesses', and the whitepaper describes rotation as
-        'a quorum of them signs THE new charter'. Nothing stops an honest
-        frozen witness from also signing a second, attacker-chosen successor
-        with entirely different membership. Both forks then verify
-        (charter.verify_chain), and a victim that adopts the attacker's fork
-        has its 'current charter' -- the one SPEC Section 9 deep confirmation
-        trusts -- populated with attacker keys, defeating deep confirmation.
-
-        SUGGESTED FIX: make FREEZE bind to one successor. Persist the frozen
-        successor's charter_hash; a later freeze of a DIFFERENT next_charter
-        must be refused (and the same one may return the stored signature):
-
-            if self.frozen:
-                if charter_hash(next_charter) != self._frozen_for:
-                    raise Rejected("already frozen for a different successor")
-                return sign_charter(self.kp, next_charter), <stored snapshot>
-            ...
-            self._persist(("frozen", "", True), ("frozen_for", "", charter_hash(next_charter)))
+        Both forks then pass charter.verify_chain, and a victim that adopts
+        the attacker's fork trusts attacker keys as the current charter,
+        defeating SPEC Section 9 deep confirmation. FREEZE now persists the
+        successor's hash and refuses any other successor.
 
         This test asks each honest witness to freeze for successor A and then
         for a DIFFERENT successor B; it asserts the second freeze is refused.

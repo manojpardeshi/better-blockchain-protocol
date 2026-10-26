@@ -34,7 +34,10 @@ CONSTANTS
     Tids, Header,       \* transitions and their input sets
     MaxGen,
     AdoptMode           \* "real": the current SPEC 5.4 / witness.py ADOPT
-                        \* "sealaware": the fix (ADOPT uses v0 SEALS, not binds)
+                        \* "sealaware": idealised fix (ADOPT reads v0 SEALS directly)
+                        \* "sibling": the implemented fix (a same-generation
+                        \*   sibling makes the sigil CONTESTED; it is released
+                        \*   once every live candidate is proven dead)
 
 Q == 3
 NoTid == "none"
@@ -60,9 +63,10 @@ VARIABLES
     votes,      \* set of <<v, w, s, g, t>> : every vote ever cast (both versions)
     binds,      \* binds[s] : set of <<g,t>> ever bound by an honest v0 witness (log union)
     rel,        \* rel[s]   : set of tids an honest v0 witness released (death-proof-backed)
-    adopted     \* TRUE once v1 has adopted
+    adopted,    \* TRUE once v1 has adopted
+    cand        \* cand[v][w][s] : live <<g,t>> candidates of a CONTESTED record
 
-vars == <<ver, gen, bound, votes, binds, rel, adopted>>
+vars == <<ver, gen, bound, votes, binds, rel, adopted, cand>>
 
 Vote(v, w, s, g, t) == <<v, w, s, g, t>>
 
@@ -85,12 +89,15 @@ DeathProof(t) ==
             \/ \E u \in Tids : u # t /\ Sealed(s, g, u)
             \/ \E v \in {0,1} : Cardinality(VotersAgainst(v, s, g, t)) >= Q
 
+MaxOr0(F) == IF F = {} THEN 0 ELSE CHOOSE m \in F : \A k \in F : k <= m
+
 -----------------------------------------------------------------------------
 TypeOK ==
     /\ ver \in {0, 1}
     /\ gen \in [{0,1} -> [AllHonest -> [Sigils -> 0..(MaxGen+1)]]]
     /\ bound \in [{0,1} -> [AllHonest -> [Sigils -> Tids \cup {NoTid, CONTESTED}]]]
     /\ adopted \in BOOLEAN
+    /\ cand \in [{0,1} -> [AllHonest -> [Sigils -> SUBSET (Gens \X Tids)]]]
 
 \* Byzantine votes are EAGER: every vote the re-used Byzantine key Z could
 \* ever sign (in either version, for any sigil/gen/tid) exists from the start.
@@ -108,6 +115,7 @@ Init ==
     /\ binds = [s \in Sigils |-> {}]
     /\ rel = [s \in Sigils |-> {}]
     /\ adopted = FALSE
+    /\ cand = [v \in {0,1} |-> [w \in AllHonest |-> [s \in Sigils |-> {}]]]
 
 \* ---- Active-version dynamics (SPEC 5.1 / 5.2), honest witness w of ver ----
 Spend(w, s, t) ==
@@ -121,7 +129,7 @@ Spend(w, s, t) ==
         /\ votes' = votes \cup {Vote(ver, w, s, g, t)}
         \* Record the bind in the v0 evidence log (only v0 logs feed ADOPT).
         /\ binds' = IF ver = 0 THEN [binds EXCEPT ![s] = @ \cup {<<g, t>>}] ELSE binds
-        /\ UNCHANGED <<ver, rel, adopted>>
+        /\ UNCHANGED <<ver, rel, adopted, cand>>
 
 Release(w, s) ==
     /\ w \in HonestV(ver)
@@ -130,10 +138,23 @@ Release(w, s) ==
     /\ rel' = IF ver = 0 THEN [rel EXCEPT ![s] = @ \cup {bound[ver][w][s]}] ELSE rel
     /\ gen' = [gen EXCEPT ![ver][w][s] = @ + 1]
     /\ bound' = [bound EXCEPT ![ver][w][s] = NoTid]
-    /\ UNCHANGED <<ver, votes, binds, adopted>>
+    /\ UNCHANGED <<ver, votes, binds, adopted, cand>>
+
+\* A CONTESTED record (sibling mode) drops each candidate proven dead and
+\* moves past its generation; once none is left it is unbound.
+ReleaseContested(w, s) ==
+    /\ w \in HonestV(ver)
+    /\ bound[ver][w][s] = CONTESTED
+    /\ \E b \in cand[ver][w][s] :
+        /\ DeathProof(b[2])
+        /\ LET rest == cand[ver][w][s] \ {b} IN
+            /\ cand' = [cand EXCEPT ![ver][w][s] = rest]
+            \* No votes while contested, so gen may rise with each dead candidate.
+            /\ gen' = [gen EXCEPT ![ver][w][s] = IF b[1] + 1 > @ THEN b[1] + 1 ELSE @]
+            /\ bound' = IF rest = {} THEN [bound EXCEPT ![ver][w][s] = NoTid] ELSE bound
+    /\ UNCHANGED <<ver, votes, binds, rel, adopted>>
 
 \* ---- Rotation: freeze v0 and adopt v1 (SPEC 5.4) ----
-MaxOr0(F) == IF F = {} THEN 0 ELSE CHOOSE m \in F : \A k \in F : k <= m
 
 \* (a) The CURRENT algorithm (SPEC 5.4 / witness.py adopt), computed from the
 \* union of the freezing quorum's honest logs: the binds made and the tids
@@ -161,7 +182,25 @@ AdoptSeal(s) ==
     ELSE IF Cardinality(AliveSealed(s)) > 1 THEN [g |-> SealFloor(s), tid |-> CONTESTED]
     ELSE [g |-> SealFloor(s), tid |-> NoTid]
 
-AdoptRec(s) == IF AdoptMode = "sealaware" THEN AdoptSeal(s) ELSE AdoptReal(s)
+\* (c) The IMPLEMENTED fix (witness.py adopt). It uses only the evidence log.
+\* If two different tids were bound at one generation the owner equivocated
+\* there, and the log cannot tell which one a v0 quorum sealed (if either).
+\* So a lone live binding with a same-generation sibling, dead or alive, is
+\* not inherited: the sigil becomes CONTESTED with every live binding as a
+\* candidate, and is only released once each candidate is proven dead.
+HasSibling(s, b) == \E u \in Tids : u # b[2] /\ <<b[1], u>> \in binds[s]
+AdoptSib(s) ==
+    IF AliveReal(s) = {}
+        THEN [g |-> Floor(s), tid |-> NoTid, cand |-> {}]
+    ELSE IF Cardinality(AliveReal(s)) = 1
+            /\ ~HasSibling(s, CHOOSE b \in AliveReal(s) : TRUE)
+        THEN LET b == CHOOSE b \in AliveReal(s) : TRUE IN [g |-> b[1], tid |-> b[2], cand |-> {}]
+    ELSE [g |-> Floor(s), tid |-> CONTESTED, cand |-> AliveReal(s)]
+
+AdoptRec(s) ==
+    CASE AdoptMode = "sealaware" -> [g |-> AdoptSeal(s).g, tid |-> AdoptSeal(s).tid, cand |-> {}]
+      [] AdoptMode = "sibling"   -> AdoptSib(s)
+      [] OTHER                   -> [g |-> AdoptReal(s).g, tid |-> AdoptReal(s).tid, cand |-> {}]
 
 Adopt ==
     /\ ver = 0
@@ -171,11 +210,13 @@ Adopt ==
     /\ adopted' = TRUE
     /\ gen' = [gen EXCEPT ![1] = [w \in AllHonest |-> [s \in Sigils |-> AdoptRec(s).g]]]
     /\ bound' = [bound EXCEPT ![1] = [w \in AllHonest |-> [s \in Sigils |-> AdoptRec(s).tid]]]
+    /\ cand' = [cand EXCEPT ![1] = [w \in AllHonest |-> [s \in Sigils |-> AdoptRec(s).cand]]]
     /\ UNCHANGED <<votes, binds, rel>>
 
 Next ==
     \/ \E w \in HonestV(ver), s \in Sigils, t \in Tids : Spend(w, s, t)
     \/ \E w \in HonestV(ver), s \in Sigils : Release(w, s)
+    \/ \E w \in HonestV(ver), s \in Sigils : ReleaseContested(w, s)
     \/ Adopt
 
 Spec == Init /\ [][Next]_vars
@@ -200,4 +241,13 @@ HonestNoEquiv ==
     \A v \in {0,1} : \A w \in HonestV(v) :
         \A s \in Sigils, g \in Gens, t1, t2 \in Tids :
             (Vote(v, w, s, g, t1) \in votes /\ Vote(v, w, s, g, t2) \in votes) => t1 = t2
+
+\* Non-vacuity (MC_rot_sibling_witness.cfg, EXPECTED to be violated): after
+\* rotation the owner can still recover s and complete Tg at generation 1.
+TgNeverCompletes == ~(adopted /\ "Tg" \in Tids /\ Complete("Tg"))
+\* ...and a CONTESTED record really is released (binds and rel are frozen after
+\* ADOPT, so AdoptRec(s) is still what each v1 witness adopted).
+NoContestedRelease ==
+    ~(adopted /\ \E w \in Honest1, s \in Sigils :
+        AdoptRec(s).tid = CONTESTED /\ bound[1][w][s] = NoTid)
 ================================================================================
