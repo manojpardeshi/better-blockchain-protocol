@@ -51,10 +51,12 @@ class Record:
     log: list = field(default_factory=list)    # evidence handed to successors on rotation
     votes: list = field(default_factory=list)  # every vote we ever cast on this sigil
     abstain: bool = False           # our key already voted another tid at ``gen``: never vote here
+    candidates: list = field(default_factory=list)  # CONTESTED: live [gen, tid, header] still to be proven dead
 
     def copy(self) -> "Record":
         """A working copy; log entries are never mutated, so the lists are copied shallowly."""
-        return Record(self.gen, self.tid, self.header, self.vote, list(self.log), list(self.votes), self.abstain)
+        return Record(self.gen, self.tid, self.header, self.vote, list(self.log), list(self.votes),
+                      self.abstain, list(self.candidates))
 
 
 def authorises(sigil: str, auth: dict) -> tuple[int, str] | None:
@@ -92,6 +94,7 @@ class Witness:
         self.cid: str | None = None
         self.version: int | None = None
         self.frozen = False
+        self.frozen_for: str | None = None  # hash of the one successor charter we froze for
         self.records: dict[str, Record] = {}
         self.store = store
         if store is not None:
@@ -107,7 +110,10 @@ class Witness:
             raise ValueError("store belongs to a different witness key")
         if state["member"] is not None:
             self.cid, self.version = state["member"]
-        self.frozen = state["frozen"]
+        # Stores written before successor binding hold ``true``: the successor
+        # is unknown, so any further freeze is refused.
+        self.frozen = bool(state["frozen"])
+        self.frozen_for = state["frozen"] if isinstance(state["frozen"], str) else None
         self.records = {s: Record(**r) for s, r in state["records"].items()}
         if self.stamps is not None:
             self.stamps.mark_redeemed(state["stamps"])
@@ -204,11 +210,16 @@ class Witness:
         Returns the new generation. Releasing is what keeps an honest
         participant's parcel from being stuck when a counter-party in a
         multi-input transition equivocates on *their* input.
+
+        A CONTESTED record drops each candidate that ``proof`` kills, and is
+        released once none is left.
         """
         if self.cid is None or self.frozen:
             raise Rejected("witness not active")
         rec = self.records.get(sigil)
-        if rec is None or rec.tid is None or rec.tid == CONTESTED:
+        if rec is not None and rec.tid == CONTESTED:
+            return self._release_contested(sigil, rec, proof)
+        if rec is None or rec.tid is None:
             raise Rejected("nothing to release")
         if not proves_dead(rec.header, rec.tid, proof, self.registry):
             raise Rejected("invalid death proof")
@@ -217,6 +228,25 @@ class Witness:
         rec.gen += 1
         rec.tid = rec.header = rec.vote = None
         rec.abstain = False
+        self._persist(self._rec(sigil, rec))
+        self.records[sigil] = rec
+        return rec.gen
+
+    def _release_contested(self, sigil: str, rec: Record, proof: dict) -> int:
+        killed = [c for c in rec.candidates if proves_dead(c[2], c[1], proof, self.registry)]
+        if not killed:
+            raise Rejected("invalid death proof")
+        rec = rec.copy()
+        for g, t, h in killed:
+            rec.log.append({"kind": "release", "gen": g, "tid": t, "header": h, "proof": proof})
+        rec.candidates = [c for c in rec.candidates if c not in killed]
+        # We never vote while contested, so the generation can rise as each
+        # candidate dies; once none is left we sit past all of them, unbound.
+        rec.gen = max([rec.gen] + [g + 1 for g, _, _ in killed])
+        if not rec.candidates:
+            rec.tid = None
+            if rec.votes:  # a re-used key skips every generation it voted at (abstention)
+                rec.gen = max(rec.gen, max(v["gen"] for v in rec.votes) + 1)
         self._persist(self._rec(sigil, rec))
         self.records[sigil] = rec
         return rec.gen
@@ -245,8 +275,14 @@ class Witness:
             raise Rejected("witness not active")
         if next_charter["prev"] != charter_hash(self.registry.charter(self.cid, self.version)):
             raise Rejected("charter does not extend ours")
-        self._persist(("frozen", "", True))
-        self.frozen = True
+        # We sign exactly one successor: signing two lets a quorum of honest
+        # witnesses certify two conflicting version v+1 charters (a fork).
+        h = charter_hash(next_charter)
+        if self.frozen and self.frozen_for != h:
+            raise Rejected("already frozen for a different successor charter")
+        if not self.frozen:
+            self._persist(("frozen", "", h))
+            self.frozen, self.frozen_for = True, h
         # Our signed votes travel with the evidence so that, if our key is
         # re-used in the next charter, we never vote a different transition
         # at a (sigil, generation) where we already voted.
@@ -299,15 +335,23 @@ class Witness:
             # retires that binding wherever it was reported.
             alive = {(g, t): h for (g, t), h in binds.items() if t not in dead}
             rec = Record(gen=floor, log=log, votes=list(own.values()))
-            if len(alive) == 1:
+            # Two tids bound at one generation mean the owner equivocated there,
+            # and the log cannot show which one (if either) a quorum sealed. So
+            # a lone live binding is inherited only if it had no sibling at its
+            # generation, dead or alive: re-binding a sibling of a sealed-then-
+            # released binding would let us seal a second tid at that generation.
+            lone = len(alive) == 1 and sum(1 for (g, _) in binds if g == next(iter(alive))[0]) == 1
+            if lone:
                 ((g, t), h), = alive.items()
                 rec.gen, rec.tid, rec.header = g, t, h
                 # Inheriting a binding never makes our key sign a second tid at g.
                 rec.abstain = any(og == g and ot != t for og, ot in own)
             elif not alive and own:
                 rec.gen = max(floor, max(og for og, _ in own) + 1)  # skipping our own gens is abstention
-            elif len(alive) > 1:
-                rec.tid = CONTESTED  # the owner signed two live spends before rotation
+            elif alive:
+                # Contested: never vote; released once every candidate is proven dead.
+                rec.tid = CONTESTED
+                rec.candidates = [[g, t, h] for (g, t), h in sorted(alive.items(), key=lambda kv: kv[0])]
             records[sigil] = rec
         # Membership and inherited records land in one atomic batch: a crash
         # must never leave us active but missing a binding.
