@@ -51,7 +51,10 @@ fn alphabet(world: &World, full: bool) -> Vec<Op> {
                     if !full && !lock_ok && expired {
                         continue;
                     }
-                    ops.push(Op::Spend { si, hi, lock_ok, expired });
+                    ops.push(Op::Spend { si, hi, lock_ok, expired, later: false });
+                    if lock_ok && !expired {
+                        ops.push(Op::Spend { si, hi, lock_ok, expired, later: true });
+                    }
                 }
             }
         }
@@ -128,14 +131,14 @@ fn expand(world: &World, st: &State, op: &Op) -> State {
         let rec = Record::from_json(r).expect("record");
         let sh = shadow.get(s).cloned().unwrap_or_default();
         let tix = |t: &str| world.headers.iter().position(|h| h.tid == t).map(|i| i as u32).unwrap_or(if t == "!contested" { CONTESTED } else { 999 });
-        assert_eq!(rec.gen, sh.gen, "MODEL: stored gen of {s} after {op:?}");
-        assert_eq!(rec.tid.as_deref().map(tix), sh.tid, "MODEL: stored tid after {op:?}");
-        assert_eq!(rec.abstain, sh.abstain, "MODEL: stored abstain after {op:?}");
+        sigil_witness_proofs::model_eq!(rec.gen, sh.gen, "MODEL: stored gen of {s} after {op:?}");
+        sigil_witness_proofs::model_eq!(rec.tid.as_deref().map(tix), sh.tid, "MODEL: stored tid after {op:?}");
+        sigil_witness_proofs::model_eq!(rec.abstain, sh.abstain, "MODEL: stored abstain after {op:?}");
         let v = rec.vote.as_ref().map(|v| (v.get("gen").and_then(Json::as_int).unwrap(), tix(v.get("tid").and_then(Json::as_str).unwrap())));
-        assert_eq!(v, sh.vote, "MODEL: stored vote of {s} after {op:?}");
+        sigil_witness_proofs::model_eq!(v, sh.vote, "MODEL: stored vote of {s} after {op:?}");
         assert_eq!(rec.header.is_some(), rec.tid.is_some() && rec.tid.as_deref() != Some("!contested"), "header stored iff bound");
         if let (Some(h), Some(t)) = (&rec.header, &rec.tid) {
-            assert_eq!(&sigil_witness::model::transition_id(h), t, "MODEL: stored header does not hash to the bound tid");
+            sigil_witness_proofs::model_eq!(&sigil_witness::model::transition_id(h), t, "MODEL: stored header does not hash to the bound tid");
         }
     }
     State { records, shadow }

@@ -66,6 +66,57 @@ fn bug2_empty_charter_accepts_unsigned_evidence() {
     assert_eq!(sigil_witness::charter::quorum(0), 1, "quorum(0) per SPEC §7 (f = floor(-1/3) = -1)");
 }
 
+/// BUG 5 (json.rs `py_float_repr`): when two shortest digit strings round-trip to the same
+/// double and are exactly equally close to it, Python's `repr` picks the even last digit
+/// (David Gay's dtoa, round-half-even) and Rust's `{:e}` picks the other one, so the canonical
+/// encoding (and every hash over it: sigil, tid) differs from the reference. Found by the
+/// canonical differential (proofs/diff/differential.py --canonical): 5 of 39,725 accepted texts.
+/// Expected values are Python 3's `repr(float(text))`.
+#[test]
+#[ignore = "BUG 5: py_float_repr breaks exact ties differently from Python repr (half-even)"]
+fn bug5_float_repr_tie_breaking_differs_from_python() {
+    let cases = [
+        ("1966098015293243369E-3", "1966098015293243.2"),
+        ("-591658828404238278E-3", "-591658828404238.2"),
+        ("-80990177648277630E-3", "-80990177648277.62"),
+        ("269733205174358640E-3", "269733205174358.62"),
+        ("92926342307573118E-3", "92926342307573.12"),
+    ];
+    for (text, python) in cases {
+        let v = parse(text.as_bytes()).expect("parses");
+        assert_eq!(v.canonical_string(), python, "canonical form of {text}");
+    }
+}
+
+/// BUG 6 (store.rs `load`): the reference now persists `frozen` as the hash of the successor
+/// charter the witness froze for (sigil/store.py, commit fc8a82b; `true` only in older stores),
+/// and the Rust store mirrors the reference's entry kinds. The Rust loader treats only `true`
+/// as frozen, so a store holding the new form would restart UNFROZEN and vote again. Latent
+/// today (the Rust witness never freezes), but it fails open, and must be fixed before FREEZE
+/// is ported.
+#[test]
+#[ignore = "BUG 6: a store whose `frozen` entry is a successor hash (reference format) loads as not frozen"]
+fn bug6_frozen_successor_hash_loads_as_not_frozen() {
+    let dir = std::env::temp_dir().join(format!("sigil-bug6-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("w.redb");
+    let _ = std::fs::remove_file(&path);
+    let (store, _) = Store::open(&path).unwrap();
+    let seq = store.submit(vec![("frozen".into(), String::new(), Json::str("ab".repeat(32)))]);
+    store.wait(seq);
+    store.close();
+    drop(store);
+    let (store, loaded) = Store::open(&path).unwrap();
+    let world = World::new(&default_headers());
+    let w = open_witness(&world, store.clone(), loaded, Arc::new(AtomicI64::new(NOW as i64)));
+    let frozen = w.frozen();
+    let (r, _) = w.spend(&world.spend_request(0, 0, true, false));
+    store.close();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(frozen, "a witness that froze for a successor must restart frozen");
+    assert!(r.is_err(), "a frozen witness must not vote: {r:?}");
+}
+
 fn nested(depth: usize) -> Json {
     let mut v = Json::Int(0);
     for _ in 0..depth {

@@ -213,58 +213,73 @@ fn release_refines_tla_and_preserves_invariant() {
 
 // ------------------------------------------------------------------- votes_of_seal (real)
 
-fn small_json() -> Json {
-    match kani::any::<u8>() % 4 {
-        0 => Json::Null,
-        1 => Json::Int(kani::any::<i8>() as i128),
-        2 => Json::Str(if kani::any() { "x".into() } else { "y".into() }),
-        _ => Json::Bool(kani::any()),
-    }
-}
-
 /// `proofs::votes_of_seal` never lets an entry override the seal's
-/// constellation/version/sigil/gen/tid, keeps every entry's witness/time/sig, and refuses any
-/// entry that is not exactly `{witness, time, sig}` (bounded: up to 2 entries, entry keys drawn
-/// from the 5 seal fields plus the 3 vote fields).
-#[kani::proof]
-#[kani::unwind(10)]
-fn votes_of_seal_never_overrides() {
+/// constellation/version/sigil/gen/tid, keeps the entry's witness/time/sig, and refuses an
+/// entry that is not exactly `{witness, time, sig}`. Every key SHAPE of one entry is checked:
+/// each subset of the three own keys, with no extra key or with any one of the five seal fields
+/// as an extra key (the override attack of the reference's old `dict(common, **entry)`), i.e.
+/// 8 x 6 = 48 shapes. All values are symbolic integers. (Symbolic key names, or a symbolic
+/// number of entries, did not finish within 40 minutes: BTreeMap code with symbolic keys is too
+/// expensive for CBMC. Entries are rebuilt independently of each other, so one entry suffices
+/// for the override property.)
+fn check_votes_of_seal_shape(mask: u8, extra: usize) {
     const COMMON: [&str; 5] = ["constellation", "version", "sigil", "gen", "tid"];
     const OWN: [&str; 3] = ["witness", "time", "sig"];
     let mut seal = Map::new();
     for k in COMMON {
-        if kani::any() {
-            seal.insert(k.to_string(), small_json());
+        seal.insert(k.to_string(), Json::Int(kani::any::<i8>() as i128));
+    }
+    let mut e = Map::new();
+    for (i, k) in OWN.iter().enumerate() {
+        if mask & (1 << i) != 0 {
+            e.insert(k.to_string(), Json::Int(kani::any::<i8>() as i128));
         }
     }
-    let n: usize = kani::any();
-    kani::assume(n <= 2);
-    let mut entries = Vec::new();
-    for _ in 0..n {
-        let mut e = Map::new();
-        for k in OWN.iter().chain(COMMON.iter()) {
-            if kani::any() {
-                e.insert(k.to_string(), small_json());
-            }
-        }
-        entries.push(Json::Obj(e));
+    if extra < COMMON.len() {
+        e.insert(COMMON[extra].to_string(), Json::Int(kani::any::<i8>() as i128));
     }
-    seal.insert("votes".into(), Json::Arr(entries.clone()));
+    let entry = Json::Obj(e);
+    seal.insert("votes".into(), Json::Arr(vec![entry.clone()]));
     let seal = Json::Obj(seal);
-    let got = sigil_witness::proofs::votes_of_seal(&seal);
-    if let Some(vs) = got {
-        assert_eq!(vs.len(), entries.len());
-        for (v, e) in vs.iter().zip(&entries) {
+    let exact = mask == 0b111 && extra == COMMON.len();
+    match sigil_witness::proofs::votes_of_seal(&seal) {
+        Some(vs) => {
+            assert!(exact, "accepted an entry that is not exactly {{witness, time, sig}}");
+            assert_eq!(vs.len(), 1);
             for k in COMMON {
-                assert!(seal.get(k).is_some());
-                assert_eq!(v.get(k), seal.get(k));
+                assert_eq!(vs[0].get(k), seal.get(k));
             }
             for k in OWN {
-                assert_eq!(v.get(k), e.get(k));
+                assert_eq!(vs[0].get(k), entry.get(k));
             }
-            assert_eq!(e.as_obj().map(|m| m.len()), Some(3));
         }
+        None => assert!(!exact, "refused a well-formed entry"),
     }
+}
+
+macro_rules! vos_harnesses {
+    ($($name:ident: $mask:expr;)*) => {
+        $(
+            #[kani::proof]
+            #[kani::unwind(8)]
+            fn $name() {
+                for extra in 0..6 {
+                    check_votes_of_seal_shape($mask, extra);
+                }
+            }
+        )*
+    };
+}
+
+vos_harnesses! {
+    votes_of_seal_shapes_own_none: 0b000;
+    votes_of_seal_shapes_own_w: 0b001;
+    votes_of_seal_shapes_own_t: 0b010;
+    votes_of_seal_shapes_own_wt: 0b011;
+    votes_of_seal_shapes_own_s: 0b100;
+    votes_of_seal_shapes_own_ws: 0b101;
+    votes_of_seal_shapes_own_ts: 0b110;
+    votes_of_seal_shapes_own_wts: 0b111;
 }
 
 // ----------------------------------------------------- lock evaluation monotonicity (real)

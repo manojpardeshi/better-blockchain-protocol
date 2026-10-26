@@ -15,6 +15,10 @@ an episode the episode ends (states would differ from then on) and the divergenc
 
 * ``SAFETY``: Rust voted or released where Python did not, or both voted differently;
 * ``STRICTER``: Rust refused (rejected / bad_request) where Python voted, released or conflicted;
+* ``STRICTER-SEAL-ENTRY``: Rust refused a seal whose vote entries carry extra keys, which
+  the reference ignores (a deliberate difference, see proofs.rs);
+* ``STRICTER-NONSTR-SIGIL`` / ``MESSAGE-NONSTR-SIGIL``: a header input names a non-string
+  sigil, which the reference tolerates and Rust refuses (deliberate);
 * ``MESSAGE``: both refused, with a different kind or message;
 * ``STRICTER-PARSE``: the Rust JSON parser refused the whole body (integers beyond i128, lone
   surrogates, ...), which the Rust server answers with 400;
@@ -223,6 +227,7 @@ class Episode:
             b = self.vote(w.bond, "Q", "q", 0, "t2" if rng.random() < 0.8 else "t1")
             u["equivocations"].append({"a": a, "b": b})
         req = {"sigil": s, "header": h, "home": p["home"], "lock": p["lock"], "salt": p["salt"], "unlock": u}
+        req = json.loads(json.dumps(req))  # mutations must not reach the world's shared objects
         if rng.random() < 0.15:
             for _ in range(rng.randrange(1, 3)):
                 mutate(rng, req, tags)
@@ -245,7 +250,7 @@ class Episode:
         tp = next((pp for pp, ss, _, _ in w.parcels if ss == ts), p)
         src = tp["home"] if rng.random() < 0.8 else rng.choice(list(w.keys_of))
         keys = w.keys_of[src]
-        held = [k for k in keys if k.pk != w.X[0].pk]
+        held = [k for k in keys if k.pk != w.X[0].pk] or [kp("outsider", 0)]  # empty charter: a non-member signs
         n = rng.choice([len(held), len(held), max(0, len(held) - 1)])
         u = rng.choice(["e" * 64, "d" * 64, tid if rng.random() < 0.1 else "f" * 64])
         votes = [self.vote(k, src, ts, tg, u) for k in held[:n]]
@@ -263,6 +268,7 @@ class Episode:
                 tags.append("seal-entry-extra-key")
         else:
             proof["votes"] = votes
+        proof = json.loads(json.dumps(proof))  # the header/lock objects are shared with the world and the witness
         if rng.random() < 0.25:
             for _ in range(rng.randrange(1, 3)):
                 mutate(rng, proof, tags)
@@ -307,8 +313,14 @@ class Episode:
             py = self.py_call(op, msg["args"])
             ru = self.rust.call(wire)
             stats["steps"] += 1
-            stats[f"{op}:{py.get('error', 'ok')}"] += 1
+            stats[f"{op}:{py.get('error', 'ok')}:{py.get('message', '')[:32]}"] += 1
             cls = classify(op, py, ru)
+            if cls == "STRICTER" and op == "release" and seal_entries_have_extra_keys(msg["args"]):
+                cls = "STRICTER-SEAL-ENTRY"  # deliberate: Rust refuses seal entries with extra keys
+            if cls in ("STRICTER", "MESSAGE") and op == "spend" and non_string_header_sigil(msg["args"]):
+                cls += "-NONSTR-SIGIL"  # deliberate: Rust requires every header sigil to be a string
+            if cls == "SAFETY" and op == "release" and getattr(self.w, "cZ", None) and self.w.cZ in wire:
+                cls = "SAFETY-EMPTY-CHARTER"  # bug 2: evidence from a constellation with no witnesses
             if cls:
                 stats[cls] += 1
                 key = (cls, op, py.get("error", "ok") + "/" + py.get("message", "")[:40], ru.get("error", "ok") + "/" + ru.get("message", "")[:40])
@@ -324,6 +336,20 @@ class Episode:
                     examples[("STATE", op, "", "")].append(
                         {"tags": tags, "wire": wire[:3000], "py": py, "rust": ru, "py_status": pst[:600], "rust_status": json.dumps(rst)[:600]})
                     return
+
+
+def seal_entries_have_extra_keys(args):
+    proof = args[1] if len(args) > 1 else None
+    seal = proof.get("seal") if isinstance(proof, dict) else None
+    votes = seal.get("votes") if isinstance(seal, dict) else None
+    return isinstance(votes, list) and any(isinstance(e, dict) and set(e) - {"witness", "time", "sig"} for e in votes)
+
+
+def non_string_header_sigil(args):
+    req = args[0] if args else None
+    h = req.get("header") if isinstance(req, dict) else None
+    inputs = h.get("inputs") if isinstance(h, dict) else None
+    return isinstance(inputs, list) and any(isinstance(x, list) and len(x) == 2 and not isinstance(x[0], str) for x in inputs)
 
 
 def same(a, b):
@@ -453,7 +479,7 @@ def main():
         print(f"--- {key[0]} {key[1]}: python {key[2]!r} vs rust {key[3]!r}  ({len(examples[key])} examples kept)")
         for e in examples[key][:2]:
             print("    tags:", e["tags"])
-            if key[0] in ("STATE", "SAFETY", "PANIC"):
+            if key[0] not in ("STRICTER-PARSE", "STRICTER-SEAL-ENTRY"):
                 print("    wire:", e["wire"])
                 print("    py_status:", e.get("py_status"))
                 print("    rust_status:", e.get("rust_status"))

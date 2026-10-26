@@ -803,6 +803,7 @@ name = "sigil-witness-proofs"
 version = "0.1.0"
 dependencies = [
  "arbitrary",
+ "hex",
  "sigil-witness",
 ]
 

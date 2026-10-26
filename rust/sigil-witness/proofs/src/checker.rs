@@ -26,9 +26,25 @@ use crate::model_rust::{self, RustRec, SpendOut};
 use crate::tla::{self, AbsRec};
 use crate::world::{Genuine, ProofSpec, World, C, NOW};
 
+/// `SIGIL_NO_MODEL=1` turns the transcription (`MODEL:`) checks off, so that mutation testing
+/// can show which bugs the TLA+ refinement and safety checks catch on their own.
+pub fn model_checks() -> bool {
+    std::env::var_os("SIGIL_NO_MODEL").is_none()
+}
+
+#[macro_export]
+macro_rules! model_eq {
+    ($($t:tt)*) => {
+        if $crate::checker::model_checks() {
+            assert_eq!($($t)*);
+        }
+    };
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Op {
-    Spend { si: usize, hi: usize, lock_ok: bool, expired: bool },
+    /// `later`: the clock reads NOW + 1 (a re-request must get the STORED vote, not a new one).
+    Spend { si: usize, hi: usize, lock_ok: bool, expired: bool, later: bool },
     Release { si: usize, spec: ProofSpec },
     Status { si: usize },
 }
@@ -185,9 +201,9 @@ impl<'w> Checker<'w> {
     fn check_status_matches_shadow(&mut self, sigil: &str, o: &Obs) {
         let sh = self.shadow.get(sigil).cloned().unwrap_or_default();
         let a = self.alpha(o);
-        assert_eq!(a, sh.alpha(), "MODEL: STATUS of {sigil} differs from the transcription");
+        crate::model_eq!(a, sh.alpha(), "MODEL: STATUS of {sigil} differs from the transcription");
         let pairs = self.vote_pairs(o);
-        assert_eq!(pairs, sh.votes, "MODEL: STATUS votes of {sigil} differ from the transcription");
+        crate::model_eq!(pairs, sh.votes, "MODEL: STATUS votes of {sigil} differ from the transcription");
         for v in &o.votes {
             self.check_vote(v, sigil);
         }
@@ -197,7 +213,10 @@ impl<'w> Checker<'w> {
         self.stats.steps += 1;
         self.clock.store(NOW as i64, Ordering::SeqCst);
         match *op {
-            Op::Spend { si, hi, lock_ok, expired } => self.spend(si, hi, lock_ok, expired),
+            Op::Spend { si, hi, lock_ok, expired, later } => {
+                self.clock.store(NOW as i64 + later as i64, Ordering::SeqCst);
+                self.spend(si, hi, lock_ok, expired)
+            }
             Op::Release { si, spec } => self.release(si, &spec),
             Op::Status { si } => {
                 let s = self.world.sigils[si].sigil.clone();
@@ -282,7 +301,7 @@ impl<'w> Checker<'w> {
         match known {
             Some((auth, expired, g, t)) => {
                 let (want, rec) = model_rust::spend(existing.as_ref(), auth, expired, g, t);
-                assert_eq!(actual, want, "MODEL: spend reply differs from the transcription");
+                crate::model_eq!(actual, want, "MODEL: spend reply differs from the transcription");
                 self.set_shadow(sigil, rec);
             }
             None => {
@@ -297,7 +316,7 @@ impl<'w> Checker<'w> {
                         }
                     };
                     let (want, rec) = model_rust::spend(existing.as_ref(), true, false, vg, vt);
-                    assert_eq!(actual, want, "MODEL: raw spend reply differs from the transcription");
+                    crate::model_eq!(actual, want, "MODEL: raw spend reply differs from the transcription");
                     self.set_shadow(sigil, rec);
                 }
             }
@@ -396,7 +415,7 @@ impl<'w> Checker<'w> {
         };
         let existing = self.shadow.get(sigil).cloned();
         let (want, rec) = model_rust::release(existing.as_ref(), false, ok);
-        assert_eq!(want.is_ok(), ok, "MODEL: release outcome differs from the transcription");
+        crate::model_eq!(want.is_ok(), ok, "MODEL: release outcome differs from the transcription");
         self.set_shadow(sigil, rec);
         self.check_status_matches_shadow(sigil, &post);
     }

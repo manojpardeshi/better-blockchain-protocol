@@ -43,7 +43,7 @@ impl FSpec {
 
 #[derive(Arbitrary, Debug)]
 enum FOp {
-    Spend { si: u8, hi: u8, lock_ok: bool, expired: bool },
+    Spend { si: u8, hi: u8, lock_ok: bool, expired: bool, later: bool },
     Release { si: u8, spec: FSpec },
     Status { si: u8 },
     RawSpend { si: u8, hi: u8, expired: bool, muts: Vec<Mutation>, clock: i16 },
@@ -65,11 +65,12 @@ fuzz_target!(|ops: Vec<FOp>| {
     let mut c = Checker::new(world);
     for op in ops.iter().take(48) {
         match op {
-            FOp::Spend { si, hi, lock_ok, expired } => c.step(&Op::Spend {
+            FOp::Spend { si, hi, lock_ok, expired, later } => c.step(&Op::Spend {
                 si: *si as usize % ns,
                 hi: *hi as usize % nh,
                 lock_ok: *lock_ok,
                 expired: *expired,
+                later: *later,
             }),
             FOp::Release { si, spec } => c.step(&Op::Release { si: *si as usize % ns, spec: spec.spec() }),
             FOp::Status { si } => c.step(&Op::Status { si: *si as usize % ns }),
