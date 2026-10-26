@@ -27,8 +27,10 @@
 # and curl. TLS is always verified (system CA bundle / CURL_CA_BUNDLE).
 set -euo pipefail
 
-TLA_VERSION="1.8.0"
-TLA_SHA256="15d103b7e5617780bcc904c0af12f1ad242e2b345c0301136c5be4588f17edac"
+# v1.7.4 is an immutable release. The v1.8.0 "release" is a rolling
+# pre-release whose jar is rebuilt in place, so it cannot be pinned by hash.
+TLA_VERSION="1.7.4"
+TLA_SHA256="936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88"
 TLA_URL="https://github.com/tlaplus/tlaplus/releases/download/v${TLA_VERSION}/tla2tools.jar"
 
 # tlapm 1.6.0-pre, linux x86_64 (bundles Zenon, Z3 and Isabelle/TLA+).
@@ -144,7 +146,7 @@ for cfg in "${CONFIGS[@]}"; do
     start=$(date +%s)
     set +e
     (cd "$HERE" && java -XX:+UseParallelGC "${libarg[@]}" -cp "$JAR" tlc2.TLC \
-        -workers auto -noGenerateSpecTE -cleanup \
+        -workers auto -cleanup \
         -metadir "$WORK/$name.states" -config "$cfgpath" "$module") >"$log" 2>&1
     rc=$?
     set -e

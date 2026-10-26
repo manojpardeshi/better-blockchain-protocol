@@ -301,6 +301,6 @@ SIGIL_CONFORMANCE_SEEDS=120 SIGIL_CONFORMANCE_STEPS=150 \
 ```
 
 Tooling: TLAPS (tlapm 1.6.0-pre, bundling Zenon/Z3/Isabelle) and TLC
-(tla2tools 1.8.0), both downloaded on first use into `~/.cache/sigil-tla`,
+(tla2tools 1.7.4), both downloaded on first use into `~/.cache/sigil-tla`,
 pinned and SHA-256-verified, over TLS. Linux x86_64 for the proof; TLC needs
 only Java ≥ 11.

@@ -7,7 +7,7 @@ formal/check.sh              # all configs: 5 safety checks + 2 mutation tests, 
 formal/check.sh MC.cfg       # one config
 ```
 
-`check.sh` downloads `tla2tools.jar` v1.8.0 into `~/.cache/sigil-tla/` (override with `TLA_CACHE`) and checks its SHA-256. It needs Java 11 or later and curl, and it uses the system CA bundle (TLS is always verified). The jar is never committed. CI runs the same script (job `formal` in `.github/workflows/test.yml`). Configs named `MC_multi*.cfg` are run against `MC_multi.tla`, the others against `MC.tla`.
+`check.sh` downloads `tla2tools.jar` v1.7.4 (an immutable release) into `~/.cache/sigil-tla/` (override with `TLA_CACHE`) and checks its SHA-256. It needs Java 11 or later and curl, and it uses the system CA bundle (TLS is always verified). The jar is never committed. CI runs the same script (job `formal` in `.github/workflows/test.yml`). Configs named `MC_multi*.cfg` are run against `MC_multi.tla`, the others against `MC.tla`.
 
 ## What is modelled
 
