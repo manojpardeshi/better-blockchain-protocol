@@ -54,9 +54,9 @@ fn parse_never_panics_on_short_inputs() {
     assert!(bad.is_empty(), "panics on {:?}", &bad[..bad.len().min(5)]);
 }
 
-/// Every `"\u` followed by up to 5 alphabet bytes. Fails on bug 1 (e.g. `"\u11` + `é` ...).
+/// Every `"\u` followed by up to 5 alphabet bytes. Failed before the bug 1 fix
+/// (e.g. `"\u11` + `é` ...).
 #[test]
-#[ignore = "BUG 1: json::parse panics on a \\u escape followed by non-ASCII bytes"]
 fn parse_never_panics_after_unicode_escape() {
     let hook = panic::take_hook();
     panic::set_hook(Box::new(|_| {}));

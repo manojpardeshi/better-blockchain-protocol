@@ -200,6 +200,7 @@ pub fn py_float_repr(x: f64) -> String {
     };
     let digits: String = mant.chars().filter(|c| *c != '.').collect();
     let exp: i32 = exp.parse().expect("integer exponent");
+    let (digits, exp) = round_half_even(x, digits, exp);
     let decpt = exp + 1; // value = 0.DIGITS * 10^decpt
     let mut out = String::new();
     if neg {
@@ -233,6 +234,56 @@ pub fn py_float_repr(x: f64) -> String {
     out
 }
 
+/// Python's `repr` breaks exact ties between two shortest round-tripping digit strings by
+/// taking the even last digit (round-half-even); Rust's shortest formatting may take the odd
+/// one. `digits`/`exp` are Rust's choice (`d.ddd x 10^exp`). There is a tie exactly when x's
+/// exact decimal expansion is those digits' common prefix followed by a single 5.
+fn round_half_even(x: f64, digits: String, exp: i32) -> (String, i32) {
+    // A double's exact decimal expansion has at most 767 significant digits.
+    let exact = format!("{:.767e}", x.abs());
+    let Some((mant, e)) = exact.split_once('e') else { return (digits, exp) };
+    let Ok(e) = e.parse::<i32>() else { return (digits, exp) };
+    let full: String = mant.chars().filter(|c| *c != '.').collect();
+    let full = full.trim_end_matches('0');
+    let k = digits.len();
+    if e != exp || full.len() != k + 1 || !full.ends_with('5') {
+        return (digits, exp);
+    }
+    let low = &full[..k];
+    if low.as_bytes()[k - 1] % 2 == 0 {
+        return checked(x, low.trim_end_matches('0'), exp).unwrap_or((digits, exp));
+    }
+    // low + 1 in the last place, carrying; a carry out of the top digit raises the exponent.
+    let mut up: Vec<u8> = low.bytes().collect();
+    let mut i = k;
+    loop {
+        if i == 0 {
+            up.insert(0, b'1');
+            break;
+        }
+        i -= 1;
+        if up[i] == b'9' {
+            up[i] = b'0';
+        } else {
+            up[i] += 1;
+            break;
+        }
+    }
+    let (up_exp, up) = if up.len() > k { (exp + 1, &up[..k]) } else { (exp, &up[..]) };
+    let up = String::from_utf8(up.to_vec()).expect("ASCII digits");
+    let up = up.trim_end_matches('0');
+    checked(x, up, up_exp).unwrap_or((digits, exp))
+}
+
+/// `digits x 10^exp` (as `d.ddd`) if it parses back to exactly `x`.
+fn checked(x: f64, digits: &str, exp: i32) -> Option<(String, i32)> {
+    if digits.is_empty() {
+        return None;
+    }
+    let text = format!("{}{}.{}0e{}", if x < 0.0 { "-" } else { "" }, &digits[..1], &digits[1..], exp);
+    (text.parse::<f64>().ok()? == x).then(|| (digits.to_string(), exp))
+}
+
 // ------------------------------------------------------------------- parsing
 
 #[derive(Debug, Clone, PartialEq)]
@@ -247,8 +298,14 @@ impl std::fmt::Display for ParseError {
 impl std::error::Error for ParseError {}
 
 pub fn parse(input: &[u8]) -> Result<Json, ParseError> {
+    parse_with_depth(input, MAX_DEPTH)
+}
+
+/// [`parse`] with a different nesting limit. The store uses a larger one: a record nests what
+/// a request carried a few levels deeper, and must always load again after a restart.
+pub fn parse_with_depth(input: &[u8], max_depth: usize) -> Result<Json, ParseError> {
     let text = std::str::from_utf8(input).map_err(|_| ParseError("not UTF-8".into()))?;
-    let mut p = Parser { s: text.as_bytes(), src: text, i: 0 };
+    let mut p = Parser { s: text.as_bytes(), src: text, i: 0, max_depth };
     p.ws();
     let v = p.value(0)?;
     p.ws();
@@ -266,6 +323,7 @@ struct Parser<'a> {
     s: &'a [u8],
     src: &'a str,
     i: usize,
+    max_depth: usize,
 }
 
 impl<'a> Parser<'a> {
@@ -293,7 +351,7 @@ impl<'a> Parser<'a> {
     }
 
     fn value(&mut self, depth: usize) -> Result<Json, ParseError> {
-        if depth > MAX_DEPTH {
+        if depth > self.max_depth {
             return Err(self.err("nesting too deep"));
         }
         match self.peek() {
@@ -421,12 +479,16 @@ impl<'a> Parser<'a> {
         if self.i + 4 > self.s.len() {
             return Err(self.err("truncated \\u escape"));
         }
-        let h = &self.src[self.i..self.i + 4];
-        if !h.bytes().all(|c| c.is_ascii_hexdigit()) {
-            return Err(self.err("invalid \\u escape"));
+        // Bytes, not `str`: a multi-byte character here must be an error, not a slice panic.
+        let mut n = 0;
+        for &c in &self.s[self.i..self.i + 4] {
+            match (c as char).to_digit(16) {
+                Some(d) if c.is_ascii() => n = n * 16 + d,
+                _ => return Err(self.err("invalid \\u escape")),
+            }
         }
         self.i += 4;
-        Ok(u32::from_str_radix(h, 16).expect("hex digits"))
+        Ok(n)
     }
 
     fn string(&mut self) -> Result<String, ParseError> {

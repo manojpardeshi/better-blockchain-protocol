@@ -103,7 +103,7 @@ pub fn evaluate(lock: &Json, unlock: &Json, sigil: &str, tid: &str, now: Option<
     let sigs = u.get("sigs").and_then(Json::as_obj).unwrap_or(empty);
     let preimages = u.get("preimages").and_then(Json::as_obj).unwrap_or(empty);
     let equivocations: &[Json] = u.get("equivocations").and_then(Json::as_arr).map(Vec::as_slice).unwrap_or(&[]);
-    let ctx = Ctx { msg, sigs, preimages, equivocations, now, batch, cache: RefCell::new(HashMap::new()) };
+    let ctx = Ctx { msg, sigs, preimages, equivocations, now, batch, cache: RefCell::new(HashMap::new()), equiv: RefCell::new(HashMap::new()) };
     ctx.ev(lock)
 }
 
@@ -115,6 +115,9 @@ struct Ctx<'a> {
     now: Option<i128>,
     batch: bool,
     cache: RefCell<HashMap<&'a str, bool>>,
+    // Per witness key: does some proof convict it? Without this every `equivocation` node
+    // re-verifies every proof, (nodes x proofs) signature checks per request.
+    equiv: RefCell<HashMap<String, bool>>,
 }
 
 impl<'a> Ctx<'a> {
@@ -161,11 +164,19 @@ impl<'a> Ctx<'a> {
             }
             "equivocation" => {
                 let w = get("witness");
-                self.equivocations.iter().any(|p| {
+                let key = w.and_then(Json::as_str); // well_formed: always a string
+                if let Some(r) = key.and_then(|k| self.equiv.borrow().get(k).copied()) {
+                    return r;
+                }
+                let r = self.equivocations.iter().any(|p| {
                     matches!(p.get("a"), Some(Json::Obj(_)))
                         && p.get("a").and_then(|a| a.get("witness")).is_some_and(|x| Some(x) == w)
                         && verify_equivocation(p, self.batch)
-                })
+                });
+                if let Some(k) = key {
+                    self.equiv.borrow_mut().insert(k.to_string(), r);
+                }
+                r
             }
             "all" => get("of").and_then(Json::as_arr).is_some_and(|of| of.iter().all(|x| self.ev(x))),
             "any" => get("of").and_then(Json::as_arr).is_some_and(|of| of.iter().any(|x| self.ev(x))),

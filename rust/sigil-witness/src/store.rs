@@ -27,7 +27,7 @@ use std::thread;
 
 use redb::{Database, Durability, ReadableTable, TableDefinition};
 
-use crate::json::{parse, Json};
+use crate::json::{parse_with_depth, Json, MAX_DEPTH};
 
 const STATE: TableDefinition<&str, &[u8]> = TableDefinition::new("state");
 
@@ -238,7 +238,9 @@ fn load(db: &Database) -> Result<Loaded, String> {
     for item in t.iter().map_err(|e| e.to_string())? {
         let (k, v) = item.map_err(|e| e.to_string())?;
         let (kind, key) = k.value().split_once('\0').ok_or("corrupt store key")?;
-        let value = parse(v.value()).map_err(|e| format!("corrupt store value: {e}"))?;
+        // A record nests what a request carried a few levels deeper, so it gets more depth than
+        // a request: anything the witness accepted must load again after a restart.
+        let value = parse_with_depth(v.value(), MAX_DEPTH + 16).map_err(|e| format!("corrupt store value: {e}"))?;
         match kind {
             "pk" => out.pk = value.as_str().map(str::to_string),
             "member" => {
@@ -247,7 +249,9 @@ fn load(db: &Database) -> Result<Loaded, String> {
                 let ver = a.get(1).and_then(Json::as_int).ok_or("corrupt member entry")?;
                 out.member = Some((cid.to_string(), ver));
             }
-            "frozen" => out.frozen = value == Json::Bool(true),
+            // `true` in older stores, the successor charter's hash since successor binding.
+            // Anything but false/null is frozen: misreading it must fail closed.
+            "frozen" => out.frozen = !matches!(value, Json::Bool(false) | Json::Null),
             "record" => {
                 out.records.insert(key.to_string(), value);
             }

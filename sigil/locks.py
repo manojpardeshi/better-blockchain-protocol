@@ -141,6 +141,8 @@ def evaluate(lock: dict, unlock: dict, sigil: str, tid: str, now: int | None) ->
         s = sigs.get(pk)
         return isinstance(s, str) and verify(pk, "unlock", msg, s)
 
+    convicted = {}  # witness -> bool, so each proof is verified at most once per witness
+
     def ev(node):
         op = node["op"]
         if op == "sig":
@@ -158,12 +160,15 @@ def evaluate(lock: dict, unlock: dict, sigil: str, tid: str, now: int | None) ->
             except ValueError:
                 return False
         if op == "equivocation":
-            return any(
-                isinstance(p.get("a"), dict) and p["a"].get("witness") == node["witness"]
-                and verify_equivocation(p)
-                for p in equivocations
-                if isinstance(p, dict)
-            )
+            w = node["witness"]
+            if w not in convicted:
+                convicted[w] = any(
+                    isinstance(p.get("a"), dict) and p["a"].get("witness") == w
+                    and verify_equivocation(p)
+                    for p in equivocations
+                    if isinstance(p, dict)
+                )
+            return convicted[w]
         if op == "all":
             return all(ev(x) for x in node["of"])
         if op == "any":

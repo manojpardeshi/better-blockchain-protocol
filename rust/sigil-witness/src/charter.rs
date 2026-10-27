@@ -14,7 +14,8 @@ pub fn faults(n: usize) -> usize {
 
 /// Votes needed for a seal.
 pub fn quorum(n: usize) -> usize {
-    n - faults(n)
+    // At least one vote: an empty charter must never accept unsigned evidence (Python: q(0) = 1).
+    (n - faults(n)).max(1)
 }
 
 pub fn charter_hash(body: &Json) -> String {
@@ -43,6 +44,12 @@ impl Charter {
         let mut witnesses = Vec::with_capacity(ws.len());
         for w in ws {
             witnesses.push(w.as_str().ok_or("witness keys must be strings")?.to_string());
+        }
+        let mut unique: Vec<&str> = witnesses.iter().map(String::as_str).collect();
+        unique.sort_unstable();
+        unique.dedup();
+        if witnesses.is_empty() || unique.len() != witnesses.len() {
+            return Err("charter witnesses must be non-empty and unique".into());
         }
         let keys = witnesses.iter().filter_map(|w| decode_pk(w).map(|k| (w.clone(), k))).collect();
         Ok(Charter { body: body.clone(), version, witnesses, keys })

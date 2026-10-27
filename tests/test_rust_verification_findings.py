@@ -1,7 +1,7 @@
 """Findings from verifying the Rust witness that also affect the Python reference.
 
-See docs/VERIFY_RUST.md. Each test asserts the intended behaviour and is marked
-``expectedFailure`` until the reference is fixed.
+See docs/VERIFY_RUST.md. Each was an expected failure until the reference was
+fixed, and is now a regression test.
 """
 
 import time
@@ -13,7 +13,7 @@ from sigil.locks import evaluate
 
 
 class EquivocationLockCost(unittest.TestCase):
-    """Bug 4: every ``equivocation`` node re-verifies every equivocation proof in the unlock.
+    """Bug 4 (fixed): every ``equivocation`` node re-verified every equivocation proof in the unlock.
 
     A lock of 63 such nodes and an unlock full of proofs whose cheap checks pass (same
     witness, constellation, sigil, gen; different tids) but whose signatures do not verify
@@ -22,7 +22,6 @@ class EquivocationLockCost(unittest.TestCase):
     the number of proofs, independent of how many nodes refer to the same witness.
     """
 
-    @unittest.expectedFailure
     def test_cost_does_not_scale_with_node_count(self):
         w = KeyPair.from_seed(b"bug4-witness")
 
@@ -42,6 +41,21 @@ class EquivocationLockCost(unittest.TestCase):
         one = min(cost(1) for _ in range(3))
         many = min(cost(63) for _ in range(3))
         self.assertLess(many, 10 * one, f"63 nodes cost {many / one:.1f}x one node")
+
+
+
+class EmptyCharter(unittest.TestCase):
+    """Bug 2 (fixed): a charter with no witnesses, or a repeated one, is refused."""
+
+    def test_empty_or_duplicated_witness_lists_are_refused(self):
+        from sigil.charter import Registry, constellation_id, verify_chain
+        k = KeyPair.generate()
+        for ws in ([], [k.pk, k.pk]):
+            body = {"name": "E", "version": 0, "witnesses": ws, "prev": None}
+            cid = constellation_id(body)
+            self.assertFalse(verify_chain(cid, [{"body": body, "sigs": {}}]))
+            with self.assertRaises(ValueError):
+                Registry().add_chain(cid, [{"body": body, "sigs": {}}])
 
 
 if __name__ == "__main__":

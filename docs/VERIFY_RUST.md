@@ -12,10 +12,11 @@ New code lives in:
 |---|---|
 | `rust/sigil-witness/proofs/` | standalone crate: abstract model (`tla.rs`), transcription of the witness logic (`model_rust.rs`), the world and step checker (`world.rs`, `checker.rs`), Kani harnesses (`kani_proofs.rs`), tests (`tests/`), differential driver (`src/bin/diff_driver.rs`, `diff/differential.py`), mutation testing (`mutants.py`) |
 | `rust/sigil-witness/fuzz/` | cargo-fuzz targets, `run.sh`, `coverage.sh`, the bug-1 reproducer in `regressions/` |
-| `tests/test_rust_verification_findings.py` | Python `expectedFailure` test for the one finding that also affects the reference |
+| `tests/test_rust_verification_findings.py` | Python regression tests for the findings that also affect the reference (bugs 2 and 4) |
 
-Neither crate is a member of `rust/Cargo.toml`; the shipped workspace and its tests are
-unchanged. `src/` was not modified: bugs are recorded as ignored tests (below).
+Neither crate is a member of `rust/Cargo.toml`. The verification itself did not modify
+`src/`; the six bugs it found were then fixed there, and their tests now run as regression
+tests (§6), including in CI.
 
 ## 0. Summary
 
@@ -28,9 +29,10 @@ unchanged. `src/` was not modified: bugs are recorded as ignored tests (below).
 | Fuzzing (libFuzzer) | 5 targets, 40 min each, plus a 5-min re-run | 65.0 M executions; 1 crash (bug 1) |
 | Differential vs the Python reference | 4,000 episodes, 143,594 steps; 56,040 JSON texts | votes byte-identical; divergences are bugs 2 and 5 or deliberate strictness |
 
-Bugs: **6**. One High (bug 3, a deep request bricks the store), one Medium (bug 4, CPU
-amplification; it also affects the reference), four Low. No bug lets an honest Rust
-witness vote two tids at one `(sigil, gen)`.
+Bugs: **6, all fixed**. One High (bug 3, a deep request bricks the store), one Medium (bug 4,
+CPU amplification; it also affected the reference), four Low. No bug let an honest Rust
+witness vote two tids at one `(sigil, gen)`. The counts in this table were measured before
+the fixes.
 
 ## 1. The abstraction function and the refinement claim
 
@@ -173,8 +175,8 @@ real code.
 * `cargo test --release --test parser_exhaustive`: every input of ≤ 5 bytes over an alphabet of
   JSON punctuation, escapes, digits, whitespace and multi-byte UTF-8 fragments, 3,368,421
   inputs. None panics, and the canonical output of every accepted input re-parses to itself.
-  The ignored `parse_never_panics_after_unicode_escape` enumerates `"\u` + ≤ 5 alphabet bytes;
-  9,360 of 3,368,421 panic (bug 1).
+  `parse_never_panics_after_unicode_escape` enumerates `"\u` + ≤ 5 alphabet bytes: before
+  the bug 1 fix 9,360 of 3,368,421 panicked; now none does.
 
 ### 3.3 Restart equivalence
 
@@ -274,9 +276,21 @@ It is a liveness difference only, documented in the source.
 
 ## 6. Bugs found
 
-Every bug has a failing test, ignored with `BUG n: …` in
-`rust/sigil-witness/proofs/tests/bugs.rs`. Run them with
-`cargo test --release --test bugs -- --ignored`.
+Every bug has a test in `rust/sigil-witness/proofs/tests/bugs.rs` that failed before its fix
+and passes after it (`cargo test --release --test bugs`, run in CI). Fixes:
+
+1. `Parser::hex4` reads the four hex digits as bytes, so a multi-byte character is a parse
+   error, not a panic.
+2. `quorum(0)` is 1, and both implementations' `verify_chain` refuse a charter whose witness
+   list is empty or repeats a key.
+3. The store parses values with a nesting limit of `MAX_DEPTH + 16`, so whatever a request
+   could carry still loads after a restart.
+4. Lock evaluation memoises the equivocation result per witness key (Rust and Python), so each
+   proof is verified at most once per request. Running SPEND on a blocking thread and capping
+   the number of proofs are not done; the 1 MiB body limit bounds the proofs.
+5. On an exact tie between two shortest digit strings, `py_float_repr` takes the even last
+   digit, as Python's `repr` does (checked against the exact decimal expansion).
+6. `store::load` treats any `frozen` value other than `false`/`null` as frozen.
 
 | # | Severity | Where | Summary | Test |
 |---|---|---|---|---|

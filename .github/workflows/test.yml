@@ -55,6 +55,8 @@ jobs:
       - run: pip install cryptography
       - run: cargo build --release --locked --manifest-path rust/Cargo.toml
       - run: cargo test --release --locked --manifest-path rust/Cargo.toml
+      - name: Regression tests for bugs found by verification
+        run: cargo test --release --locked --manifest-path rust/sigil-witness/proofs/Cargo.toml --test bugs
       - name: Golden vectors still match the Python reference
         run: PYTHONPATH=. python rust/sigil-witness/tests/gen_vectors.py | cmp - rust/sigil-witness/tests/vectors.json
       - name: Interop (Python wallet against Rust witness processes)

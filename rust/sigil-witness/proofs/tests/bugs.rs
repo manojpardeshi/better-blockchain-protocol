@@ -1,6 +1,6 @@
-//! Bugs found while verifying the Rust witness (docs/VERIFY_RUST.md, "Bugs found"). Each test
-//! asserts the correct behaviour and FAILS on the current code; they are ignored so the suite
-//! stays green. Run them with `cargo test --release --test bugs -- --ignored`.
+//! Bugs found while verifying the Rust witness (docs/VERIFY_RUST.md, "Bugs found"), all fixed.
+//! Each test asserts the correct behaviour and failed on the code before its fix; they now run
+//! as regression tests (`cargo test --release --test bugs`, also run in CI).
 
 use std::sync::atomic::AtomicI64;
 use std::sync::Arc;
@@ -20,7 +20,7 @@ use sigil_witness_proofs::world::{default_headers, signed_vote, World, NOW};
 /// UTF-8 character slices a `str` off a char boundary and panics. Reachable from every HTTP
 /// request body (`server::call` parses before anything else).
 #[test]
-#[ignore = "BUG 1: json::parse panics on a \\u escape followed by non-ASCII bytes"]
+// Was BUG 1 (fixed): json::parse panics on a \\u escape followed by non-ASCII bytes
 fn bug1_parser_panics_on_unicode_after_backslash_u() {
     for input in ["\"\\u111\u{e9}\"", "\"\\u\u{20ac}\u{e9}\"", "{\"request\":\"\\u1\u{e9}\u{e9}\"}"] {
         let r = std::panic::catch_unwind(|| parse(input.as_bytes()).is_err());
@@ -33,12 +33,14 @@ fn bug1_parser_panics_on_unicode_after_backslash_u() {
 /// constellation whose charter lists no witnesses, any seal or death proof "from" it verifies
 /// with zero valid votes, and a successor charter needs zero signatures.
 #[test]
-#[ignore = "BUG 2: quorum(0) is 0 (spec and reference: 1), so empty charters accept unsigned seals"]
+// Was BUG 2 (fixed): quorum(0) is 0 (spec and reference: 1), so empty charters accept unsigned seals
 fn bug2_empty_charter_accepts_unsigned_evidence() {
     let body = obj([("name", Json::str("E")), ("version", Json::Int(0)), ("witnesses", Json::Arr(vec![])), ("prev", Json::Null)]);
     let cid = sigil_witness::charter::constellation_id(&body);
     let reg_json = Json::Obj([(cid.clone(), Json::Arr(vec![obj([("body", body), ("sigs", Json::Obj(Map::new()))])]))].into_iter().collect());
-    let reg = Registry::from_json(&reg_json).expect("the empty charter loads");
+    assert_eq!(sigil_witness::charter::quorum(0), 1, "quorum(0) per SPEC §7 (f = floor(-1/3) = -1)");
+    // The fix refuses empty charters outright; if one ever loads, its evidence must still fail.
+    let Ok(reg) = Registry::from_json(&reg_json) else { return };
     let lock = obj([("op", "never".into())]);
     let salt = Json::str("x");
     let s = sigil_of(&Json::str(&cid), &lock, &salt);
@@ -63,7 +65,6 @@ fn bug2_empty_charter_accepts_unsigned_evidence() {
         ("votes", Json::Arr(vec![v])),
     ]);
     assert!(!proves_dead(&header, &tid, &proof, &reg, false), "a death proof with no member votes must not verify");
-    assert_eq!(sigil_witness::charter::quorum(0), 1, "quorum(0) per SPEC §7 (f = floor(-1/3) = -1)");
 }
 
 /// BUG 5 (json.rs `py_float_repr`): when two shortest digit strings round-trip to the same
@@ -73,7 +74,7 @@ fn bug2_empty_charter_accepts_unsigned_evidence() {
 /// canonical differential (proofs/diff/differential.py --canonical): 5 of 39,725 accepted texts.
 /// Expected values are Python 3's `repr(float(text))`.
 #[test]
-#[ignore = "BUG 5: py_float_repr breaks exact ties differently from Python repr (half-even)"]
+// Was BUG 5 (fixed): py_float_repr breaks exact ties differently from Python repr (half-even)
 fn bug5_float_repr_tie_breaking_differs_from_python() {
     let cases = [
         ("1966098015293243369E-3", "1966098015293243.2"),
@@ -95,7 +96,7 @@ fn bug5_float_repr_tie_breaking_differs_from_python() {
 /// today (the Rust witness never freezes), but it fails open, and must be fixed before FREEZE
 /// is ported.
 #[test]
-#[ignore = "BUG 6: a store whose `frozen` entry is a successor hash (reference format) loads as not frozen"]
+// Was BUG 6 (fixed): a store whose `frozen` entry is a successor hash (reference format) loads as not frozen
 fn bug6_frozen_successor_hash_loads_as_not_frozen() {
     let dir = std::env::temp_dir().join(format!("sigil-bug6-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -141,7 +142,7 @@ fn max_depth(v: &Json) -> usize {
 /// is theirs to choose), so every witness of a constellation can be bricked until an operator
 /// repairs its store by hand.
 #[test]
-#[ignore = "BUG 3: a deeply nested (but accepted) SPEND makes the store unloadable after restart"]
+// Was BUG 3 (fixed): a deeply nested (but accepted) SPEND makes the store unloadable after restart
 fn bug3_deep_request_bricks_the_store_on_restart() {
     let world = World::new(&default_headers());
     let owner = &world.owner;
@@ -186,7 +187,7 @@ fn bug3_deep_request_bricks_the_store_on_restart() {
 /// lock for their own parcel. The test checks that evaluation time does not scale with the node
 /// count (63 nodes must cost well under 10x one node).
 #[test]
-#[ignore = "BUG 4: equivocation-lock evaluation is O(nodes x proofs) signature checks (CPU DoS)"]
+// Was BUG 4 (fixed): equivocation-lock evaluation is O(nodes x proofs) signature checks (CPU DoS)
 fn bug4_equivocation_lock_cost_scales_with_nodes() {
     let world = World::new(&default_headers());
     let w = sigil_witness::crypto::KeyPair::from_seed(&[3; 32]);

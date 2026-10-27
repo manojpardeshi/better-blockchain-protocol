@@ -25,9 +25,9 @@ fn quorum_intersection_all_n() {
     let n: usize = kani::any();
     let f = faults(n);
     let q = quorum(n);
-    assert!(q <= n);
+    assert!(q >= 1); // even an empty charter needs a vote (bug 2, fixed)
     if n >= 1 {
-        assert!(q >= 1);
+        assert!(q <= n);
         assert!(3 * (f as u128) < n as u128);
         assert!(2 * (q as u128) >= n as u128 + f as u128 + 1);
         // q - f honest voters in a quorum is more than the f + ... needed by Lemma 2:
@@ -36,11 +36,11 @@ fn quorum_intersection_all_n() {
     }
 }
 
-/// Documents bug 2 (docs/VERIFY_RUST.md): for n = 0 the Rust quorum is 0, where the spec's
-/// floor((n-1)/3) gives f = -1 and q = 1 (and Python's `(n - 1) // 3` agrees with the spec).
+/// Bug 2 (docs/VERIFY_RUST.md), fixed: for n = 0 the quorum is 1, as the spec's
+/// floor((n-1)/3) = -1 gives (and Python's `(n - 1) // 3`), so no unsigned evidence counts.
 #[kani::proof]
-fn quorum_of_empty_charter_is_zero() {
-    assert_eq!(quorum(0), 0);
+fn quorum_of_empty_charter_is_one() {
+    assert_eq!(quorum(0), 1);
 }
 
 // ------------------------------------------------------- witness record logic (transcription)
