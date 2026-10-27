@@ -345,7 +345,8 @@ fn lock_eval_monotone_in_time() {
 
 /// `json::parse` never panics on any input of up to N bytes that contains no '.', 'e' or 'E'
 /// (so no float is parsed: float parsing and printing are out of Kani's reach and are covered
-/// by fuzzing and the Python differential instead).
+/// by fuzzing and the Python differential instead). N = 7 did not finish in 20 minutes
+/// (`from_utf8`, map and integer-parsing code over symbolic bytes), so N = 4.
 fn parse_no_panic<const N: usize>() {
     let bytes: [u8; N] = kani::any();
     let len: usize = kani::any();
@@ -357,15 +358,20 @@ fn parse_no_panic<const N: usize>() {
 }
 
 #[kani::proof]
-#[kani::unwind(9)]
-fn parse_no_panic_7() {
-    parse_no_panic::<7>();
+#[kani::unwind(6)]
+fn parse_no_panic_4() {
+    parse_no_panic::<4>();
 }
 
-/// Expected to FAIL (bug 1): 8 bytes suffice to make `Parser::hex4` slice a `str` inside a
-/// multi-byte character, e.g. `"\u111` followed by `é`.
+/// The string-escape path with a concrete prefix: `"\u` followed by 5 arbitrary bytes.
+/// Expected to FAIL (bug 1): `Parser::hex4` slices a `str` inside a multi-byte character, e.g.
+/// `"\u111` followed by `é`.
 #[kani::proof]
 #[kani::unwind(10)]
-fn parse_no_panic_8_finds_bug_1() {
-    parse_no_panic::<8>();
+fn parse_unicode_escape_finds_bug_1() {
+    let tail: [u8; 5] = kani::any();
+    let mut input = [0u8; 8];
+    input[..3].copy_from_slice(b"\"\\u");
+    input[3..].copy_from_slice(&tail);
+    let _ = sigil_witness::json::parse(&input);
 }

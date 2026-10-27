@@ -22,9 +22,10 @@ unchanged. `src/` was not modified: bugs are recorded as ignored tests (below).
 | Kind of evidence | Scope | Result |
 |---|---|---|
 | Kani proofs on the transcription of the record logic | every record state (unbounded i128 generations), vote histories of ≤ 2 votes | each SPEND/RELEASE step is a TLA+ `Spend`/`Release` step or a stutter, and an invariant implying one tid per `(sigil, gen)` is inductive |
-| Kani proofs on shipped functions | quorum arithmetic (all `usize`); `votes_of_seal`, lock monotonicity, parser (bounded) | proved; the parser harness finds bug 1 at 8 bytes |
-| Bounded exhaustive check of the real witness | every state reachable with a 363-op alphabet (3 sigils, 7 headers, gens 0..3, 276 death-proof shapes) | 521 states, 189,123 checked transitions, no violation; all 11 seeded mutants killed (see §3.4) |
-| Fuzzing (libFuzzer) | 5 targets, 40 min each | 64.9 M executions; 1 crash (bug 1) |
+| Kani proofs on shipped functions | quorum arithmetic (all `usize`) | proved. The `votes_of_seal`, lock and parser harnesses did not complete (time or memory); see §2 |
+| Exhaustive bounded checks of shipped functions | lock evaluation: 72,009 locks × 6 clock readings; parser: all 3.4 M inputs of ≤ 5 bytes over a 20-symbol alphabet | locks are monotone in time and match the spec semantics; the parser never panics on these, and 9,360 inputs of the form `"\u` + ≤ 5 bytes panic (bug 1) |
+| Bounded exhaustive check of the real witness | every state reachable with a 171-op alphabet (3 sigils, 7 headers, gens 0..3, two clock readings, 84 death-proof shapes), and with a 363-op alphabet (276 proof shapes, one clock reading) | 6,067 states / 1,037,457 checked transitions, and 521 / 189,123; no violation. All 10 non-equivalent seeded mutants are killed (§3.4) |
+| Fuzzing (libFuzzer) | 5 targets, 40 min each, plus a 5-min re-run | 65.0 M executions; 1 crash (bug 1) |
 | Differential vs the Python reference | 4,000 episodes, 143,594 steps; 56,040 JSON texts | votes byte-identical; divergences are bugs 2 and 5 or deliberate strictness |
 
 Bugs: **6**. One High (bug 3, a deep request bricks the store), one Medium (bug 4, CPU
@@ -76,12 +77,12 @@ so the cryptographic assumption (Ed25519 unforgeability) is the only one used.
 | `quorum_intersection_all_n` | real `charter::{faults, quorum}` | every `n: usize` | no panic or overflow; `q ≤ n`; for `n ≥ 1`: `3f < n`, `2q ≥ n + f + 1` (Lemma 1 counting), `2f < q` (Lemma 2 counting) | 4.6 s |
 | `quorum_of_empty_charter_is_zero` | real `quorum` | `n = 0` | documents bug 2 (`q(0) = 0`, the spec gives 1) | <1 s |
 | `init_satisfies_invariant` | transcription | | `Init` satisfies `inv`, and α(empty) = TLA+ `Init` | <1 s |
-| `spend_refines_tla_and_preserves_invariant` | `model_rust::spend_core` | every record (gen any i128 in [0, 2^62], tid any of 6 or CONTESTED, vote, abstain free), absent records, any authorisation/expiry outcome, `0 ≤ g < 2^62`, any tid; histories of ≤ 2 earlier votes | stutter, or exactly TLA+ `Spend`; a conflict carries only our vote for another tid at the same gen; `inv` preserved | KANI_SPEND |
-| `release_refines_tla_and_preserves_invariant` | `model_rust::release_core` | same | only from bound non-contested records with a valid proof; exactly TLA+ `Release`; `gen + 1` never overflows; `inv` preserved | KANI_RELEASE |
-| `votes_of_seal_never_overrides` | real `proofs::votes_of_seal` | one entry whose own keys are each present or not, plus at most one override key naming any seal field; symbolic integer values | KANI_VOS | KANI_VOS_T |
-| `lock_eval_monotone_in_time` | real `locks::evaluate` | locks of depth ≤ 2 (≤ 2 children) over `after`/`before`/`never`/absent-`sig` leaves; any i64 times and clock | KANI_LOCK | KANI_LOCK_T |
-| `parse_no_panic_7` | real `json::parse` | every input of ≤ 7 bytes without `.`, `e`, `E` (floats are out of Kani's reach) | KANI_P7 | KANI_P7_T |
-| `parse_no_panic_8_finds_bug_1` | real `json::parse` | same, ≤ 8 bytes | KANI_P8 | KANI_P8_T |
+| `spend_refines_tla_and_preserves_invariant` | `model_rust::spend_core` | every record (gen any i128 in [0, 2^62], tid any of 6 or CONTESTED, vote, abstain free), absent records, any authorisation/expiry outcome, `0 ≤ g < 2^62`, any tid; histories of ≤ 2 earlier votes | stutter, or exactly TLA+ `Spend`; a conflict carries only our vote for another tid at the same gen; `inv` preserved | 13 s |
+| `release_refines_tla_and_preserves_invariant` | `model_rust::release_core` | same | only from bound non-contested records with a valid proof; exactly TLA+ `Release`; `gen + 1` never overflows; `inv` preserved | 8 s |
+| `votes_of_seal_never_overrides` | real `proofs::votes_of_seal` | one entry whose own keys are each present or not, plus at most one override key naming any seal field; symbolic integer values | **not completed**: one formulation with symbolic key names crashed CBMC (`corrupted double-linked list`); the per-shape harnesses (`votes_of_seal_shapes_own_*`, all 48 key shapes with symbolic values) each exceeded 45 min. BTreeMap code is out of practical reach of CBMC here; the property is covered by the `proofs_verify` fuzz target (asserted on every input) and the bounded exhaustive check (§3) | >45 min |
+| `lock_eval_monotone_in_time` | real `locks::evaluate` | locks of depth ≤ 2 (≤ 2 children) over `after`/`before`/`never`/absent-`sig` leaves; any i64 times and clock | **not completed** in 20 min; replaced by the exhaustive check in §3.2, which covers a larger lock space (real signatures included) | — |
+| `parse_no_panic_4` | real `json::parse` | every input of ≤ 4 bytes without `.`, `e`, `E` | **not completed**: CBMC ran out of memory after 15 min (7 bytes: no result in 20 min) | — |
+| `parse_unicode_escape_finds_bug_1` | real `json::parse` | `"\u` followed by 5 symbolic bytes | **not completed** in 20 min | — |
 
 `inv` (per record) says: the generation is in range, and a bound record's generation is
 below 2^62. The stored vote is for the bound tid at the current generation and is in the
@@ -124,7 +125,7 @@ at D). Seven headers have the shapes of `formal/MC.tla`: a same-generation confl
 two-home transition, release to generation 1, a jump to generation 2, and more.
 
 The **alphabet** is SPEND of any sigil in any header, with the owner's or an intruder's
-signature and a live or expired authorisation, plus STATUS. Then RELEASE with a death proof
+signature and a live or expired authorisation, also with the clock one second later (a repeated request must be answered with the stored vote, not a fresh one), plus STATUS. Then RELEASE with a death proof
 of any of these shapes: either input of the bound header; seal or votes; from the home, the
 rogue or the other constellation; for a phantom tid, for the bound tid itself, or for any
 header's tid; with all, or all but one, of the harness-held members; with or without `w0`'s
@@ -141,8 +142,13 @@ tid at that generation.
 
 | Alphabet | States | Transitions checked | Depth | Time |
 |---|---|---|---|---|
-| reduced (150 ops) | 521 | 78,150 | 11 | 158 s |
-| full (363 ops) | 521 | 189,123 | 11 | 590 s |
+| reduced, without the one-second-later SPEND (150 ops) | 521 | 78,150 | 11 | 158 s |
+| full, without the one-second-later SPEND (363 ops) | 521 | 189,123 | 11 | 590 s |
+| **reduced, with the one-second-later SPEND (171 ops)** | **6,067** | **1,037,457** | 11 | 2,308 s (sharing the CPU with Kani) |
+
+The one-second-later SPEND was added after mutation testing (§3.4) showed that with a single
+fixed clock a fresh vote is byte-identical to the stored one, so returning a fresh vote was
+invisible. Votes can now carry either timestamp, which is why the state count grows.
 
 No violation of refinement, transcription, frame, persist-before-answer, one tid per
 `(sigil, gen)`, death-proof soundness, or **completeness**: every proof the spec oracle
@@ -151,6 +157,24 @@ accepts (with exactly-`{witness, time, sig}` seal entries), the witness accepts 
 **What this proves.** For this world and alphabet, every reachable state of the real
 witness has been visited, and every step from it is an allowed TLA+ step. Generations,
 tids and sigils are few; the Kani proofs cover the record logic for all values.
+
+### 3.2 Exhaustive checks of the lock evaluator and the parser
+
+Kani could not complete these two (above), so they are checked by enumeration instead, on the
+real code.
+
+* `cargo test --release --test locks_exhaustive`: every lock of depth ≤ 2 with 1–2 children
+  per `all`/`any`, over 9 leaves. The leaves are `after t` and `before t` for t ∈ {−1, 0, 1},
+  `never`, a `sig` whose signature is absent, and a `sig` with a real valid signature. That is
+  72,009 locks at every clock in {−2..2} and untimed: 360,045 timed evaluations. Each one
+  matches an independent evaluator of the §3.5 semantics. eval(now) ⇒ eval(None) always holds;
+  this is the monotonicity `Witness::spend` relies on to evaluate a lock once. Batch and single
+  verification agree.
+* `cargo test --release --test parser_exhaustive`: every input of ≤ 5 bytes over an alphabet of
+  JSON punctuation, escapes, digits, whitespace and multi-byte UTF-8 fragments, 3,368,421
+  inputs. None panics, and the canonical output of every accepted input re-parses to itself.
+  The ignored `parse_never_panics_after_unicode_escape` enumerates `"\u` + ≤ 5 alphabet bytes;
+  9,360 of 3,368,421 panic (bug 1).
 
 ### 3.3 Restart equivalence
 
@@ -165,7 +189,23 @@ and that `log` never influences a reply.
 `python3 rust/sigil-witness/proofs/mutants.py` copies `rust/` to a scratch directory,
 applies one edit to `sigil-witness/src`, and runs the reduced bounded check against it.
 
-MUTANT_TABLE
+| Mutant (edit to `src/`) | What it breaks | Killed by (all checks) | Killed with transcription checks off (`--no-model`) |
+|---|---|---|---|
+| `release-any-proof` | RELEASE accepts any death proof (the TLA+ mutant `AnyProof`) | SAFETY: death proof the spec oracle rejects | SAFETY, same |
+| `proof-any-constellation` | seal-kind evidence from any constellation (TLA+ `AnyConstellationProof`, the fixed v0 double spend) | SAFETY, same | SAFETY, same |
+| `votes-proof-any-constellation` | the same for votes-kind evidence | SAFETY, same | SAFETY, same |
+| `proof-same-tid` | death proofs made of votes for the bound transition itself | SAFETY, same | SAFETY, same |
+| `stale-accepted` | SPEND accepts the generation just below the record's | MODEL: reply differs | **SAFETY: w0 voted two tids at one (sigil, gen)** |
+| `release-keeps-vote` | RELEASE leaves the stored vote in place | MODEL: stored vote differs | **SAFETY: vote tid is not the request header's tid** |
+| `fastpath-wrong-vote` | a repeated request gets a freshly signed vote, not the stored one | SAFETY: vote let out but not stored (only after the one-second-later SPEND was added; before that it survived) | SAFETY, same |
+| `home-ignored` | votes on sigils homed at other constellations | SAFETY: `Home[s] = ConsOf(w)` violated | SAFETY, same |
+| `jump-while-bound` | SPEND at a higher generation while bound answers Conflict instead of "release it first" | MODEL: reply differs | survives: no state changes, so this is not a safety bug |
+| `expiry-ignored` | binds on an expired authorisation (§5.1) | MODEL: reply differs | survives: TLA+ abstracts time; the owner-side expiry rule is modelled separately in `formal/` |
+| `conflict-revotes` | the slow-path Conflict re-binds instead | **survives (equivalent)**: that branch is unreachable, since the fast path answers every same-generation conflict | not run |
+
+All 10 non-equivalent mutants are killed. All 8 that are safety bugs are caught by the safety
+and refinement checks alone. The two that only change replies are caught by the transcription
+check.
 
 ## 4. Fuzzing (cargo-fuzz 0.13.2, libFuzzer, nightly)
 
@@ -176,7 +216,7 @@ MUTANT_TABLE
 | Target | What it checks | Execs (40 min) | Edges (cov) | Line coverage of the key file |
 |---|---|---|---|---|
 | `json_roundtrip` | parser never panics; canonical output is ASCII, re-parses to the same value and is a fixpoint | 57,882,230 | 988 | json.rs 81.5 % |
-| `witness_ops` | structured SPEND/RELEASE/STATUS sequences (≤ 48 ops) and mutated requests/proofs, raw sigils, varying clock; every step checked by `checker.rs` (refinement, transcription, one tid per gen, death-proof soundness) | 482,142 | 5,170 | witness.rs 81.5 %, proofs.rs 89.1 % |
+| `witness_ops` | structured SPEND/RELEASE/STATUS sequences (≤ 48 ops) and mutated requests/proofs, raw sigils, varying clock; every step checked by `checker.rs` (refinement, transcription, one tid per gen, death-proof soundness) | 482,142 (+95,500 in a 5-min re-run after the one-second-later SPEND was added) | 5,170 | witness.rs 81.5 %, proofs.rs 89.1 % |
 | `witness_http_body` | raw bodies through the server's parse → object → field path, sequences of up to 8 messages, then the same checks | 3,974,073 | 3,401 | json.rs 81.2 %, witness.rs 67.6 % |
 | `locks_eval` | evaluate never panics; batch = single verification; monotone in time; true ⇒ well formed; agreement with a spec oracle on generated locks (shape rules, depth 8, 64 nodes, sig/multi/hash/equivocation/time semantics) | 2,133,942 | 3,405 | locks.rs 99.2 % |
 | `proofs_verify` | mutated seals, death proofs and equivocation proofs: no panic; batch = single; accepted ⇒ valid per the spec oracle (genuine votes only); `votes_of_seal` never lets an entry override the seal | 404,767 | 4,085 | proofs.rs 97.1 % |
@@ -240,7 +280,7 @@ Every bug has a failing test, ignored with `BUG n: …` in
 
 | # | Severity | Where | Summary | Test |
 |---|---|---|---|---|
-| 1 | Low–Medium | `json.rs` `Parser::hex4` | remote panic on `"\u` + non-ASCII bytes | `bug1_…`, `fuzz/regressions/json_roundtrip/hex4-char-boundary`, Kani `parse_no_panic_8_finds_bug_1` |
+| 1 | Low–Medium | `json.rs` `Parser::hex4` | remote panic on `"\u` + non-ASCII bytes | `bug1_…`, `parse_never_panics_after_unicode_escape`, `fuzz/regressions/json_roundtrip/hex4-char-boundary` |
 | 2 | Low | `charter.rs` `faults`/`quorum` | `quorum(0) = 0`: an empty charter accepts unsigned seals and death proofs | `bug2_…`, differential `--empty-charter` |
 | 3 | **High** (availability) | `witness.rs` + `store.rs` + `json::MAX_DEPTH` | one deep but accepted SPEND makes the store unloadable: the witness never restarts | `bug3_…` |
 | 4 | Medium (DoS) | `locks.rs` `Ctx::ev` "equivocation"; also `sigil/locks.py` | lock evaluation costs #nodes × #proofs signature checks | `bug4_…`, `tests/test_rust_verification_findings.py` |
@@ -264,9 +304,8 @@ The reply is empty (curl exit 52). The server prints the panic and keeps serving
 the binary unwinds on panic.
 
 **Impact.** Any unauthenticated client can drop its own connection and spam the log; a
-build with `panic = "abort"` would crash the witness. Kani finds the bug with 8-byte inputs
-and proves the parser panic-free for all inputs of ≤ 7 bytes without `.`, `e` or `E`.
-libFuzzer found it in about 10,000 executions.
+build with `panic = "abort"` would crash the witness. libFuzzer found it in about 10,000
+executions; the exhaustive enumeration finds 9,360 inputs of ≤ 8 bytes that trigger it.
 
 **Fix.** Work on bytes:
 ```rust
