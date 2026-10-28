@@ -1,0 +1,27 @@
+[package]
+name = "sigil-step-guest"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "The Sigil PCD step relation as a bare-metal RV32IM program (what a zkVM guest would run)"
+
+[[bin]]
+name = "sigil-step-guest"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+blake2 = { version = "0.10", default-features = false }
+ed25519-dalek = { version = "2", default-features = false }
+serde_json = { version = "1", default-features = false, features = ["alloc"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+debug = false
+
+[profile.dev]
+panic = "abort"

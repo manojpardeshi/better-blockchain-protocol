@@ -10,7 +10,7 @@ Kinds:
 
 * ``pk``      -- the witness key this store belongs to (guards against mix-ups)
 * ``member``  -- ``[cid, version]`` the witness has joined
-* ``frozen``  -- ``true`` once the witness froze for rotation
+* ``frozen``  -- hash of the successor charter the witness froze for (``true`` in older stores)
 * ``record``  -- key = sigil, value = the full ``Record`` as a dict
 * ``stamp``   -- key = a redeemed stamp serial
 

@@ -26,15 +26,15 @@ Status legend: ⬜ not started · 🟨 in progress · ✅ done
 ## Phase 2: Performance, Rust (#9)
 | | Item |
 |---|---|
-| ⬜ | Rust witness: Ed25519 batch verification and an embedded key-value store |
+| ✅ | Rust witness: Ed25519 batch verification and an embedded key-value store (`rust/sigil-witness`; rotation, stamps and gossip storage still to port) |
 | ⬜ | Sharding a witness's sigil space across machines |
-| ⬜ | Published benchmarks: votes/s per core, payment latency, dossier verification cost |
+| ✅ | Published benchmarks: votes/s per core, payment latency, dossier verification cost (`docs/BENCHMARKS.md`) |
 
 ## Phase 3: Dossier growth and privacy, research in parallel (#10)
 | | Item |
 |---|---|
-| ⬜ | Recursive succinct proofs of ancestry validity (zkVM prototype) |
-| ⬜ | Holder privacy: ancestry hidden behind proofs |
+| 🟨 | Recursive succinct proofs of ancestry validity: design and measurements in `docs/research/RECURSIVE_PROOFS.md`, toy Plonky2 recursive proof and RISC-V cycle counts in `research/`; full zkVM guest not yet built |
+| 🟨 | Holder privacy: ancestry hidden behind proofs (designed in the same doc) |
 
 ## Phase 4: Missing features (#11)
 | | Item |

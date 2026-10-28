@@ -1,0 +1,11 @@
+[package]
+name = "rv32-count"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Minimal RV32IM emulator that counts retired instructions (a stand-in for a zkVM executor)"
+
+[dependencies]
+
+[profile.release]
+opt-level = 3

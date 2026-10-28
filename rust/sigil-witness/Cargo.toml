@@ -1,0 +1,25 @@
+[package]
+name = "sigil-witness"
+description = "A Sigil v0 witness, wire-compatible with the Python reference"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "sigil_witness"
+path = "src/lib.rs"
+
+[[bin]]
+name = "sigil-witness"
+path = "src/main.rs"
+
+[dependencies]
+blake2b_simd.workspace = true
+ed25519-dalek.workspace = true
+rand.workspace = true
+hex.workspace = true
+redb.workspace = true
+tokio.workspace = true
+axum.workspace = true
+clap.workspace = true

@@ -75,6 +75,7 @@ from tests import test_model_check as base
 
 SEEDS = int(os.environ.get("SIGIL_MODEL_EXT_SEEDS", str(max(1, base.SEEDS // 4))))
 STEPS = base.STEPS
+FAR_FUTURE = base.FAR_FUTURE
 N = 4
 Q = quorum(N)
 
@@ -140,8 +141,8 @@ class Universe:
 
     def auth(self, header, tid, sigil):
         p = self.parcels[sigil]
-        u = locks.empty_unlock()
-        u["sigs"][self.owner.pk] = locks.sign_unlock(self.owner, sigil, tid)
+        u = locks.empty_unlock(FAR_FUTURE)
+        u["sigs"][self.owner.pk] = locks.sign_unlock(self.owner, sigil, tid, FAR_FUTURE)
         return {"home": p["home"], "lock": p["lock"], "salt": p["salt"], "unlock": u, "header": header}
 
     def request(self, header, tid, sigil):
@@ -243,7 +244,7 @@ class Universe:
                 e = {"kind": "bind", "gen": g, "auth": self.auth(h, t, s)}
             elif r < 0.3:    # a binding with a broken authorisation
                 a = self.auth(h, t, s)
-                a["unlock"] = locks.empty_unlock()
+                a["unlock"] = locks.empty_unlock(FAR_FUTURE)  # unexpired but unsigned
                 e = {"kind": "bind", "gen": g, "auth": a}
             elif r < 0.4:    # authorisation re-labelled to another header
                 a = self.auth(h, t, s)
@@ -612,8 +613,8 @@ class KnownGapTests(unittest.TestCase):
             h = {"inputs": [[s, gen]], "body": model.body_hash(
                 model.body([ref], [model.parcel(X, usd, 100, b["lock"], b["salt"])], memo=memo))}
             t = model.transition_id(h)
-            u = locks.empty_unlock()
-            u["sigs"][key.pk] = locks.sign_unlock(key, s, t)
+            u = locks.empty_unlock(FAR_FUTURE)
+            u["sigs"][key.pk] = locks.sign_unlock(key, s, t, FAR_FUTURE)
             req = {"sigil": s, "header": h, "home": X, "lock": p["lock"], "salt": p["salt"], "unlock": u}
             return t, request_seal(net, req)
 
@@ -643,8 +644,8 @@ class KnownGapTests(unittest.TestCase):
 
         def req(name):
             h = {"inputs": [[s, 0]], "body": name * 64}
-            u = locks.empty_unlock()
-            u["sigs"][owner.pk] = locks.sign_unlock(owner, s, model.transition_id(h))
+            u = locks.empty_unlock(FAR_FUTURE)
+            u["sigs"][owner.pk] = locks.sign_unlock(owner, s, model.transition_id(h), FAR_FUTURE)
             return {"sigil": s, "header": h, "home": X, "lock": p["lock"], "salt": p["salt"], "unlock": u}
 
         w0, w1, w2, w3 = net.witnesses(X)

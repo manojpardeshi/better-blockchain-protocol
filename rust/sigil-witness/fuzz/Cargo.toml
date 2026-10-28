@@ -1,0 +1,58 @@
+[package]
+name = "sigil-witness-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+# Standalone (not a member of rust/Cargo.toml).
+[workspace]
+
+[features]
+# Skip inputs that hit an already-reported bug, so fuzzing can get past it. Turn it off
+# (`--no-default-features`) to reproduce the bug.
+default = ["skip_known_bugs"]
+skip_known_bugs = []
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+sigil-witness = { path = ".." }
+sigil-witness-proofs = { path = "../proofs", features = ["fuzz"] }
+
+[[bin]]
+name = "json_roundtrip"
+path = "fuzz_targets/json_roundtrip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "witness_ops"
+path = "fuzz_targets/witness_ops.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "witness_http_body"
+path = "fuzz_targets/witness_http_body.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "locks_eval"
+path = "fuzz_targets/locks_eval.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "proofs_verify"
+path = "fuzz_targets/proofs_verify.rs"
+test = false
+doc = false
+bench = false

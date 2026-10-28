@@ -74,9 +74,14 @@ def transition_id(h: dict) -> str:
     return digest("transition", h)
 
 
-def unlock_message(sigil: str, tid: str) -> dict:
-    """What a lock's signatures sign: 'consume <sigil> in <transition>'."""
-    return {"sigil": sigil, "tid": tid}
+def unlock_message(sigil: str, tid: str, expires) -> dict:
+    """What a lock's signatures sign: 'consume <sigil> in <transition>, if bound by <expires>'.
+
+    ``expires`` (a time) bounds when a witness may *newly* bind the sigil
+    for this authorisation, so an owner whose spend failed knows when no
+    delayed request can still bind it (SPEC §5.1).
+    """
+    return {"sigil": sigil, "tid": tid, "expires": expires}
 
 
 # ------------------------------------------------------------ votes/seals
@@ -102,8 +107,10 @@ def seal_from_votes(votes: list) -> dict:
 
 
 def votes_of_seal(seal: dict) -> list:
+    # Only a vote's own fields come from its entry; any other key in the entry
+    # is ignored, so an entry can never override what the seal claims.
     common = {k: seal[k] for k in ("constellation", "version", "sigil", "gen", "tid")}
-    return [dict(common, **v) for v in seal["votes"]]
+    return [{**common, "witness": v["witness"], "time": v["time"], "sig": v["sig"]} for v in seal["votes"]]
 
 
 def seal_key(sigil: str, tid: str) -> str:

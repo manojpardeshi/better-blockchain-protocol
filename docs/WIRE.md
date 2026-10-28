@@ -29,6 +29,7 @@ Big integers (RSA stamp values) are lowercase hex strings. Request bodies are ca
 ## Client behaviour
 
 * A witness that cannot be reached counts as crashed. It does not vote, and it can never be assumed to hold no vote (see the wallet's `unpledge_if_unbound`).
+* A request may be delayed in flight and reach a witness after the client gave up on it. Witnesses refuse to newly bind on an authorisation whose `unlock.expires` has passed (SPEC §5.1), so a wallet releases a failed pledge only after `expires` plus a clock-skew margin, and only if every current member answered STATUS with no binding or vote for it (SPEC §4 rule 3).
 * Constellation sizes come from the verified charter, never from how many witnesses answered.
 * Charter chains fetched from witnesses are verified against the constellation id (SPEC §3.7) before use. Invalid or forked chains are ignored.
 

@@ -44,6 +44,10 @@ def verify_chain(cid: str, chain: list) -> bool:
     first = chain[0]["body"]
     if first["version"] != 0 or first["prev"] is not None or constellation_id(first) != cid:
         return False
+    for c in chain:
+        ws = c["body"]["witnesses"]
+        if not ws or len(set(ws)) != len(ws):  # an empty charter would accept unsigned evidence
+            return False
     for prev, cur in zip(chain, chain[1:]):
         pb, cb = prev["body"], cur["body"]
         if cb["version"] != pb["version"] + 1 or cb["prev"] != charter_hash(pb):

@@ -28,6 +28,8 @@ from sigil.witness import Rejected
 
 SEEDS = int(os.environ.get("SIGIL_MODEL_SEEDS", "150"))
 STEPS = int(os.environ.get("SIGIL_MODEL_STEPS", "120"))
+# Authorisation expiry is not what these checks explore: every one is unexpired.
+FAR_FUTURE = 4_000_000_000
 
 
 class Universe:
@@ -52,8 +54,8 @@ class Universe:
 
     def request(self, header, tid, sigil):
         p = self.parcels[sigil]
-        u = locks.empty_unlock()
-        u["sigs"][self.owner.pk] = locks.sign_unlock(self.owner, sigil, tid)
+        u = locks.empty_unlock(FAR_FUTURE)
+        u["sigs"][self.owner.pk] = locks.sign_unlock(self.owner, sigil, tid, FAR_FUTURE)
         return {"sigil": sigil, "header": header, "home": self.cid, "lock": p["lock"], "salt": p["salt"], "unlock": u}
 
     def honest_votes(self, sigil, gen):

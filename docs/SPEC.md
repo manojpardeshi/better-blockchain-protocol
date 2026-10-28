@@ -62,9 +62,9 @@ Lock := {op:"sig",  pk}                 signature by pk
 ```
 Objects MUST have exactly the listed keys. Depth ≤ 8, nodes ≤ 64. Evaluation is total and linear.
 
-**Unlock** = `{sigs: {pk: sig}, preimages: {h: hex}, equivocations: [proof]}`. Signatures are `Sig(sk, "unlock", {sigil, tid})`.
+**Unlock** = `{sigs: {pk: sig}, preimages: {h: hex}, equivocations: [proof], expires: int}`. Signatures are `Sig(sk, "unlock", {sigil, tid, expires})`. `expires` is a time (seconds, same scale as `after`/`before`) chosen by the owner. It bounds when a witness may *newly* bind the sigil for this authorisation (§5.1), so an owner whose spend failed knows when no delayed request can still bind it (§4). All signatures in one unlock cover the same `expires`.
 
-`eval(lock, unlock, sigil, tid, now)`: standard boolean semantics. When `now` is null (holder re-check), `after` and `before` evaluate to true.
+`eval(lock, unlock, sigil, tid, now)`: standard boolean semantics; signatures are checked over `{sigil, tid, unlock.expires}`, so changing `expires` invalidates them. When `now` is null (holder re-check), `after` and `before` evaluate to true. Holders do not check `expires` against any clock: once a binding exists, it may keep being voted and sealed after expiry.
 
 ### 3.6 Vote and seal
 ```
@@ -72,7 +72,7 @@ vote = {constellation, version, witness: pk, sigil, gen, tid, time, sig}
        sig = Sig(witness_sk, "vote", vote without sig)
 seal = {constellation, version, sigil, gen, tid, votes: [{witness, time, sig}]}
 ```
-A seal is **valid** for a registry *R* and convicted set *X* if, for charter `R[constellation][version]`, at least `q` distinct members not in *X* have valid votes.
+A seal is **valid** for a registry *R* and convicted set *X* if, for charter `R[constellation][version]`, at least `q` distinct members not in *X* have valid votes. Each vote is rebuilt from the seal's own `constellation, version, sigil, gen, tid` plus the entry's `witness, time, sig`. Any other key in an entry is ignored and can never override a seal field.
 
 ### 3.7 Charter
 ```
@@ -104,10 +104,15 @@ The evidence MUST come from the target sigil's home. Constellations are permissi
 
 ## 4. Holder obligations
 
-1. A holder MUST NOT authorise two different transitions that consume the same sigil at the same generation.
+1. A holder MUST NOT authorise two different transitions that consume the same sigil at the same generation, except after releasing a pledge under rule 3. Re-authorising the *same* transition (for example with a later `expires`) is allowed; it is not equivocation.
 2. A holder MUST NOT authorise a transition at generation *g*+1 for a sigil until a quorum of its home has released generation *g*.
-3. Receiving addresses MUST use fresh salts. A recipient SHOULD check that the received sigil is unbound at its home (at most *f* witnesses report a binding).
-4. A holder SHOULD keep verified-transition caches and MUST clear them when its trust policy changes.
+3. **Pledge release.** An authorisation of `(s, g, T)` that the holder failed to seal (a *pledge*) may be released, and a different transition of `s` at `g` authorised, only when both hold:
+   * *expiry:* by the holder's clock, `now > E + skew`, where `E` is the latest `expires` it ever signed for `(s, g, T)` and `skew` bounds how far any honest witness's clock may lag the holder's (v0 default: 120 s). Then no honest witness will newly bind `s` to `T` (§5.1), however late a request arrives;
+   * *no binding:* every member of the home's current charter answered STATUS, and none reports a binding to, or a vote for, `T` at `g`. An unreachable member might hold one.
+
+   Without the expiry condition, a request delayed in flight could bind `s` to `T` after the holder checked, and the holder would then authorise two transitions (rule 1). If a binding exists, the pledge stays: the holder may still complete `T` (re-authorising it with a fresh `expires`) or recover via a death proof (§5.2).
+4. Receiving addresses MUST use fresh salts. A recipient SHOULD check that the received sigil is unbound at its home (at most *f* witnesses report a binding).
+5. A holder SHOULD keep verified-transition caches and MUST clear them when its trust policy changes.
 
 ## 5. Witness protocol
 
@@ -120,34 +125,35 @@ A witness MUST make its records (and its frozen flag) durable before it releases
 
 1. If inactive or frozen → reject. If stamps are required and `stamp` is missing, invalid or already redeemed → reject; otherwise redeem it.
 2. `home` MUST equal this constellation's id.
-3. **Authorisation:** `sigil({home, lock, salt}) = sigil`; `sigil` occurs exactly once in `header.inputs` with generation `g` (a non-negative integer); all header sigils are distinct; `tid = H("transition", header)`; `eval(lock, unlock, sigil, tid, now)` holds with the witness's clock.
+3. **Authorisation:** `sigil({home, lock, salt}) = sigil`; `sigil` occurs exactly once in `header.inputs` with generation `g` (a non-negative integer); all header sigils are distinct; `unlock.expires` is an integer; `tid = H("transition", header)`; `eval(lock, unlock, sigil, tid, now)` holds with the witness's clock.
 4. Let `r` = record(sigil).
    * `g < r.gen` → reject (stale).
    * `g > r.gen`: if `r.tid ≠ null` → reject (release first). Otherwise set `r.gen = g`. Skipping generations without voting is abstention and is safe.
-   * If `r.tid = null`: bind `r.tid = tid`, `r.header = header`, append `{kind:"bind", gen:g, auth:{home, lock, salt, unlock, header}}` to `r.log`.
+   * If `r.tid = null`: if `now > unlock.expires` by the witness's clock → reject (authorisation expired); a witness MUST NOT newly bind a sigil on an expired authorisation. Otherwise bind `r.tid = tid`, `r.header = header`, append `{kind:"bind", gen:g, auth:{home, lock, salt, unlock, header}}` to `r.log`.
    * If `r.tid ≠ tid` → reply **Conflict** carrying the existing vote.
-   * Otherwise return `r.vote`, creating and recording it on first use.
+   * Otherwise return `r.vote`, creating and recording it on first use. (Re-voting an existing binding is allowed after expiry.)
 
 A witness MUST NOT sign two votes with the same `(constellation, sigil, gen)` and different `tid`.
 
 ### 5.2 RELEASE(sigil, proof)
-1. `r` = record(sigil). Require `r.tid` to be a transition (not null, not contested).
-2. Require `proof` to be a valid death proof for `(r.header, r.tid)` (§3.9).
-3. Append `{kind:"release", gen:r.gen, tid:r.tid, header:r.header, proof}` to `r.log`, then set `r.gen += 1` and clear `tid`, `header`, `vote` and `abstain`.
+1. `r` = record(sigil). Require `r.tid` to be a transition or contested (not null).
+2. If `r` is contested: require `proof` to be a valid death proof for at least one of `r.candidates` (§5.4). For each candidate `(g, tid, header)` it kills, append a `release` entry for it to `r.log`, remove it, and set `r.gen = max(r.gen, g+1)`. Once no candidate is left, clear `tid` and raise `r.gen` past every generation of the witness's own votes. Stop here.
+3. Otherwise require `proof` to be a valid death proof for `(r.header, r.tid)` (§3.9).
+4. Append `{kind:"release", gen:r.gen, tid:r.tid, header:r.header, proof}` to `r.log`, then set `r.gen += 1` and clear `tid`, `header`, `vote` and `abstain`.
 
 ### 5.3 STATUS(sigil)
 Return `{gen, tid, votes}`. `votes` is every vote this witness ever cast on the sigil. Anyone may query. It is used for death proofs and freshness checks.
 
 ### 5.4 FREEZE(next_charter) / ADOPT
-* FREEZE: require `next_charter.prev = H("charter", current body)`. Set frozen (no further votes or releases, ever). Return a signature on `next_charter` and the evidence `{sigil: log ‖ [{kind:"vote", vote} for every vote this witness cast on sigil]}`.
+* FREEZE: require `next_charter.prev = H("charter", current body)`. A witness freezes for exactly one successor: if already frozen for a different `next_charter`, reject. Persist `H("charter", next_charter)` and set frozen (no further votes or releases, ever). Return a signature on `next_charter` and the evidence `{sigil: log ‖ [{kind:"vote", vote} for every vote this witness cast on sigil]}`.
 * The new charter is valid once a quorum of current members have signed it.
 * ADOPT(snapshots), run by each member of the new version. For each sigil, collect the union of log entries from all snapshots, then:
   * keep `bind` entries whose `auth` passes §5.1 step 3 with `now = null`; each gives a pair `(g, tid)`;
   * collect `dead` = the tids of `release` entries whose death proof verifies against their stated header;
   * `alive` = kept bindings whose tid is not in `dead`;
   * `own` = the adopter's own earlier votes on the sigil: valid `vote` entries signed by its own key for this constellation, plus any it already holds (a re-used key MUST bring its own votes);
-  * exactly one alive `(g, tid)` → record `gen = g`, bound to `tid`; if `own` holds a vote at `g` for another tid, mark the record **abstain**: it never votes at `g` (a release still moves it on);
-  * more than one → record **contested** (rejects all spends and releases);
+  * exactly one alive `(g, tid)`, and no other kept binding at `g` → record `gen = g`, bound to `tid`; if `own` holds a vote at `g` for another tid, mark the record **abstain**: it never votes at `g` (a release still moves it on);
+  * otherwise, if any binding is alive → record **contested** with `candidates` = the alive `(g, tid, header)`, at `gen = max over kept bindings of (g+1 if dead else g)`. A contested record rejects all spends; RELEASE removes candidates as they are proven dead (§5.2). Two tids bound at one generation mean the owner equivocated there, and the evidence cannot show which one (if either) a quorum sealed. Inheriting the surviving one could seal a second tid at a generation whose sealed tid was later released;
   * none → record unbound at `gen = max over kept bindings of (g+1 if dead else g)`, raised to one past the highest generation in `own`, or 0.
 
   A witness therefore never signs two tids for one `(constellation, sigil, gen)`, even across charter versions, so §3.8 equivocation proofs cannot be manufactured against an honest key.
@@ -177,6 +183,8 @@ To accept a received parcel, the holder MUST also trust its `home`.
 | Stamp signatures | RSA-FDH, ≥ 2048-bit modulus (1024 allowed only in tests) |
 | Fault bound | *f* = ⌊(*n*−1)/3⌋, *q* = *n* − *f* |
 | Lock limits | depth 8, 64 nodes |
+| Authorisation lifetime (wallet default) | `expires` = now + 600 s |
+| Clock-skew margin for pledge release (wallet default) | 120 s |
 
 ## 8. Safety argument
 
@@ -190,7 +198,7 @@ To accept a received parcel, the holder MUST also trust its `home`.
 *Case g₁ = g₂:* contradicts Lemma 1.
 *Case g₁ < g₂:* the seal for `(s, g₂, T₂)` has at least *f*+1 honest voters, and so does the seal for `(s, g₁, T₁)`. These two honest sets have sizes adding up to more than the *n* − *f* honest witnesses, so some honest witness *w* is in both. *w* voted `T₁` at `g₁` and later voted at `g₂ > g₁`. Since *w* was bound at `g₁`, it could only advance by RELEASE, which required a valid death proof for `T₁`. By Lemma 2, `T₁` is not complete. Contradiction. ∎
 
-**Rotation.** Every seal of version *v* shares at least one honest witness with the quorum *F* that froze and signed version *v*+1, and that witness's log contains the binding (with the owner's authorisation, which successors can verify). After freezing, at most *f* honest members of *v* are unfrozen, which is fewer than the *q* − *f* honest votes a new seal needs, so no new seal of version *v* can form. ADOPT therefore keeps every sealed binding as alive (or dead with proof). The **contested** state only arises when an owner authorised two transitions that were never proven dead.
+**Rotation.** Every seal of version *v* shares at least one honest witness with the quorum *F* that froze and signed version *v*+1, and that witness's log contains the binding (with the owner's authorisation, which successors can verify). After freezing, at most *f* honest members of *v* are unfrozen, which is fewer than the *q* − *f* honest votes a new seal needs, so no new seal of version *v* can form. ADOPT therefore keeps every sealed binding as alive (or dead with proof). If a sealed binding `(g, u)` is alive, the new version either binds `u` at `g` or is contested with `u` as a candidate, and leaves `g` only once `u` is proven dead. If `u` is dead, `(g, u)` is still in the evidence, so an alive sibling at `g` makes the record contested and otherwise the record is unbound past `g`. Either way the new version never votes a second tid at `g`. This rule is model-checked in `formal/MC_rot_sibling*.cfg`. The **contested** state only arises when an owner authorised two transitions at one generation.
 
 **Holders cannot be robbed by witnesses.** Rule 6.4 re-checks the owner's unlock, so even a seal produced by a fully corrupt quorum can't spend a parcel without its lock's signatures. Witnesses enforce time locks; holders accept time conditions on the quorum's word.
 

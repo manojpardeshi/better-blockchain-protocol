@@ -31,5 +31,33 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: ~/.cache/sigil-tla
-          key: tla2tools-1.8.0
+          key: tla2tools-1.7.4-tlapm-1.6.0-pre
+      # Runs the unbounded TLAPS safety proof (SigilProofs.tla) and the
+      # bounded TLC models with their mutation tests; see docs/VERIFICATION.md.
       - run: formal/check.sh
+
+  rust:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/target
+          key: cargo-${{ runner.os }}-${{ hashFiles('rust/Cargo.lock') }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install cryptography
+      - run: cargo build --release --locked --manifest-path rust/Cargo.toml
+      - run: cargo test --release --locked --manifest-path rust/Cargo.toml
+      - name: Regression tests for bugs found by verification
+        run: cargo test --release --locked --manifest-path rust/sigil-witness/proofs/Cargo.toml --test bugs
+      - name: Golden vectors still match the Python reference
+        run: PYTHONPATH=. python rust/sigil-witness/tests/gen_vectors.py | cmp - rust/sigil-witness/tests/vectors.json
+      - name: Interop (Python wallet against Rust witness processes)
+        run: python bench/interop.py

@@ -81,7 +81,7 @@ There is no blockspace, so there is nothing to auction and no MEV, because no on
 
 * **Parcel**: a unit of value: which constellation it lives in, the asset, the amount, a **lock** (a small predicate saying who may spend it), and a random salt.
 * **Sigil**: the parcel's single-use identifier, `H(home, lock, salt)`. It deliberately leaves out the asset and amount.
-* **Lock / unlock**: a total, loop-free predicate language: `sig`, `multi` (k-of-n), `after`/`before` (time), `hash` (preimage), `equivocation` (anyone holding proof that a given witness cheated), `all`, `any`, `never`. Unlocks sign the pair *(sigil, transition id)*, so an authorisation can't be replayed into another transition.
+* **Lock / unlock**: a total, loop-free predicate language: `sig`, `multi` (k-of-n), `after`/`before` (time), `hash` (preimage), `equivocation` (anyone holding proof that a given witness cheated), `all`, `any`, `never`. Unlocks sign *(sigil, transition id, expiry)*, so an authorisation can't be replayed into another transition, and once it expires no witness will newly bind the sigil with it: a wallet whose spend failed can tell when a delayed request can no longer complete it.
 * **Transition**: consumes parcels and creates parcels. Its id is the hash of a **header** listing input sigils (each with a *generation*) and the hash of the **body**. Witnesses receive only the header.
 * **Witness**: signs a **vote** binding a sigil to one transition, at most once per generation.
 * **Seal**: a quorum of matching votes. A transition is *complete* when every one of its inputs is sealed to it.
@@ -93,7 +93,7 @@ There is no blockspace, so there is nothing to auction and no MEV, because no on
 
 1. **Bob makes an address**: `{home, lock, salt}`. Bob picks the home constellation he trusts and a fresh one-time key.
 2. **Alice builds a transition** consuming her parcels and creating Bob's parcel plus change.
-3. **Alice signs** an unlock for each input over `(sigil, tid)`.
+3. **Alice signs** an unlock for each input over `(sigil, tid, expires)`.
 4. **Alice sends each input's header and unlock to that input's home witnesses.** Each witness checks the lock, checks it hasn't voted differently for this sigil at this generation, and returns a signed vote. One round trip; witnesses don't talk to each other.
 5. **Alice collects a quorum of votes per input**, giving her seals. The transition is final. There are no confirmations to wait for and no reorganisations.
 6. **Alice gives Bob the dossier** (the ancestry of his new parcel).
