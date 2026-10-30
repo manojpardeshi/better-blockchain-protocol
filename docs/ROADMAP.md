@@ -26,7 +26,7 @@ Status legend: ⬜ not started · 🟨 in progress · ✅ done
 ## Phase 2: Performance, Rust (#9)
 | | Item |
 |---|---|
-| ✅ | Rust witness: Ed25519 batch verification and an embedded key-value store (`rust/sigil-witness`; rotation, stamps and gossip storage still to port) |
+| ✅ | Rust witness: Ed25519 batch verification and an embedded key-value store (`rust/sigil-witness`), with rotation (FREEZE/ADOPT/CONTESTED release over `/v0/freeze` and `/v0/adopt`), blind stamps and gossip storage; it can replace the Python witness, including in mixed Rust+Python constellations (`bench/interop.py`) |
 | ⬜ | Sharding a witness's sigil space across machines |
 | ✅ | Published benchmarks: votes/s per core, payment latency, dossier verification cost (`docs/BENCHMARKS.md`) |
 

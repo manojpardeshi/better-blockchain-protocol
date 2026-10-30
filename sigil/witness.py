@@ -295,14 +295,20 @@ class Witness:
         Only verifiable evidence is accepted: bindings must carry a valid
         owner authorisation and releases a valid death proof, so a lying
         predecessor can omit evidence (covered by the union) but never
-        invent it.
+        invent it. Snapshots arrive from untrusted predecessors (over the
+        wire, ``/v0/adopt``), so malformed parts are skipped like any other
+        unverifiable evidence: a snapshot that is not an object, a log that
+        is not a list, and log entries that are not objects.
         """
         self._check_member(cid, version)
         records: dict[str, Record] = {}
         evidence: dict[str, list] = {}
         for snap in snapshots:
+            if not isinstance(snap, dict):
+                continue
             for sigil, log in snap.items():
-                evidence.setdefault(sigil, []).extend(log)
+                if isinstance(log, list):
+                    evidence.setdefault(sigil, []).extend(e for e in log if isinstance(e, dict))
         for sigil, log in evidence.items():
             binds: dict[tuple, dict] = {}   # (gen, tid) -> header
             dead: set[str] = set()          # tids proven unsealable
@@ -319,7 +325,10 @@ class Witness:
                     except (KeyError, TypeError):
                         pass
                 elif e.get("kind") == "bind":
-                    b = authorises(sigil, e.get("auth", {}))
+                    try:
+                        b = authorises(sigil, e.get("auth", {}))
+                    except AttributeError:  # a non-object unlock: never bound by an honest witness
+                        b = None
                     if b is not None:
                         binds[b] = e["auth"]["header"]
                 elif e.get("kind") == "release":

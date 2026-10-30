@@ -15,6 +15,11 @@ use crate::proofs::verify_equivocation;
 
 pub const MAX_DEPTH: usize = 8;
 pub const MAX_NODES: i64 = 64;
+/// Equivocation proofs one unlock may carry (`locks.MAX_EQUIVOCATIONS`). A well-formed lock has
+/// at most 64 nodes, so it never needs more; an unlock with more satisfies no lock. This bounds
+/// one evaluation to 3 signature checks per proof, at most 192, where a 1 MiB body could
+/// otherwise carry about 1,400 proofs.
+pub const MAX_EQUIVOCATIONS: usize = 64;
 
 fn is_int(v: Option<&Json>) -> bool {
     matches!(v, Some(Json::Int(_)))
@@ -103,6 +108,9 @@ pub fn evaluate(lock: &Json, unlock: &Json, sigil: &str, tid: &str, now: Option<
     let sigs = u.get("sigs").and_then(Json::as_obj).unwrap_or(empty);
     let preimages = u.get("preimages").and_then(Json::as_obj).unwrap_or(empty);
     let equivocations: &[Json] = u.get("equivocations").and_then(Json::as_arr).map(Vec::as_slice).unwrap_or(&[]);
+    if equivocations.len() > MAX_EQUIVOCATIONS {
+        return false;
+    }
     let ctx = Ctx { msg, sigs, preimages, equivocations, now, batch, cache: RefCell::new(HashMap::new()), equiv: RefCell::new(HashMap::new()) };
     ctx.ev(lock)
 }

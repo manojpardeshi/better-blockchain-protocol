@@ -35,7 +35,9 @@ MAX_CHARTERS = 64        # constellations per message
 MAX_CHAIN = 1024         # charter versions per chain
 # Per-store cap: new constellations accepted by gossip (extensions of known
 # ones are always accepted). Genesis charters need no signatures, so
-# without a cap anyone could fill a witness's registry for free.
+# without a cap anyone could fill a witness's registry for free. The same
+# cap bounds the fork evidence a store keeps (one item per constellation,
+# and anyone can fork a constellation whose keys they mint).
 MAX_CONSTELLATIONS = 10_000
 
 _MALFORMED = (KeyError, TypeError, ValueError, AttributeError, IndexError, RecursionError)
@@ -141,6 +143,8 @@ class GossipStore:
     def _note_fork(self, cid: str, known: list, chain: list, i: int) -> None:
         if cid in self.forks or i == 0:  # i == 0: a different genesis is a different cid, not a fork
             return
+        if len(self.forks) >= self.max_constellations:
+            return
         f = {"constellation": cid, "prefix": known[:i], "a": known[i], "b": chain[i]}
         if verify_chain(cid, chain[: i + 1]):  # our branch is already verified
             self.forks[cid] = f
@@ -148,7 +152,9 @@ class GossipStore:
     def add_fork(self, f: dict) -> bool:
         try:
             cid = f["constellation"]
-            if not isinstance(cid, str) or cid in self.forks or not verify_fork(f):
+            if not isinstance(cid, str) or cid in self.forks or len(self.forks) >= self.max_constellations:
+                return False
+            if not verify_fork(f):
                 return False
             self.forks[cid] = {k: f[k] for k in ("constellation", "prefix", "a", "b")}
             return True

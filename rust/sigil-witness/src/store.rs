@@ -6,8 +6,9 @@
 //!
 //! State is a key/value table in [redb](https://docs.rs/redb): key `"<kind>\0<key>"`, value
 //! the canonical JSON of the current value. Kinds are those of `sigil/store.py`: `pk`,
-//! `member` (`[cid, version]`), `frozen`, `record` (key = sigil, value = the record as the
-//! reference's `asdict(Record)`). Each commit uses `Durability::Immediate`, i.e. redb's
+//! `member` (`[cid, version]`), `frozen` (the hash of the one successor charter the witness
+//! froze for), `record` (key = sigil, value = the record as the reference's `asdict(Record)`)
+//! and `stamp` (key = a redeemed stamp serial). Each commit uses `Durability::Immediate`, i.e. redb's
 //! checksummed commit followed by `fdatasync`, so a commit that returned survives a crash or
 //! power loss and a batch lands entirely or not at all.
 //!
@@ -19,7 +20,7 @@
 //! answering". If a commit fails the process aborts: in-memory state is then ahead of the disk,
 //! and continuing could equivocate after a restart.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
@@ -40,7 +41,12 @@ pub struct Loaded {
     pub pk: Option<String>,
     pub member: Option<(String, i128)>,
     pub frozen: bool,
+    /// The successor charter hash the witness froze for (`None` if not frozen, or frozen by an
+    /// older store that wrote `true`: then any further FREEZE is refused).
+    pub frozen_for: Option<String>,
     pub records: HashMap<String, Json>,
+    /// Redeemed stamp serials.
+    pub stamps: HashSet<String>,
 }
 
 struct Progress {
@@ -251,7 +257,13 @@ fn load(db: &Database) -> Result<Loaded, String> {
             }
             // `true` in older stores, the successor charter's hash since successor binding.
             // Anything but false/null is frozen: misreading it must fail closed.
-            "frozen" => out.frozen = !matches!(value, Json::Bool(false) | Json::Null),
+            "frozen" => {
+                out.frozen = !matches!(value, Json::Bool(false) | Json::Null);
+                out.frozen_for = value.as_str().map(str::to_string);
+            }
+            "stamp" => {
+                out.stamps.insert(key.to_string());
+            }
             "record" => {
                 out.records.insert(key.to_string(), value);
             }
