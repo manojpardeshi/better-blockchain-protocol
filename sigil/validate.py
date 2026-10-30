@@ -42,10 +42,17 @@ class Dossier:
                 self.charters[cid] = chain
 
     def merge(self, other: "Dossier") -> "Dossier":
-        self.transitions.update(other.transitions)
-        self.seals.update(other.seals)
+        """Add what ``other`` has and we lack. Entries we already hold are
+        never replaced: a tid fixes the header and body but not the unlocks,
+        and a seal key not its votes, so a hostile copy could otherwise make
+        our own history unprovable."""
+        for tid, tx in other.transitions.items():
+            self.transitions.setdefault(tid, tx)
+        for key, seal in other.seals.items():
+            self.seals.setdefault(key, seal)
         for cid, chain in other.charters.items():
-            if len(chain) > len(self.charters.get(cid, [])):
+            mine = self.charters.get(cid, [])
+            if len(chain) > len(mine) and chain[: len(mine)] == mine:  # extensions only, never a fork
                 self.charters[cid] = chain
         return self
 

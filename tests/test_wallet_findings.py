@@ -80,7 +80,6 @@ def rogue_counterfeit(net: Network, X: str, victims: list) -> list:
 # ---------------------------------------------------------------------------
 
 class TrustPolicyTests(unittest.TestCase):
-    @unittest.expectedFailure
     def test_restarted_wallet_keeps_its_trust_policy(self):
         """CRITICAL. wallet_store.load drops the wallet's trust policy.
 
@@ -113,7 +112,6 @@ class TrustPolicyTests(unittest.TestCase):
         with self.assertRaises(InvalidDossier):
             alice.receive(d, [ref])
 
-    @unittest.expectedFailure
     def test_cli_wallet_does_not_trust_constellations_named_by_a_payer(self):
         """CRITICAL. A CLI wallet trusts every constellation a payer names.
 
@@ -148,7 +146,6 @@ class TrustPolicyTests(unittest.TestCase):
 
 
 class DossierIntegrityTests(unittest.TestCase):
-    @unittest.expectedFailure
     def test_received_dossier_cannot_overwrite_our_own_history(self):
         """HIGH. Any payer can corrupt the wallet's own dossier (loss of funds).
 
@@ -186,7 +183,6 @@ class DossierIntegrityTests(unittest.TestCase):
 
 
 class ReceiveLockTests(unittest.TestCase):
-    @unittest.expectedFailure
     def test_receive_rejects_a_parcel_the_payer_can_still_spend(self):
         """HIGH. A payment the payer can claw back is credited as received.
 
@@ -226,7 +222,6 @@ class ReceiveLockTests(unittest.TestCase):
         mallory.transact([model.ref(tid, 0)], [model.parcel(X, usd, 100, back["lock"], back["salt"])])
         self.fail(f"merchant credited {merchant.balance(usd)} USD that the payer clawed back")
 
-    @unittest.expectedFailure
     def test_two_parcels_on_one_sigil_are_not_both_credited(self):
         """LOW. Two payments to one address are both credited; only one is spendable.
 
@@ -276,7 +271,6 @@ class AuthoriseTests(unittest.TestCase):
         a = Wallet("payee-" + memo, self.net, self.X).address()
         return self.alice.prepare([held["ref"]], [model.parcel(self.X, self.usd, 100, a["lock"], a["salt"])], memo)
 
-    @unittest.expectedFailure
     def test_authorise_refuses_a_header_at_another_generation(self):
         """HIGH. A counter-party's header makes the wallet equivocate.
 
@@ -325,7 +319,6 @@ class AuthoriseTests(unittest.TestCase):
             self.fail("authorise accepted a header naming the wrong generation")
         self.fail("alice signed T1 and T3 for (s, 0) while T1 could still be sealed")
 
-    @unittest.expectedFailure
     def test_authorise_checks_the_header_commits_to_the_body(self):
         """HIGH. Swap: the counter-party shows one body and gets a signature for another.
 
@@ -394,7 +387,6 @@ class PendingTransitionTests(unittest.TestCase):
             except ValueError:
                 self.fail("the wallet shows 100 USD it can neither spend, complete nor recover")
 
-    @unittest.expectedFailure
     def test_failed_payment_does_not_freeze_its_input(self):
         """HIGH. A transient outage during ``pay`` freezes the input forever.
 
@@ -426,7 +418,6 @@ class PendingTransitionTests(unittest.TestCase):
         self.net.clock.advance(10 ** 6)
         self.assert_recoverable(self.bob, s)
 
-    @unittest.expectedFailure
     def test_cli_restart_mid_seal_can_finish_the_payment(self):
         """HIGH. A CLI wallet that crashes while sealing can never finish or recover.
 
@@ -458,7 +449,6 @@ class PendingTransitionTests(unittest.TestCase):
         self.net.clock.advance(10 ** 6)
         self.assert_recoverable(bob, s)
 
-    @unittest.expectedFailure
     def test_library_pay_cannot_lose_a_pledge_in_a_crash(self):
         """MEDIUM. ``Wallet.pay`` has no point at which the pledge can be saved.
 
@@ -501,7 +491,6 @@ class PendingTransitionTests(unittest.TestCase):
 
 
 class AbortTests(unittest.TestCase):
-    @unittest.expectedFailure
     def test_abort_recovers_an_input_bound_at_fewer_than_a_quorum(self):
         """MEDIUM. ``abort`` cannot recover an input that only a minority bound.
 
@@ -559,7 +548,6 @@ class StatusLiar(Witness):
 
 
 class RotationFindings(unittest.TestCase):
-    @unittest.expectedFailure
     def test_legitimate_repledge_stays_deep_confirmable_after_rotation(self):
         """MEDIUM (wallet x witness ADOPT). A rule-3 pledge release plus one
         Byzantine log makes the sigil CONTESTED forever after a rotation.

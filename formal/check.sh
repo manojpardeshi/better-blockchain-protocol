@@ -112,7 +112,7 @@ else
     CONFIGS=(MC.cfg MC_all.cfg MC_lazy.cfg MC_mutant.cfg
              MC_multi.cfg MC_multi_all.cfg MC_multi_mutant.cfg
              MC_proofs_witness.cfg MC_proofs_witness2.cfg
-             MC_rot.cfg MC_rot_mutant.cfg MC_rot_sibling.cfg MC_rot_sibling4.cfg MC_rot_sibling_witness.cfg MC_rot_sibling_witness2.cfg
+             MC_rot.cfg MC_rot_mutant.cfg MC_rot_sibling.cfg MC_rot_sibling4.cfg MC_rot_sibling_witness.cfg MC_rot_sibling_witness2.cfg MC_rot_sibling_witness3.cfg
              MC_expiry.cfg MC_expiry_mutant.cfg MC_expiry_skew_mutant.cfg
              MC_deep.cfg MC_deep_mutant.cfg
              MC_wallet.cfg MC_wallet_live.cfg MC_wallet_code.cfg

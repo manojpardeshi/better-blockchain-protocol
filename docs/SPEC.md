@@ -105,7 +105,7 @@ The evidence MUST come from the target sigil's home. Constellations are permissi
 ## 4. Holder obligations
 
 1. A holder MUST NOT authorise two different transitions that consume the same sigil at the same generation, except after releasing a pledge under rule 3. Re-authorising the *same* transition (for example with a later `expires`) is allowed; it is not equivocation.
-2. A holder MUST NOT authorise a transition at generation *g*+1 for a sigil until a quorum of its home has released generation *g*.
+2. A holder MUST NOT authorise a transition at generation *g*+1 for a sigil until it holds a valid death proof (§3.9) for the transition it pledged at *g*. That transition can then never be sealed (§8 Lemma 2), so no second binding at *g* can follow; witnesses still bound to it at *g* are released with the same proof, and unbound ones accept *g*+1 directly (§5.1 step 6).
 3. **Pledge release.** An authorisation of `(s, g, T)` that the holder failed to seal (a *pledge*) may be released, and a different transition of `s` at `g` authorised, only when both hold:
    * *expiry:* by the holder's clock, `now > E + skew`, where `E` is the latest `expires` it ever signed for `(s, g, T)` and `skew` bounds how far any honest witness's clock may lag the holder's (v0 default: 120 s). Then no honest witness will newly bind `s` to `T` (§5.1), however late a request arrives;
    * *no binding:* every member of the home's current charter answered STATUS, and none reports a binding to, or a vote for, `T` at `g`. An unreachable member might hold one.
@@ -113,6 +113,9 @@ The evidence MUST come from the target sigil's home. Constellations are permissi
    Without the expiry condition, a request delayed in flight could bind `s` to `T` after the holder checked, and the holder would then authorise two transitions (rule 1). If a binding exists, the pledge stays: the holder may still complete `T` (re-authorising it with a fresh `expires`) or recover via a death proof (§5.2).
 4. Receiving addresses MUST use fresh salts. A recipient SHOULD check that the received sigil is unbound at its home (at most *f* witnesses report a binding).
 5. A holder SHOULD keep verified-transition caches and MUST clear them when its trust policy changes.
+6. **What a holder signs.** Before authorising, a holder MUST check that `header.body = H("body", body)`, that header and body list the same number of inputs, and that each of its own inputs appears at its own position with its own sigil and its current generation. It MUST NOT authorise while a live pledge of that sigil names another transition (at any generation), and SHOULD first ask the home's witnesses: if any reports a binding or vote at that generation for a transition it has no pledge for (a pledge lost in a crash), it MUST NOT authorise.
+7. **What a holder accepts.** A recipient MUST accept a parcel only at an address it issued, exactly (`home`, `lock` and `salt`): a lock that merely includes the recipient's key may still be spendable by the payer. It MUST NOT credit two parcels with one sigil. Its trust policy is its own: charters a received dossier introduces are learned (to verify seals) but never trusted unless the owner adds them, and the policy MUST survive a restart.
+8. **Durability.** A holder MUST make every pledge, and the header and body it authorised, durable before any witness sees the authorisation. After expiry a pledge that bound nothing is released (rule 3); otherwise the holder completes the transition (re-authorising the same tid, rule 1) or aborts it with a death proof (rule 2).
 
 ## 5. Witness protocol
 

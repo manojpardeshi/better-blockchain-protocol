@@ -93,9 +93,9 @@ from TLC 1.8.0 on 4 cores. All of these run from `formal/check.sh`.
 | `MC_proofs` *(opt-in, ≈5 min)* | `MC_proofs.tla` | the proved invariant and §8 hold on all reachable states of a concrete instance; every `ASSUME` is evaluated | same | hold | **774,144** |
 | `MC_rot` | `MC_rot.tla` | **charter rotation**: Safety, cross-version Lemma 1 (`OneSealAcrossVersions`) and honest non-equivocation across FREEZE/ADOPT, with the *fixed* ADOPT | 2 versions of C (n=4 q=3 each), sigils s,x, gens 0..1, eager Byz | hold | 44,746 (depth 19) |
 | `MC_rot_mutant` | `MC_rot.tla` | the **old** ADOPT (before the Bug 1 fix) | same | **violated (expected)** — reproduces the double-spend of §4, Bug 1 | ~4k (depth 10) |
-| `MC_rot_sibling` | `MC_rot.tla` | the **implemented** ADOPT (`AdoptMode = "sibling"`, SPEC §5.4 / `witness.py`): same-generation siblings make the sigil contested; contested release | same | hold | 11,916 |
-| `MC_rot_sibling4` | `MC_rot.tla` | as above, plus `Tg = {(s,1)}` (recovery spend at gen 1) | same + Tg | hold | ~28k |
-| `MC_rot_sibling_witness`, `…_witness2` | `MC_rot.tla` | non-vacuity: Tg completes after rotation; a contested record is released | same + Tg | **violated (expected)** | — |
+| `MC_rot_sibling` | `MC_rot.tla` | the **implemented** ADOPT (`AdoptMode = "sibling"`, SPEC §5.4 / `witness.py`): same-generation siblings make the sigil contested; contested release | same | hold | 77,392 |
+| `MC_rot_sibling4` | `MC_rot.tla` | as above, plus `Tg = {(s,1)}` (recovery spend at gen 1) | same + Tg | hold | 157,441 |
+| `MC_rot_sibling_witness`, `…_witness2`, `…_witness3` | `MC_rot.tla` | non-vacuity: Tg completes after rotation; a contested record is released; a contested record is settled by a seal | same + Tg | **violated (expected)** | — |
 | `MC_expiry` | `SigilExpiry.tla` | **owner-signed expiry** + the wallet unpledge rule: with drifting clocks and arbitrarily delayed requests, once the wallet drops a pledge the tid can never be sealed | n=4 q=3, skew 1, `max_skew` 2, time 0..7 | hold | 113,030 |
 | `MC_expiry_mutant`, `MC_expiry_skew_mutant` | `SigilExpiry.tla` | witness ignores expiry / wallet margin `max_skew < 2·skew` | same | **violated (expected)** | — |
 | `MC_deep` | `SigilDeep.tla` | **deep confirmation** (SPEC §9): `f+1` current-charter confirmations ⇒ the binding is real, against a retired-key forgery; and the true binding is always confirmable | current n=4 f=1, threshold 2 | hold | 4 |
@@ -307,15 +307,43 @@ models assume the fixed semantics (a vote is counted only under the seal's own
 
 ---
 
-## 4b. Wallet bugs found (open)
+## 4b. Wallet bugs found (all fixed)
 
-None is fixed (this work does not change `sigil/`). Each has a deterministic
-reproduction in `tests/test_wallet_findings.py`, marked
-`unittest.expectedFailure` and asserting the correct behaviour, with the
-scenario, impact and a suggested fix in its docstring; all twelve fail by
-assertion (not by error) against the current code. TLA⁺ mutants reproduce W4,
-W6, W7 and W8 at the model level, and the proposed fixes are model-checked
-(`MC_wallet`, `MC_wallet_live`).
+All ten are fixed in `sigil/wallet.py`, `sigil/wallet_store.py`,
+`sigil/validate.py` (`Dossier.merge`), `sigil/cli.py` and, for W9,
+`sigil/witness.py`. The twelve reproductions in `tests/test_wallet_findings.py`
+were expected failures, each shown to fail by assertion against the old code;
+they now run as regression tests. TLA⁺ mutants reproduce W4, W6, W7 and W8 at
+the model level, and the fixed design is model-checked (`MC_wallet`,
+`MC_wallet_live`). Fixes, in brief:
+
+* **W1, W2.** A wallet's default trust is its home plus the constellations its
+  network was configured with at creation; charters a dossier introduces are
+  learned but never trusted unless the owner calls `Wallet.trust`. The policy
+  (`trusted`, convicted witnesses) is saved and restored, and a saved policy of
+  "trust anything" is refused on load.
+* **W3.** `receive` merges only the verified ancestry, and `Dossier.merge`
+  never replaces an entry it holds (charters only by extension, never a fork).
+* **W3b, W10.** `receive` accepts only addresses the wallet issued (exact
+  sigil), and never a second parcel with a sigil it already holds.
+* **W4, W5.** `authorise` checks the header commits to the body, that the
+  input lists line up, that each own input has its own sigil and current
+  generation, and refuses while any live pledge of the sigil names another tid.
+* **W6, W7.** Authorised transitions are kept as `pending` (saved with the
+  pledge); an `on_pledge` hook saves the wallet before any witness sees an
+  authorisation (the CLI uses it). After expiry, `release_expired_pledges`
+  drops a pledge that bound nothing, or completes the transition with a fresh
+  authorisation of the same tid, or aborts it. `authorise` also refuses when a
+  member reports a binding or vote at that generation for a tid it has no
+  pledge for (a pledge lost in a crash).
+* **W8.** `abort` frees the inputs at `g + 1` as soon as a death proof
+  verifies (SPEC §4 rule 2 now says so), releasing every witness still bound.
+* **W9.** RELEASE of a CONTESTED record also accepts a valid seal for its one
+  remaining candidate and binds to it (SPEC §5.2); the seal is logged so a
+  later ADOPT inherits the binding. `deep_confirm` shows such a seal from the
+  dossier to any current member that reports the sigil contested. Model-checked
+  as `ResolveContested` in `formal/SigilRot.tla` (`MC_rot_sibling*`, with
+  non-vacuity config `MC_rot_sibling_witness3`).
 
 | # | Severity | Where | Bug | Impact | Test |
 |---|---|---|---|---|---|
@@ -331,9 +359,8 @@ W6, W7 and W8 at the model level, and the proposed fixes are model-checked
 | W9 | medium | wallet × witness ADOPT | a pledge legitimately released under SPEC §4 rule 3 plus one Byzantine witness's genuine (expired) bind in its FREEZE evidence makes the sigil CONTESTED after rotation, forever | deep confirmation of the legitimate payment fails forever (or the sigil is frozen if the rotation came first) | `RotationFindings` |
 | W10 | low | `Wallet.receive` | two parcels paid to one address share a sigil; both are credited | `balance` overstates; only one is spendable | `ReceiveLockTests.test_two_parcels_on_one_sigil_are_not_both_credited` |
 
-Also noted, not separately tested: `wallet_store.load` drops `pledge_ttl` and
-`max_skew` (a wallet configured with a larger skew margin reverts to 120 s);
-`finalise` never deletes the pledges of consumed inputs (harmless today);
+Also noted: `wallet_store.load` dropped `pledge_ttl` and `max_skew` (now
+saved); `finalise` never deletes the pledges of consumed inputs (harmless);
 `unpledge_if_unbound` counts answering *witness objects* against the charter
 size, so a directory listing one member twice would let it skip a member
 (`MC_wallet_status_mutant` shows why every member must answer); and STATUS
