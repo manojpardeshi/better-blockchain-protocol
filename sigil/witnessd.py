@@ -3,13 +3,21 @@
     python -m sigil.witnessd keygen  --out key.json
     python -m sigil.witnessd genesis --name orion --keys k1.pub k2.pub k3.pub k4.pub --out registry.json
     python -m sigil.witnessd run     --key key.json --registry registry.json --constellation <cid> \\
-                                     --store data.db [--host 127.0.0.1] [--port 7000] [--stamps]
+                                     --store data.db [--host 127.0.0.1] [--port 7000] [--stamps] \\
+                                     [--admin-token FILE] [--adopt]
 
 ``keygen`` writes the private key (mode 0600) and its public key next to it
 (``key.pub``). ``genesis`` builds charter version 0 from public keys and
 writes a charter registry (docs/WIRE.md). ``run`` verifies the registry,
 restores the witness from its store (or joins the constellation on first
 start) and serves it until SIGTERM or SIGINT.
+
+A fresh store joins charter version 0 directly. A later version is only ever
+entered by ADOPT (SPEC §5.4), with the evidence of its predecessors: start a
+new member with ``--adopt`` and it waits, voting on nothing, until an operator
+sends ``/v0/adopt`` (``RemoteNetwork.rotate`` does). The rotation calls
+(``/v0/freeze``, ``/v0/adopt``) need the token in ``--admin-token FILE``;
+without it they are disabled.
 
 Every vote is made durable before it is sent (SPEC §5), so the daemon may be
 killed at any moment, even with SIGKILL, and restarted on the same store.
@@ -116,32 +124,53 @@ def load_mint(path: str, bits: int = 2048) -> StampMint:
 
 # --------------------------------------------------------------------- run
 
-def build_witness(key: str, registry: str, cid: str, store: str, stamps: bool = False) -> Witness:
+def load_admin_token(path: str | None) -> str | None:
+    """The operator token for the rotation calls (``None``: rotation calls disabled)."""
+    if path is None:
+        return None
+    with open(path) as f:
+        token = f.read().strip()
+    if not token:
+        raise SystemExit(f"{path}: empty admin token")
+    return token
+
+
+def build_witness(key: str, registry: str, cid: str, store: str, stamps: bool = False,
+                  adopt: bool = False) -> Witness:
     kp = load_key(key)
     reg = load_registry(registry)
     if cid not in reg:
         raise SystemExit(f"constellation {cid} is not in {registry}")
     mint = load_mint(store + ".stamps.json") if stamps else None
     w = Witness(kp, reg, lambda: int(time.time()), stamp_mint=mint, store=WitnessStore(store))
-    if w.cid is None:
-        # First start: join the newest charter version that lists us.
+    if w.cid is None and not adopt:
+        # First start: join version 0. A later version must be entered by ADOPT,
+        # which brings the predecessors' bindings; joining it bare could vote a
+        # second transition for a sigil the constellation already consumed.
         chain = reg.chain(cid)
-        version = max((c["body"]["version"] for c in chain if kp.pk in c["body"]["witnesses"]), default=None)
-        if version is None:
+        if not any(kp.pk in c["body"]["witnesses"] for c in chain):
             raise SystemExit(f"{kp.pk[:12]} is not a member of {cid[:12]}")
-        w.join(cid, version)
-    elif w.cid != cid:
+        if len(chain) > 1:
+            raise SystemExit(f"{cid[:12]} has rotated past version 0: a fresh store joins a later "
+                             "version only by ADOPT (start with --adopt)")
+        w.join(cid, 0)
+    elif w.cid is not None and w.cid != cid:
         raise SystemExit(f"store {store} belongs to constellation {w.cid}, not {cid}")
     return w
 
 
 def run(args) -> None:
-    w = build_witness(args.key, args.registry, args.constellation, args.store, args.stamps)
-    server = WitnessServer(w, args.host, args.port).start()
+    token = load_admin_token(args.admin_token)
+    w = build_witness(args.key, args.registry, args.constellation, args.store, args.stamps, args.adopt)
+    server = WitnessServer(w, args.host, args.port, admin_token=token).start()
     stop = threading.Event()
     for sig in (signal.SIGTERM, signal.SIGINT):
         signal.signal(sig, lambda *_: stop.set())
-    print(f"witness {w.pk[:12]} of {w.cid[:12]} v{w.version} listening on {server.url}", flush=True)
+    if w.cid is None:
+        print(f"witness {w.pk[:12]} awaiting ADOPT into {args.constellation[:12]} listening on {server.url}",
+              flush=True)
+    else:
+        print(f"witness {w.pk[:12]} of {w.cid[:12]} v{w.version} listening on {server.url}", flush=True)
     stop.wait()
     server.stop()
     with server._lock:  # wait for an in-flight call to finish its write
@@ -171,6 +200,10 @@ def main(argv=None) -> None:
     r.add_argument("--host", default="127.0.0.1")
     r.add_argument("--port", type=int, default=7000)
     r.add_argument("--stamps", action="store_true", help="require a stamp with every spend")
+    r.add_argument("--admin-token", metavar="FILE",
+                   help="file holding the operator token that authorises /v0/freeze and /v0/adopt")
+    r.add_argument("--adopt", action="store_true",
+                   help="on a fresh store, do not join: wait for /v0/adopt into a later charter version")
 
     args = p.parse_args(argv)
     if args.cmd == "keygen":

@@ -23,3 +23,6 @@ redb.workspace = true
 tokio.workspace = true
 axum.workspace = true
 clap.workspace = true
+num-bigint-dig.workspace = true
+num-traits.workspace = true
+num-integer.workspace = true

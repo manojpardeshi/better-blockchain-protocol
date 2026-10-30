@@ -60,7 +60,7 @@ Lock := {op:"sig",  pk}                 signature by pk
       | {op:"all", of:[Lock+]} | {op:"any", of:[Lock+]}
       | {op:"never"}
 ```
-Objects MUST have exactly the listed keys. Depth ≤ 8, nodes ≤ 64. Evaluation is total and linear.
+Objects MUST have exactly the listed keys. Depth ≤ 8, nodes ≤ 64. Evaluation is total and linear. An unlock carrying more than 64 equivocation proofs satisfies no lock: a lock has at most 64 nodes, so it never needs more, and the cap bounds the signature checks of one evaluation.
 
 **Unlock** = `{sigs: {pk: sig}, preimages: {h: hex}, equivocations: [proof], expires: int}`. Signatures are `Sig(sk, "unlock", {sigil, tid, expires})`. `expires` is a time (seconds, same scale as `after`/`before`) chosen by the owner. It bounds when a witness may *newly* bind the sigil for this authorisation (§5.1), so an owner whose spend failed knows when no delayed request can still bind it (§4). All signatures in one unlock cover the same `expires`.
 
@@ -150,7 +150,8 @@ Return `{gen, tid, votes}`. `votes` is every vote this witness ever cast on the 
 ### 5.4 FREEZE(next_charter) / ADOPT
 * FREEZE: require `next_charter.prev = H("charter", current body)`. A witness freezes for exactly one successor: if already frozen for a different `next_charter`, reject. Persist `H("charter", next_charter)` and set frozen (no further votes or releases, ever). Return a signature on `next_charter` and the evidence `{sigil: log ‖ [{kind:"vote", vote} for every vote this witness cast on sigil]}`.
 * The new charter is valid once a quorum of current members have signed it.
-* ADOPT(snapshots), run by each member of the new version. For each sigil, collect the union of log entries from all snapshots, then:
+* A member of version *v* > 0 MUST enter it by ADOPT, never by joining bare; only version 0 has no predecessors to inherit from. Over the wire (WIRE.md "Rotation") FREEZE and ADOPT are operator calls, since anyone able to send FREEZE could halt a witness for good.
+* ADOPT(snapshots), run by each member of the new version. For each sigil, collect the union of log entries from all snapshots (a snapshot that is not an object, a log that is not a list and an entry that is not an object are skipped: like any unverifiable evidence, they count as omitted), then:
   * keep `bind` entries whose `auth` passes §5.1 step 3 with `now = null`; each gives a pair `(g, tid)`;
   * collect `dead` = the tids of `release` entries whose death proof verifies against their stated header;
   * `alive` = kept bindings whose tid is not in `dead`;

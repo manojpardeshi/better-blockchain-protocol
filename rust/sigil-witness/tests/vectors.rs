@@ -1,6 +1,6 @@
 //! Golden vectors produced by the Python reference (tests/gen_vectors.py).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 
@@ -10,6 +10,7 @@ use sigil_witness::json::{parse, parse_str, Json};
 use sigil_witness::locks::{evaluate, well_formed};
 use sigil_witness::model::{sigil_of, transition_id, unlock_message};
 use sigil_witness::proofs::{proves_dead, verify_equivocation, verify_seal};
+use sigil_witness::stamps::{full_domain_hash, StampKey};
 use sigil_witness::store::Store;
 use sigil_witness::witness::{Error, Witness};
 
@@ -113,6 +114,110 @@ fn seals_equivocations_and_death_proofs() {
             assert_eq!(got, expected(c), "death proof {}", s(c, "name"));
         }
     }
+}
+
+/// Compare one call's outcome with the reference's recorded answer.
+fn check_outcome(i: usize, step: &Json, got: Result<Json, Error>) {
+    let want = step.get("expect").unwrap();
+    match (got, want.get("error").and_then(Json::as_str)) {
+        (Ok(x), None) => assert_eq!(
+            x.canonical_string(),
+            want.get("ok").unwrap().canonical_string(),
+            "step {i} ({} {})",
+            s(step, "op"),
+            step.get("who").and_then(Json::as_str).unwrap_or("")
+        ),
+        (Err(Error::Conflict(vote)), Some("conflict")) => {
+            assert_eq!(vote.unwrap_or(Json::Null), *want.get("vote").unwrap(), "step {i}")
+        }
+        (Err(Error::Rejected(m)), Some("rejected")) => assert_eq!(m, s(want, "message"), "step {i}"),
+        (Err(Error::BadRequest(_)), Some("bad_request")) => {}
+        (got, _) => panic!("step {i} ({}): got {got:?}, want {}", s(step, "op"), want.canonical_string()),
+    }
+}
+
+/// Replay a multi-witness script (`Script` in gen_vectors.py): every witness is built as the
+/// reference built it, every call must give the reference's answer, byte for byte.
+fn replay_script(script: &Json, stamp_key: Option<&Json>) -> usize {
+    let regs = script.get("registries").unwrap();
+    let cid = s(script, "cid");
+    let now = Arc::new(AtomicI64::new(0));
+    let mut ws: HashMap<String, Witness> = HashMap::new();
+    for (who, spec) in script.get("witnesses").and_then(Json::as_obj).unwrap() {
+        let kp = KeyPair::from_py_seed(&hex::decode(s(spec, "py_seed")).unwrap());
+        let reg = Registry::from_json(regs.get(s(spec, "registry")).unwrap()).unwrap();
+        let n2 = now.clone();
+        let clock = Box::new(move || n2.load(Ordering::SeqCst) as i128);
+        let adopt = spec.get("adopt") == Some(&Json::Bool(true));
+        let mut w = Witness::open_with(kp, reg, cid, Store::memory(), Default::default(), clock, adopt).unwrap();
+        if spec.get("stamps") == Some(&Json::Bool(true)) {
+            w = w.with_stamps(StampKey::from_json(stamp_key.expect("stamp key")).unwrap());
+        }
+        ws.insert(who.clone(), w);
+    }
+    let steps = arr(script, "steps");
+    for (i, step) in steps.iter().enumerate() {
+        now.store(step.get("now").and_then(Json::as_int).unwrap() as i64, Ordering::SeqCst);
+        let w = &ws[s(step, "who")];
+        let a = arr(step, "args");
+        let got = match s(step, "op") {
+            "spend" => w.spend(&a[0]).0,
+            "release" => w.release(&a[0], &a[1]).0,
+            "status" => w.status(&a[0]).0,
+            "freeze" => w.freeze(&a[0]).0,
+            "adopt" => w.adopt(&a[0], &a[1], a[2].as_arr().unwrap()).0,
+            "record" => Ok(a[0].as_str().and_then(|x| w.record(x)).map(|r| r.to_json()).unwrap_or(Json::Null)),
+            "sell_stamp" => w.sell_stamp(&a[0]).0,
+            "gossip" => w.gossip(&a[0]).0,
+            "proofs" => Ok(w.proofs()),
+            "charters" => Ok(w.registry().to_json()),
+            op => panic!("unknown op {op}"),
+        };
+        check_outcome(i, step, got);
+    }
+    steps.len()
+}
+
+/// FREEZE (one successor, evidence with own votes), ADOPT (lone binding, CONTESTED siblings,
+/// own-vote abstention for a re-used key, malformed evidence skipped), RELEASE of CONTESTED
+/// records, and both rotation regressions of tests/test_conformance.py.
+#[test]
+fn rotation_script_matches_reference() {
+    let v = vectors();
+    let n = replay_script(v.get("rotation").unwrap(), None);
+    assert!(n > 60, "{n} steps");
+}
+
+/// Charter chains, forks, equivocation proofs and the per-message caps of `/v0/gossip`.
+#[test]
+fn gossip_script_matches_reference() {
+    let v = vectors();
+    replay_script(v.get("gossip").unwrap(), None);
+}
+
+/// Blind stamps: full-domain hash, blind signing, verification and redemption on SPEND.
+#[test]
+fn stamps_match_reference() {
+    let v = vectors();
+    let st = v.get("stamps").unwrap();
+    let key = StampKey::from_json(st.get("key").unwrap()).unwrap();
+    let hexn = |x: &Json, k: &str| sigil_witness::stamps::parse_hex(s(x, k)).unwrap();
+    for c in arr(st, "fdh") {
+        assert_eq!(sigil_witness::stamps::to_hex(&full_domain_hash(&key.n, s(c, "serial"))), s(c, "fdh"));
+    }
+    for c in arr(st, "blind") {
+        let r = hexn(c, "r");
+        let blinded = sigil_witness::stamps::blind(&key.n, &key.e, s(c, "serial"), &r);
+        assert_eq!(sigil_witness::stamps::to_hex(&blinded), s(c, "blinded"));
+        let bsig = key.sign_blinded(&blinded).unwrap();
+        assert_eq!(sigil_witness::stamps::to_hex(&bsig), s(c, "blind_sig"));
+        let sig = sigil_witness::stamps::unblind(&key.n, &bsig, &r).unwrap();
+        assert_eq!(sigil_witness::stamps::to_hex(&sig), s(c, "sig"));
+    }
+    for c in arr(st, "verify") {
+        assert_eq!(key.verify(c.get("stamp").unwrap()), expected(c), "stamp {}", s(c, "name"));
+    }
+    replay_script(st.get("script").unwrap(), st.get("key"));
 }
 
 /// Replay a scripted run of the reference witness: every vote must be byte-identical and every

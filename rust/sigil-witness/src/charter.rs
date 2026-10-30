@@ -137,6 +137,27 @@ impl Registry {
         Ok(())
     }
 
+    /// Insert a chain [`verify_chain`] already accepted (`verified` is its result). Only for a
+    /// chain that extends the known one, as `GossipStore::add_chain` builds it.
+    pub(crate) fn insert_verified(&mut self, cid: &str, chain: Vec<Json>, verified: Vec<Charter>) {
+        self.raw.insert(cid.to_string(), chain);
+        self.chains.insert(cid.to_string(), verified);
+    }
+
+    /// The chain as received (`{body, sigs}` charters), empty if unknown.
+    pub fn raw_chain(&self, cid: &str) -> &[Json] {
+        self.raw.get(cid).map(Vec::as_slice).unwrap_or(&[])
+    }
+
+    /// How many constellations are known.
+    pub fn len(&self) -> usize {
+        self.raw.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.raw.is_empty()
+    }
+
     pub fn charter(&self, cid: &str, version: i128) -> Option<&Charter> {
         let chain = self.chains.get(cid)?;
         usize::try_from(version).ok().and_then(|v| chain.get(v))

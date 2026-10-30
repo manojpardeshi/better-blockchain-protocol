@@ -14,6 +14,8 @@ Nothing a witness sends is trusted. Clients verify votes, seals, charters and pr
 | POST | `/v0/release` | `{sigil, proof}` (SPEC §5.2) | new generation (int) |
 | POST | `/v0/status` | `{sigil}` (SPEC §5.3) | `{gen, tid, votes}` |
 | POST | `/v0/sell_stamp` | `{blinded: hex}` | blind signature (hex) |
+| POST | `/v0/freeze` (admin) | `{charter}`: the next charter's body (SPEC §5.4) | `{sig, snapshot}` |
+| POST | `/v0/adopt` (admin) | `{constellation, version, snapshots: [snapshot, …]}` (SPEC §5.4) | `{constellation, version}` |
 
 Every reply is one JSON object:
 
@@ -24,7 +26,17 @@ Every reply is one JSON object:
   * `bad_request` (HTTP 400). The request was malformed.
   * `internal` (HTTP 500).
 
-Big integers (RSA stamp values) are lowercase hex strings. Request bodies are capped at 1 MiB. A witness handles its calls one at a time and persists state before it answers (SPEC §5).
+Big integers (RSA stamp values) are lowercase hex strings. Request bodies are capped at 1 MiB (the admin calls: 256 MiB, read only after the token is checked). A witness handles its calls one at a time and persists state before it answers (SPEC §5). An unlock carries at most 64 equivocation proofs (SPEC §3.5), so one lock evaluation verifies at most 64 of them, far fewer than the ~1,400 a 1 MiB body could hold.
+
+## Rotation
+
+FREEZE is irreversible, so `/v0/freeze` and `/v0/adopt` are operator calls. They need `Authorization: Bearer <token>`, where the witness reads the token from `--admin-token FILE`. A witness started without one refuses them (`rejected`), and so does a request with a wrong token.
+
+* `freeze` answers the witness's signature on the charter body and its evidence `{sigil: log ‖ [{kind: "vote", vote}, …]}`. The witness freezes for exactly one successor: asked again for the same body it answers the same, and for any other it answers `rejected`. A frozen witness never votes or releases again, also after a restart.
+* `adopt` runs once, on a witness that has joined no charter version. A retry for the version it adopted answers the same; anything else is `rejected`. The witness must already know the charter `version` (send it by `/v0/gossip` first), and must be a member, else `bad_request`. Malformed parts of a snapshot are skipped, like any other unverifiable evidence.
+* A fresh store joins version 0 directly. A witness for a later version is started with `--adopt` (both daemons): it votes on nothing until ADOPT. A fresh store without `--adopt` refuses to start on a constellation that has rotated.
+
+`RemoteNetwork.rotate(cid, new_urls, admin_token)` drives a rotation like `Network.rotate`: every reachable member freezes for the next charter and signs it; signatures that do not verify are dropped with their evidence; with a quorum, the new chain is gossiped to old and new members, and every new member adopts the union of the signers' evidence. A re-used key whose old process did not sign is left waiting (`RotationIncomplete`), because it must bring its own votes. Operators then add the new chain to their registry files, since gossip state is not persisted.
 
 ## Client behaviour
 
@@ -48,7 +60,7 @@ Charter rotations (SPEC §3.7) and equivocation proofs (SPEC §3.8) are public f
 **Admission.** Every item is verified before it is stored. Items that fail are dropped silently, and the counts in the reply show what was accepted.
 * A chain is accepted only if `Registry.add_chain` accepts it, which means it verifies from the cid and extends the known chain. A chain whose bodies match the known chain but whose signature subsets differ is treated as the same chain, not as a fork. A chain that diverges is never adopted. If both branches verify, the divergence is stored as fork evidence, one item per constellation.
 * A proof is accepted only if `verify_equivocation` holds and the accused key belongs to a charter version the receiver knows (`a.constellation`, `a.version`). The receiver keeps one proof per witness key.
-* A fork is accepted only if both branches verify against the shared prefix. The receiver keeps one fork per constellation.
+* A fork is accepted only if both branches verify against the shared prefix. The receiver keeps one fork per constellation, and at most 10 000 forks in all (anyone can fork a constellation whose keys they minted).
 
 On a witness, gossip uses the witness's own charter registry, so a verified rotation is served from `/v0/charters` straight away. Gossip state is not persisted, because it can be learned again from peers.
 
@@ -87,4 +99,6 @@ A wallet builds its store as `GossipStore(network.registry)`, so newly learned c
 * `RemoteWitness`, a client with the same interface as `Witness`;
 * `RemoteNetwork`, which has the same interface as the in-process `Network`, so `Wallet` runs unchanged against a real network.
 
-`tests/test_wire.py` runs payments, swaps, stamps, conflicts, deep confirmation and crash tolerance over real HTTP.
+`tests/test_wire.py` runs payments, swaps, stamps, conflicts, deep confirmation and crash tolerance over real HTTP, and `tests/test_rotation_wire.py` runs rotations.
+
+The Rust witness (`rust/sigil-witness`) serves every call above with the same semantics. `bench/interop.py` checks this with the Python wallet against Rust witness processes and mixed Rust+Python constellations, including rotation, stamps and gossip.
