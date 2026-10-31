@@ -24,12 +24,12 @@ The honest conclusion first:
 > phishing operators, finding the one implementation bug, and racing timing
 > windows. The residual risk is almost entirely here.
 
-This review found **six defects**, summarised in [§3](#3-findings). Five are
-**still open** on the merged main branch (`a22e412`, which includes the
-wallet-verification fixes `91269ff` and the Rust rotation/stamps/gossip port
-`0b016ef`/`eca6edd`). They are recorded as `expectedFailure` tests in
-`tests/redteam/test_redteam.py`, and **one is critical** (BUG-1, a counterfeit
-through the holder's verifier cache). The sixth, BUG-2, was fixed upstream in
+This review found **six defects**, summarised in [§3](#3-findings). After the
+review, BUG-1 (critical: a counterfeit through the holder's verifier cache),
+BUG-3 and BUG-4 were fixed, along with the `sig`/`multi` CPU amplification
+(`MAX_KEYS`); their tests are now regression tests in
+`tests/redteam/test_redteam.py`. **Two remain open** as `expectedFailure` tests,
+both design questions: BUG-5 (swap hostage) and BUG-6 (bond self-claim). The sixth, BUG-2, was fixed upstream in
 parallel and is now a regression test. Three more attack hypotheses tested here
 (dossier merge poisoning, the default trust policy accepting a payer's rogue home,
 and shared-control locks accepted as payment) were also fixed by that wallet work.
@@ -305,20 +305,11 @@ total and linear; and the equivocation-proof memoisation fix (Rust/Python bug 4 
 (`MAX_EQUIVOCATIONS`) removed the worst amplifier, equivocation locks.
 
 **Residual risk — Medium**, measured by `tests/redteam/resources.py`:
-* **CPU (still open after the merge):** the proof cap does not touch `sig`/`multi`
-  leaves. A sub-MiB SPEND with a large `sig`/`multi` lock tree forces thousands of
-  Ed25519 verifications, and the Python evaluator does not memoise `has_sig`, so
-  one key repeated across nodes is verified once per node. Measured on merged main:
-  a **272 KiB** request → **3 780 verifies ≈ 0.5 s CPU** on this VM (≈ 14
-  verifies/KiB; an honest one-signature SPEND costs 1 verify and 0.2 ms, so ≈ 2 500×
-  amplification per request); a full 1 MiB request is ≈ **2 s CPU**. The rejected
-  request still costs the full evaluation, and without stamps it costs the attacker
-  nothing. This is the same class as bug 4 of VERIFY_RUST, for ordinary multi-sig.
-* **Storage:** each accepted SPEND logs the full authorisation (salt + header +
-  unlock) forever; measured ≈ **800 KiB stored per request**, ratio ≈ 1.0, and logs
-  never compact (`store.py` docstring). Without stamps this is free to the attacker
-  ([VERIFY_RUST §6 Informational](VERIFY_RUST.md)).
-* **Memory:** one ~1 MiB gossip message registers a 14 000-witness charter.
+* **CPU (fixed after the review):** the proof cap did not touch `sig`/`multi`
+  locks, so one 272 KiB SPEND forced ~3,780 Ed25519 verifications. A lock may
+  now name at most `MAX_KEYS = 64` keys in all (SPEC §3.5, Python and Rust),
+  and each key's signature is checked once per evaluation, so no SPEND checks
+  more than 64 signatures (`test_spend_cpu_amplification_measured`).
 
 An AI adversary with many cheap IPs and the default (stampless) witness can keep a
 constellation's witnesses CPU-bound and fill their disks.
@@ -518,12 +509,12 @@ in `sigil/`, per the task. `python3 -m unittest discover` stays green: 183 tests
 
 | # | Severity | Status on main | Where | One line | Test |
 |---|---|---|---|---|---|
-| BUG-1 | **Critical** (conservation / counterfeit) | **open** | `sigil/validate.py` `Verifier._verify` cache | A warm recipient's verifier cache skips re-validating a cached transition's body, so a malicious **payer** reuses a public ancestor tid (e.g. the genesis) with a forged body and an output minted from thin air; a 1000-supply asset inflated a recipient to ~1e9. Cold recipients reject. | `Finding1Conservation` |
+| BUG-1 | **Critical** (conservation / counterfeit) | **fixed** (every cached id reused is re-checked to hash to the presented entry) | `sigil/validate.py` `Verifier._verify` cache | A warm recipient's verifier cache skips re-validating a cached transition's body, so a malicious **payer** reuses a public ancestor tid (e.g. the genesis) with a forged body and an output minted from thin air; a 1000-supply asset inflated a recipient to ~1e9. Cold recipients reject. | `Finding1Conservation` |
 | BUG-6 | **High** (economics: slashing void) | **open** (design) | bond lock pattern (whitepaper §7, SPEC §9); `locks.equivocation` | The equivocator holds its own equivocation proof first and claims its own bond; the claim is also front-runnable because the equivocation branch is not bound to the claimant. | `Finding6BondSelfClaim` |
 | BUG-5 | Medium–High (protocol: swap hostage) | **open** | multi-party flow; `sigil/swap.py`, `Wallet.abort` | A counter-party binds only the honest input and vanishes; no death proof can exist and expiry does not release a bound input, so the honest coin is locked indefinitely. | `Finding5SwapHostage` |
-| BUG-4 | Medium (policy evasion) | **open** | `sigil/wallet.py` `receive` | `deep_threshold` is applied per parcel, so splitting a payment into parcels just under it skips deep confirmation entirely. | `Finding4DeepConfirmSplit` |
+| BUG-4 | Medium (policy evasion) | **fixed** (threshold on the payment total per asset; per-counter-party windows not done) | `sigil/wallet.py` `receive` | `deep_threshold` is applied per parcel, so splitting a payment into parcels just under it skips deep confirmation entirely. | `Finding4DeepConfirmSplit` |
 | BUG-2 | Medium (liveness / third-party griefing) | **fixed** in `91269ff`/`eca6edd` | `wallet.py` rule-3 release + `deep_confirm`, `witness.py` ADOPT | A witness within *f* lying on STATUS induced an honest owner to bind twice; after rotation the honestly sealed coin was CONTESTED and deep confirmation failed for an innocent holder. Now settled by seal. | `Finding2InducedEquivocation` (regression) |
-| BUG-3 | Low (robustness / contract) | **open** | `sigil/witness.py` `authorises` | A malformed non-dict `unlock` raises `AttributeError` (not caught) instead of `Rejected` from in-process `Witness.spend`; the HTTP server masks it as 400, no state mutated. | `Finding3MalformedLeak` |
+| BUG-3 | Low (robustness / contract) | **fixed** | `sigil/witness.py` `authorises` | A malformed non-dict `unlock` raises `AttributeError` (not caught) instead of `Rejected` from in-process `Witness.spend`; the HTTP server masks it as 400, no state mutated. | `Finding3MalformedLeak` |
 
 **Also reproduced here and fixed on main by the parallel wallet work (`91269ff`):**
 a payer overwriting the payee's own history through `Dossier.merge` of unverified

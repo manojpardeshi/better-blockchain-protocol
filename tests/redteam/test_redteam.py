@@ -86,9 +86,10 @@ class Resources(unittest.TestCase):
     def test_spend_cpu_amplification_measured(self):
         rows = resources.spend_cpu_amplification()
         worst = max(r["verifies"] for r in rows)
-        # One sub-MiB request forces thousands of signature checks (loose bound
-        # so timing jitter never fails the build).
-        self.assertGreaterEqual(worst, 1000)
+        # Before MAX_KEYS one sub-MiB request forced thousands of signature
+        # checks (~3,780 measured). Now a lock names at most MAX_KEYS keys and
+        # each key is checked once, so no SPEND checks more than that.
+        self.assertLessEqual(worst, locks.MAX_KEYS)
 
     def test_storage_amplification_measured(self):
         r = resources.storage_per_spend()
@@ -100,10 +101,22 @@ class Resources(unittest.TestCase):
 # each as an expectedFailure asserting the property that *should* hold.
 
 
+class LockKeyCap(unittest.TestCase):
+    def test_a_lock_names_at_most_max_keys_keys(self):
+        """The red team measured ~3,780 signature checks forced by one 272 KiB
+        SPEND through a wide ``multi`` lock. A lock may now name at most
+        ``MAX_KEYS`` keys in all, and each key's signature is checked once."""
+        ks = [KeyPair.generate().pk for _ in range(locks.MAX_KEYS + 1)]
+        self.assertTrue(locks.well_formed(locks.multi(1, ks[:-1])))
+        self.assertFalse(locks.well_formed(locks.multi(1, ks)))
+        self.assertFalse(locks.well_formed(locks.any_of(locks.sig(ks[0]), locks.multi(1, ks[1:]))))
+        self.assertTrue(locks.well_formed(locks.any_of(*[locks.sig(k) for k in ks[:locks.MAX_NODES - 1]])))
+
+
 class Finding1Conservation(unittest.TestCase):
-    @unittest.expectedFailure
     def test_warm_recipient_cannot_be_inflated(self):
-        """BUG-1 (CRITICAL -- conservation / counterfeit).
+        """BUG-1 (CRITICAL -- conservation / counterfeit). FIXED: the verifier
+        now checks that every cached id it reuses hashes to the entry presented.
 
         Scenario: ``sigil.validate.Verifier`` memoises verified transition ids
         in ``self._ok``. On a cache hit (``_verify``: ``if cur in self._ok``) it
@@ -133,7 +146,10 @@ class Finding1Conservation(unittest.TestCase):
         compare identity on a hit. Alternatively reject any dossier containing a
         transition whose stored body does not hash to its key, up front.
         """
-        issued, credited = conserve.cache_attack()
+        try:
+            issued, credited = conserve.cache_attack()
+        except InvalidDossier:
+            return  # correct: the forged ancestor is rejected, as for a cold recipient
         self.assertLessEqual(credited, issued)
 
 
@@ -190,9 +206,8 @@ class Finding2InducedEquivocation(unittest.TestCase):
 
 
 class Finding3MalformedLeak(unittest.TestCase):
-    @unittest.expectedFailure
     def test_spend_only_rejects_on_malformed_unlock(self):
-        """BUG-3 (LOW -- robustness / contract).
+        """BUG-3 (LOW -- robustness / contract). FIXED: ``authorises`` treats it as malformed.
 
         Scenario: ``sigil.witness.authorises`` catches only
         ``(KeyError, TypeError, ValueError)``. A malformed request whose
@@ -225,9 +240,8 @@ class Finding3MalformedLeak(unittest.TestCase):
 
 
 class Finding4DeepConfirmSplit(unittest.TestCase):
-    @unittest.expectedFailure
     def test_deep_threshold_applies_to_the_whole_payment(self):
-        """BUG-4 (MEDIUM, policy evasion of the long-range-forgery defence).
+        """BUG-4 (MEDIUM, policy evasion of the long-range-forgery defence). FIXED: the threshold applies to the payment total per asset.
 
         Scenario: ``Wallet.receive`` decides per *parcel* whether to run deep
         confirmation: ``p["amount"] >= self.deep_threshold``. A payer who wants to

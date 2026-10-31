@@ -141,6 +141,10 @@ def lock_cases() -> list:
         (locks.equivocation(c.pk), u(eq=[eq] * locks.MAX_EQUIVOCATIONS)),
         (locks.equivocation(c.pk), u(eq=[eq] * (locks.MAX_EQUIVOCATIONS + 1))),
         (locks.any_of(locks.sig(a.pk), locks.equivocation(c.pk)), u(a, eq=[bad_eq] * (locks.MAX_EQUIVOCATIONS + 1))),
+        # MAX_KEYS: a lock names at most 64 keys in all (sig and multi), bounding signature checks.
+        (locks.multi(1, [a.pk] + [kp(100 + i).pk for i in range(locks.MAX_KEYS - 1)]), u(a)),
+        (locks.multi(1, [a.pk] + [kp(100 + i).pk for i in range(locks.MAX_KEYS)]), u(a)),
+        (locks.any_of(locks.sig(a.pk), locks.multi(1, [kp(100 + i).pk for i in range(locks.MAX_KEYS)])), u(a)),
     ]
     out = []
     for lock, unlock in cases:

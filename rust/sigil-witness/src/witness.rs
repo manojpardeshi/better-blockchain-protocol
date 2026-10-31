@@ -108,7 +108,7 @@ impl Record {
 
 /// `authorises`: validate an owner authorisation, returning the `(gen, tid)` it binds.
 /// `now` is the clock for time locks (`None`: time conditions hold, as for a holder or ADOPT).
-/// `Err` is the reference's uncaught `AttributeError` on a non-object unlock (HTTP 400).
+/// A non-object unlock is malformed, so it binds nothing (`Ok(None)`), as in the reference.
 pub fn authorises(sigil: &Json, auth: &Json, now: Option<i128>, batch: bool) -> Result<Option<(i128, String)>, Error> {
     let null = Json::Null;
     let get = |k: &str| auth.get(k).unwrap_or(&null);
@@ -142,7 +142,7 @@ pub fn authorises(sigil: &Json, auth: &Json, now: Option<i128>, batch: bool) -> 
     };
     let unlock = get("unlock");
     if unlock.as_obj().is_none() {
-        return Err(Error::BadRequest("unlock must be an object".into()));
+        return Ok(None);
     }
     if !matches!(unlock.get("expires"), Some(Json::Int(_))) {
         return Ok(None);

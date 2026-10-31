@@ -60,7 +60,7 @@ Lock := {op:"sig",  pk}                 signature by pk
       | {op:"all", of:[Lock+]} | {op:"any", of:[Lock+]}
       | {op:"never"}
 ```
-Objects MUST have exactly the listed keys. Depth ≤ 8, nodes ≤ 64. Evaluation is total and linear. An unlock carrying more than 64 equivocation proofs satisfies no lock: a lock has at most 64 nodes, so it never needs more, and the cap bounds the signature checks of one evaluation.
+Objects MUST have exactly the listed keys. Depth ≤ 8, nodes ≤ 64, and at most 64 keys in all (`sig` keys plus every `multi` key list), so one evaluation checks at most 64 owner signatures. Evaluation is total and linear. An unlock carrying more than 64 equivocation proofs satisfies no lock: a lock has at most 64 nodes, so it never needs more, and the cap bounds the signature checks of one evaluation.
 
 **Unlock** = `{sigs: {pk: sig}, preimages: {h: hex}, equivocations: [proof], expires: int}`. Signatures are `Sig(sk, "unlock", {sigil, tid, expires})`. `expires` is a time (seconds, same scale as `after`/`before`) chosen by the owner. It bounds when a witness may *newly* bind the sigil for this authorisation (§5.1), so an owner whose spend failed knows when no delayed request can still bind it (§4). All signatures in one unlock cover the same `expires`.
 
@@ -186,7 +186,7 @@ To accept a received parcel, the holder MUST also trust its `home`.
 | Signatures | Ed25519 |
 | Stamp signatures | RSA-FDH, ≥ 2048-bit modulus (1024 allowed only in tests) |
 | Fault bound | *f* = ⌊(*n*−1)/3⌋, *q* = *n* − *f* |
-| Lock limits | depth 8, 64 nodes |
+| Lock limits | depth 8, 64 nodes, 64 keys |
 | Authorisation lifetime (wallet default) | `expires` = now + 600 s |
 | Clock-skew margin for pledge release (wallet default) | 120 s |
 

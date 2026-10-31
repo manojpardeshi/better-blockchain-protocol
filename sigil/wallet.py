@@ -169,9 +169,15 @@ class Wallet:
         parcels of at least ``deep_threshold``.
         """
         received = []
-        for r in refs:
-            p = self.verifier.verify_parcel(dossier, r)
-            if deep or (deep is None and self.deep_threshold is not None and p["amount"] >= self.deep_threshold):
+        # The threshold applies to the whole payment per asset, so splitting
+        # one large payment into many small parcels cannot dodge it.
+        parcels = [self.verifier.verify_parcel(dossier, r) for r in refs]
+        totals: dict[str, int] = defaultdict(int)
+        for p in parcels:
+            totals[p["asset"]] += p["amount"]
+        for r, p in zip(refs, parcels):
+            if deep or (deep is None and self.deep_threshold is not None
+                        and totals[p["asset"]] >= self.deep_threshold):
                 self.deep_confirm(dossier, [r["tx"]])
             if not self.policy.trusts(p["home"]):
                 raise InvalidDossier("parcel lives in a constellation we do not trust")

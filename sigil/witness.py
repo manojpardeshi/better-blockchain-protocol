@@ -79,7 +79,7 @@ def authorises(sigil: str, auth: dict) -> tuple[int, str] | None:
         if not evaluate(auth["lock"], auth["unlock"], sigil, tid, None):
             return None
         return gen, tid
-    except (KeyError, TypeError, ValueError):
+    except (KeyError, TypeError, ValueError, AttributeError):  # e.g. a non-object unlock
         return None
 
 
@@ -358,10 +358,7 @@ class Witness:
                     except (KeyError, TypeError):
                         pass
                 elif e.get("kind") == "bind":
-                    try:
-                        b = authorises(sigil, e.get("auth", {}))
-                    except AttributeError:  # a non-object unlock: never bound by an honest witness
-                        b = None
+                    b = authorises(sigil, e.get("auth", {}))
                     if b is not None:
                         binds[b] = e["auth"]["header"]
                 elif e.get("kind") == "seal":
