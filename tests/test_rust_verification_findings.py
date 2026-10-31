@@ -42,6 +42,28 @@ class EquivocationLockCost(unittest.TestCase):
         many = min(cost(63) for _ in range(3))
         self.assertLess(many, 10 * one, f"63 nodes cost {many / one:.1f}x one node")
 
+    def test_number_of_proofs_is_capped(self):
+        """The rest of bug 4: an unlock carries at most MAX_EQUIVOCATIONS (64) proofs.
+
+        A well-formed lock has at most 64 nodes, so no lock needs more; with more, the unlock
+        satisfies nothing, and evaluation never verifies more than 64 proofs.
+        """
+        w = KeyPair.from_seed(b"bug4-cap")
+
+        def vote(t):
+            v = {"constellation": "C", "version": 0, "witness": w.pk, "sigil": "s", "gen": 0, "tid": t, "time": 1}
+            v["sig"] = w.sign("vote", {k: v[k] for k in v})
+            return v
+
+        proof = {"a": vote("t"), "b": vote("u")}
+        lock = locks.equivocation(w.pk)
+        unlock = locks.empty_unlock(0)
+        unlock["equivocations"] = [proof] * locks.MAX_EQUIVOCATIONS
+        self.assertTrue(evaluate(lock, unlock, "s", "t", 0))
+        unlock["equivocations"] = [proof] * (locks.MAX_EQUIVOCATIONS + 1)
+        self.assertFalse(evaluate(lock, unlock, "s", "t", 0))
+        self.assertEqual(locks.MAX_EQUIVOCATIONS, locks.MAX_NODES)
+
 
 
 class EmptyCharter(unittest.TestCase):

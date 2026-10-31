@@ -92,6 +92,8 @@ Payments are handed from holder to holder as files; no server stores them. Recei
 | `sigil/charter.py` | Constellation charters and membership rotation |
 | `sigil/stamps.py` | Blind RSA stamps for paying witnesses |
 | `sigil/network.py` | In-process simulated network with fault injection |
+| `sigil/server.py`, `sigil/witnessd.py` | Wire protocol v0 (JSON over HTTP, including operator-only rotation calls) and the witness daemon |
+| `rust/sigil-witness` | The Rust witness: wire-compatible drop-in for the Python daemon (spend, release, status, rotation, stamps, gossip storage) |
 | `tests/` | Payments, security, recovery, rotation, durability, deep confirmation, fuzzing, adversarial model checking |
 
 ## Status

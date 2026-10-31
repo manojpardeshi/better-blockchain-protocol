@@ -286,8 +286,10 @@ and passes after it (`cargo test --release --test bugs`, run in CI). Fixes:
 3. The store parses values with a nesting limit of `MAX_DEPTH + 16`, so whatever a request
    could carry still loads after a restart.
 4. Lock evaluation memoises the equivocation result per witness key (Rust and Python), so each
-   proof is verified at most once per request. Running SPEND on a blocking thread and capping
-   the number of proofs are not done; the 1 MiB body limit bounds the proofs.
+   proof is verified at most once per request. Later hardening: an unlock may carry at most 64
+   equivocation proofs (`MAX_EQUIVOCATIONS`, equal to the lock node limit, so no satisfiable
+   lock is lost; SPEC §3.5), in both implementations, and the Rust server runs SPEND, RELEASE,
+   gossip, FREEZE and ADOPT on the blocking pool (`spawn_blocking`).
 5. On an exact tie between two shortest digit strings, `py_float_repr` takes the even last
    digit, as Python's `repr` does (checked against the exact decimal expansion).
 6. `store::load` treats any `frozen` value other than `false`/`null` as frozen.
@@ -436,14 +438,43 @@ reference.
   with keys their holder controls, and is already noted in BENCHMARKS.md. In every fuzzing
   campaign above, with honest and randomly corrupted signatures, batch and single
   verification gave the same verdict.
-* **Storage growth without stamps.** The Rust witness refuses `--stamps`. Anyone can create
-  sigils homed here, and each SPEND stores up to 1 MiB of authorisation forever. The
-  reference relies on stamps for this.
-* **Rotation divergence (expected).** Since `fc8a82b`, the reference RELEASEs a CONTESTED
-  record by removing its candidates. The Rust witness has no rotation and answers "nothing
-  to release" for a CONTESTED record restored from a store. It cannot produce one itself.
+* **Storage growth without stamps.** Anyone can create sigils homed at a witness, and each
+  SPEND stores up to 1 MiB of authorisation forever. The Rust witness now supports `--stamps`,
+  as the reference does, which is the intended answer; without it the growth remains.
+* **Rotation divergence (resolved).** The Rust witness now implements FREEZE, ADOPT and the
+  RELEASE of CONTESTED records exactly as the reference (golden vectors). A CONTESTED record
+  with no candidates, the only kind the bounded check (§3) starts from, is refused as before.
 
-## 7. Tools
+## 7. Ported after the verification: not covered by §1–§5
+
+Rotation (FREEZE, ADOPT, RELEASE of a CONTESTED record), stamps, gossip storage, the
+`/v0/freeze` and `/v0/adopt` endpoints with their admin token, and the move of SPEND to the
+blocking pool were added after the work above. They are **tested, not verified**:
+
+* **Tested:** golden vectors replayed byte for byte against the reference (`tests/vectors.rs`:
+  rotation, stamps and gossip scripts, the equivocation cap); Rust tests of restarts and the
+  HTTP admin path (`tests/rotation.rs`); `bench/interop.py` against Rust processes and mixed
+  constellations, including both rotation regressions of `RotationRegressionTests`; all of
+  §2–§5 still pass unchanged (the record type gained `candidates`, which the BFS harness now
+  initialises).
+* **Not covered:** the Kani transcription (`model_rust.rs`) models only SPEND and RELEASE of a
+  bound or unbound record, so the refinement proofs say nothing about ADOPT, FREEZE or the
+  candidate-removing RELEASE. The bounded exhaustive check starts from a CONTESTED record
+  without candidates, so it never exercises a successful contested RELEASE. The differential
+  driver and the fuzz targets do not generate FREEZE, ADOPT, stamps or gossip. The rotation
+  safety argument for ADOPT rests on the reference's TLA+ model (`formal/MC_rot_sibling*.cfg`)
+  plus the vectors that pin the Rust code to the reference; there is no mechanised link
+  between the Rust ADOPT and that model.
+* **Concurrency to keep in mind:** membership, the frozen flag and the records share one
+  mutex, so a SPEND or RELEASE that raced a FREEZE commits before the FREEZE snapshot or is
+  refused; ADOPT holds that mutex for its whole run (it is an operator call on a witness that
+  votes on nothing yet). Stamp redemption checks, verifies outside the lock, then inserts
+  atomically. Gossip copies the registry only when it learns a chain (copy on write).
+* **Big integers:** stamps use `num-bigint-dig` (prime generation and `modpow`). Signing is not
+  constant time, exactly like the reference's `pow(blinded, d, n)`; the key never signs
+  anything secret-dependent for a client other than the blinded value it chose.
+
+## 8. Tools
 
 | Tool | Status |
 |---|---|

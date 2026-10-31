@@ -3,7 +3,9 @@
 Layout of a wallet directory::
 
     keys.json     secret key seeds (pk -> hex seed), mode 0600
-    state.json    name, home, deep_threshold, holdings, pledged, stamps, confirmed
+    state.json    name, home, deep_threshold, pledge_ttl, max_skew, trust policy,
+                  holdings, pledged, pending transitions, issued addresses,
+                  stamps, confirmed
     dossier.json  the wallet's dossier (Dossier.to_json)
 
 BACK UP THE WALLET DIRECTORY. In Sigil there is no ledger to restore from:
@@ -63,8 +65,17 @@ def save(wallet: Wallet, wallet_dir: str) -> None:
         "name": wallet.name,
         "home": wallet.home,
         "deep_threshold": wallet.deep_threshold,
+        "pledge_ttl": wallet.pledge_ttl,
+        "max_skew": wallet.max_skew,
+        # The trust policy is a security decision: losing it on reload would
+        # make the wallet accept money from any constellation a payer names.
+        "trusted": sorted(wallet.policy.trusted) if wallet.policy.trusted is not None else None,
+        "convicted": sorted(wallet.policy.convicted),
         "holdings": wallet.holdings,
         "pledged": {s: list(v) for s, v in wallet.pledged.items()},
+        "pending": wallet.pending,
+        "completed": wallet.completed,
+        "issued": sorted(wallet.issued),
         "stamps": {pk: list(v) for pk, v in wallet.stamps.items() if v},
         "confirmed": sorted(list(c) for c in wallet._confirmed),
     }
@@ -78,7 +89,17 @@ def load(wallet_dir: str, network) -> Wallet:
         seeds = json.load(f)
     with open(os.path.join(wallet_dir, DOSSIER)) as f:
         dossier = Dossier.from_json(f.read())
-    w = Wallet(state["name"], network, state["home"], deep_threshold=state["deep_threshold"])
+    if "trusted" not in state:
+        # Wallets saved before the trust policy was persisted: fall back to
+        # the default (home plus the configured constellations), never to "any".
+        trusted = None
+    elif state["trusted"] is None:
+        raise ValueError("state.json has no trust policy; refusing to trust every constellation")
+    else:
+        trusted = set(state["trusted"])
+    w = Wallet(state["name"], network, state["home"], deep_threshold=state["deep_threshold"],
+               trusted=trusted, pledge_ttl=state.get("pledge_ttl", 600), max_skew=state.get("max_skew", 120))
+    w.policy.convicted = set(state.get("convicted", []))
     for pk, seed in seeds.items():
         kp = KeyPair.from_seed(bytes.fromhex(seed))
         if kp.pk != pk:
@@ -91,6 +112,10 @@ def load(wallet_dir: str, network) -> Wallet:
     # bind, so expires=0 is safe (release still needs every witness's status).
     w.pledged = {s: tuple(v) if len(v) == 3 else (v[0], v[1], 0)
                  for s, v in state["pledged"].items()}
+    w.pending = state.get("pending", {})
+    w.completed = state.get("completed", [])
+    # Older wallets did not record issued addresses: accept the ones we hold.
+    w.issued = set(state.get("issued", [h["sigil"] for h in w.holdings.values()]))
     w.stamps = defaultdict(list, {pk: list(v) for pk, v in state["stamps"].items()})
     w._confirmed = {tuple(c) for c in state["confirmed"]}
     return w

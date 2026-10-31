@@ -15,6 +15,13 @@ use crate::proofs::verify_equivocation;
 
 pub const MAX_DEPTH: usize = 8;
 pub const MAX_NODES: i64 = 64;
+/// Keys a lock may name in all (`sig` and `multi`): bounds signature checks per spend.
+pub const MAX_KEYS: i64 = 64;
+/// Equivocation proofs one unlock may carry (`locks.MAX_EQUIVOCATIONS`). A well-formed lock has
+/// at most 64 nodes, so it never needs more; an unlock with more satisfies no lock. This bounds
+/// one evaluation to 3 signature checks per proof, at most 192, where a 1 MiB body could
+/// otherwise carry about 1,400 proofs.
+pub const MAX_EQUIVOCATIONS: usize = 64;
 
 fn is_int(v: Option<&Json>) -> bool {
     matches!(v, Some(Json::Int(_)))
@@ -26,21 +33,29 @@ fn is_str(v: Option<&Json>) -> bool {
 
 pub fn well_formed(lock: &Json) -> bool {
     let mut budget = MAX_NODES;
-    wf(lock, 0, &mut budget)
+    let mut keys = MAX_KEYS;
+    wf(lock, 0, &mut budget, &mut keys)
 }
 
-fn wf(lock: &Json, depth: usize, budget: &mut i64) -> bool {
+fn wf(lock: &Json, depth: usize, budget: &mut i64, keys: &mut i64) -> bool {
     *budget -= 1;
     let m = match lock {
         Json::Obj(m) if *budget >= 0 && depth <= MAX_DEPTH => m,
         _ => return false,
     };
     match m.get("op").and_then(Json::as_str) {
-        Some("sig") => is_str(m.get("pk")) && m.len() == 2,
+        Some("sig") => {
+            *keys -= 1;
+            is_str(m.get("pk")) && m.len() == 2 && *keys >= 0
+        }
         Some("multi") => {
             let (Some(Json::Int(k)), Some(Json::Arr(pks))) = (m.get("k"), m.get("pks")) else {
                 return false;
             };
+            *keys -= pks.len() as i64;
+            if *keys < 0 {
+                return false;
+            }
             let mut seen: Vec<&str> = Vec::with_capacity(pks.len());
             for p in pks {
                 match p {
@@ -56,7 +71,7 @@ fn wf(lock: &Json, depth: usize, budget: &mut i64) -> bool {
         Some("hash") => is_str(m.get("h")) && m.len() == 2,
         Some("equivocation") => is_str(m.get("witness")) && m.len() == 2,
         Some("all" | "any") => match m.get("of") {
-            Some(Json::Arr(of)) if !of.is_empty() && m.len() == 2 => of.iter().all(|x| wf(x, depth + 1, budget)),
+            Some(Json::Arr(of)) if !of.is_empty() && m.len() == 2 => of.iter().all(|x| wf(x, depth + 1, budget, keys)),
             _ => false,
         },
         Some("never") => m.len() == 1,
@@ -103,6 +118,9 @@ pub fn evaluate(lock: &Json, unlock: &Json, sigil: &str, tid: &str, now: Option<
     let sigs = u.get("sigs").and_then(Json::as_obj).unwrap_or(empty);
     let preimages = u.get("preimages").and_then(Json::as_obj).unwrap_or(empty);
     let equivocations: &[Json] = u.get("equivocations").and_then(Json::as_arr).map(Vec::as_slice).unwrap_or(&[]);
+    if equivocations.len() > MAX_EQUIVOCATIONS {
+        return false;
+    }
     let ctx = Ctx { msg, sigs, preimages, equivocations, now, batch, cache: RefCell::new(HashMap::new()), equiv: RefCell::new(HashMap::new()) };
     ctx.ev(lock)
 }

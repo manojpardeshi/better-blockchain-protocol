@@ -4,11 +4,17 @@
 //! sigil-witness keygen  --out key.json
 //! sigil-witness genesis --name orion --keys k1.pub k2.pub k3.pub k4.pub --out registry.json
 //! sigil-witness run     --key key.json --registry registry.json --constellation <cid> \
-//!                       --store data.redb [--host 127.0.0.1] [--port 7000]
+//!                       --store data.redb [--host 127.0.0.1] [--port 7000] [--stamps] \
+//!                       [--admin-token FILE] [--adopt]
 //! ```
 //!
 //! Every vote is made durable before it is sent, so the daemon may be killed at any moment,
 //! even with SIGKILL, and restarted on the same store.
+//!
+//! `--stamps` requires a stamp with every SPEND and sells them; the stamp key lives in
+//! `<store>.stamps.json` (the reference's file and format), created on first use. A fresh
+//! store joins charter version 0; a new member of a later version is started with `--adopt`
+//! and waits for `/v0/adopt`. The rotation calls need the token in `--admin-token FILE`.
 
 use std::io::Write;
 use std::sync::Arc;
@@ -16,9 +22,10 @@ use std::sync::Arc;
 use clap::{Parser, Subcommand};
 use sigil_witness::charter::{constellation_id, short};
 use sigil_witness::json::{obj, parse, Json};
+use sigil_witness::stamps::load_mint;
 use sigil_witness::store::Store;
 use sigil_witness::witness::system_clock;
-use sigil_witness::{load_key, load_registry, server, KeyPair, Witness};
+use sigil_witness::{load_admin_token, load_key, load_registry, server, write_private, KeyPair, Witness};
 
 #[derive(Parser)]
 #[command(name = "sigil-witness", about = "Sigil v0 witness (Rust)", version)]
@@ -59,9 +66,15 @@ enum Cmd {
         host: String,
         #[arg(long, default_value_t = 7000)]
         port: u16,
-        /// Stamps are not supported by the Rust witness (refused).
+        /// Require a stamp with every spend (and sell stamps); key in <store>.stamps.json.
         #[arg(long)]
         stamps: bool,
+        /// File holding the operator token that authorises /v0/freeze and /v0/adopt.
+        #[arg(long, value_name = "FILE")]
+        admin_token: Option<String>,
+        /// On a fresh store, do not join: wait for /v0/adopt into a later charter version.
+        #[arg(long)]
+        adopt: bool,
         /// Verify each signature on its own instead of Ed25519 batch verification.
         #[arg(long)]
         no_batch_verify: bool,
@@ -96,31 +109,38 @@ fn read_pk(arg: &str) -> Result<String, String> {
     }
 }
 
-#[cfg(unix)]
-fn write_private(path: &str, data: &[u8]) -> std::io::Result<()> {
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-    let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(path)?;
-    f.write_all(data)?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-}
-
-#[cfg(not(unix))]
-fn write_private(path: &str, data: &[u8]) -> std::io::Result<()> {
-    std::fs::write(path, data)
-}
-
 fn main() {
     let cli = Cli::parse();
     let r = match cli.cmd {
         Cmd::Keygen { out } => keygen(&out),
         Cmd::Genesis { name, keys, out } => genesis(&name, &keys, &out),
-        Cmd::Run { key, registry, constellation, store, host, port, stamps, no_batch_verify, threads, unsafe_memory_store } => {
-            if stamps {
-                Err("--stamps is not supported by the Rust witness".to_string())
-            } else {
-                run(&key, &registry, &constellation, &store, &host, port, !no_batch_verify, threads, unsafe_memory_store)
-            }
-        }
+        Cmd::Run {
+            key,
+            registry,
+            constellation,
+            store,
+            host,
+            port,
+            stamps,
+            admin_token,
+            adopt,
+            no_batch_verify,
+            threads,
+            unsafe_memory_store,
+        } => run(RunArgs {
+            key,
+            registry,
+            cid: constellation,
+            store,
+            host,
+            port,
+            stamps,
+            admin_token,
+            adopt,
+            batch: !no_batch_verify,
+            threads,
+            memory: unsafe_memory_store,
+        }),
     };
     if let Err(e) = r {
         eprintln!("sigil-witness: {e}");
@@ -168,51 +188,59 @@ fn genesis(name: &str, keys: &[String], out: &str) -> Result<(), String> {
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-fn run(
-    key: &str,
-    registry: &str,
-    cid: &str,
-    store_path: &str,
-    host: &str,
+struct RunArgs {
+    key: String,
+    registry: String,
+    cid: String,
+    store: String,
+    host: String,
     port: u16,
+    stamps: bool,
+    admin_token: Option<String>,
+    adopt: bool,
     batch: bool,
     threads: Option<usize>,
     memory: bool,
-) -> Result<(), String> {
-    let kp = load_key(key)?;
-    let reg = load_registry(registry)?;
+}
+
+fn run(a: RunArgs) -> Result<(), String> {
+    let (cid, host, port) = (a.cid.as_str(), a.host.as_str(), a.port);
+    let kp = load_key(&a.key)?;
+    let reg = load_registry(&a.registry)?;
     if !reg.contains(cid) {
-        return Err(format!("constellation {cid} is not in {registry}"));
+        return Err(format!("constellation {cid} is not in {}", a.registry));
     }
-    let (store, loaded) = if memory {
+    let token = a.admin_token.as_deref().map(load_admin_token).transpose()?;
+    let (store, loaded) = if a.memory {
         eprintln!("sigil-witness: WARNING --unsafe-memory-store: state is not durable (benchmarks only)");
         (Store::memory(), Default::default())
     } else {
-        Store::open(store_path)?
+        Store::open(&a.store)?
     };
-    let mut w = Witness::open(kp, reg, cid, store.clone(), loaded, system_clock())?;
-    w.batch_verify = batch;
+    let mut w = Witness::open_with(kp, reg, cid, store.clone(), loaded, system_clock(), a.adopt)?;
+    if a.stamps {
+        // Redeemed serials come back from the witness store.
+        w = w.with_stamps(load_mint(&format!("{}.stamps.json", a.store), 2048)?);
+    }
+    w.batch_verify = a.batch;
     let w = Arc::new(w);
 
     let mut rt = tokio::runtime::Builder::new_multi_thread();
-    if let Some(n) = threads {
+    if let Some(n) = a.threads {
         rt.worker_threads(n.max(1));
     }
     let rt = rt.enable_all().build().map_err(|e| e.to_string())?;
     rt.block_on(async {
         let listener = tokio::net::TcpListener::bind((host, port)).await.map_err(|e| format!("{host}:{port}: {e}"))?;
         let addr = listener.local_addr().map_err(|e| e.to_string())?;
-        println!(
-            "witness {} of {} v{} listening on http://{}:{}",
-            short(&w.pk),
-            short(&w.cid),
-            w.version,
-            addr.ip(),
-            addr.port()
-        );
+        match (w.cid(), w.version()) {
+            (Some(c), Some(v)) => {
+                println!("witness {} of {} v{} listening on http://{}:{}", short(&w.pk), short(&c), v, addr.ip(), addr.port())
+            }
+            _ => println!("witness {} awaiting ADOPT into {} listening on http://{}:{}", short(&w.pk), short(cid), addr.ip(), addr.port()),
+        }
         let _ = std::io::stdout().flush();
-        axum::serve(listener, server::router(w.clone()))
+        axum::serve(listener, server::router_with_admin(w.clone(), token))
             .tcp_nodelay(true)
             .with_graceful_shutdown(shutdown_signal())
             .await
