@@ -759,11 +759,19 @@ impl Witness {
             // Two tids bound at one generation mean the owner equivocated there, and the log
             // cannot show which one (if either) a quorum sealed. So a lone live binding is
             // inherited only if it had no sibling at its generation, dead or alive.
-            // A verified seal settles its generation (SPEC §8 Lemma 1), as long as inheriting it
-            // does not step back over a later generation.
-            let lone = alive.len() == 1
-                && (binds.items.iter().filter(|((g, _), _)| *g == alive[0].0 .0).count() == 1
-                    || (sealed.contains(&alive[0].0) && floor <= alive[0].0 .0 + 1));
+            // A lone live binding (g, t) is inherited only if it is the top of the evidence:
+            // every other binding, dead or alive, is at a LOWER generation, and our own key
+            // never voted above g. Otherwise a later release would re-open generations already
+            // used (a second seal there, or our key voting twice), so the record is contested.
+            // A verified seal for (g, t) settles g itself (SPEC §8 Lemma 1): siblings AT g are
+            // then allowed (W9).
+            let lone = alive.len() == 1 && {
+                let (g, t) = &alive[0].0;
+                let sealed_here = sealed.contains(&alive[0].0);
+                binds.items.iter().all(|((g2, t2), _)| {
+                    (g2 == g && t2 == t) || *g2 < *g || (sealed_here && *g2 <= *g)
+                }) && own.items.iter().all(|((og, _), _)| *og <= *g)
+            };
             if lone {
                 let ((g, t), h) = alive[0];
                 rec.gen = *g;
@@ -868,6 +876,8 @@ fn sealed_candidate(
         && seal.get("tid").and_then(Json::as_str) == Some(t.as_str())
         && seal.get("constellation").and_then(Json::as_str) == home
         && top <= g + 1
+        // Never step back below our own votes.
+        && rec.votes.iter().all(|v| v.get("gen").and_then(Json::as_int).is_some_and(|vg| vg <= *g))
         && verify_seal(seal, registry, &HashSet::new(), batch);
     ok.then(|| left[0].clone())
 }

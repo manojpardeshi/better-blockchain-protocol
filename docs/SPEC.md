@@ -156,7 +156,7 @@ Return `{gen, tid, votes}`. `votes` is every vote this witness ever cast on the 
   * collect `dead` = the tids of `release` entries whose death proof verifies against their stated header;
   * `alive` = kept bindings whose tid is not in `dead`;
   * `own` = the adopter's own earlier votes on the sigil: valid `vote` entries signed by its own key for this constellation, plus any it already holds (a re-used key MUST bring its own votes);
-  * exactly one alive `(g, tid)`, and no other kept binding at `g` → record `gen = g`, bound to `tid`; if `own` holds a vote at `g` for another tid, mark the record **abstain**: it never votes at `g` (a release still moves it on);
+  * exactly one alive `(g, tid)` that is the **top of the evidence** (every other kept binding, dead or alive, is at a generation below `g`, or at most `g` when the evidence holds a valid seal for `(g, tid)`), and no vote in `own` is above `g` → record `gen = g`, bound to `tid`; if `own` holds a vote at `g` for another tid, mark the record **abstain**: it never votes at `g` (a release still moves it on);
   * otherwise, if any binding is alive → record **contested** with `candidates` = the alive `(g, tid, header)`, at `gen = max over kept bindings of (g+1 if dead else g)`. A contested record rejects all spends; RELEASE removes candidates as they are proven dead (§5.2). Two tids bound at one generation mean the owner equivocated there, and the evidence cannot show which one (if either) a quorum sealed. Inheriting the surviving one could seal a second tid at a generation whose sealed tid was later released;
   * none → record unbound at `gen = max over kept bindings of (g+1 if dead else g)`, raised to one past the highest generation in `own`, or 0.
 

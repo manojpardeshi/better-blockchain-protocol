@@ -95,6 +95,8 @@ from TLC 1.8.0 on 4 cores. All of these run from `formal/check.sh`.
 | `MC_rot_mutant` | `MC_rot.tla` | the **old** ADOPT (before the Bug 1 fix) | same | **violated (expected)** — reproduces the double-spend of §4, Bug 1 | ~4k (depth 10) |
 | `MC_rot_sibling` | `MC_rot.tla` | the **implemented** ADOPT (`AdoptMode = "sibling"`, SPEC §5.4 / `witness.py`): same-generation siblings make the sigil contested; contested release | same | hold | 77,392 |
 | `MC_rot_sibling4` | `MC_rot.tla` | as above, plus `Tg = {(s,1)}` (recovery spend at gen 1) | same + Tg | hold | 157,441 |
+| `MC_rot_sibling_cex` | `MC_rot.tla` | the first sibling rule (`AdoptMode = "sibling_v1"`) on an instance where a sealed generation lies above a lone binding | Ty, Tb, Tu, Tg | **violated (expected)**, Bugs 3/4 | — |
+| `MC_rot_sibling_top` | `MC_rot.tla` | the implemented rule (top of the evidence) on the same instance | Ty, Tb, Tu, Tg | hold | see check.sh |
 | `MC_rot_sibling_witness`, `…_witness2`, `…_witness3` | `MC_rot.tla` | non-vacuity: Tg completes after rotation; a contested record is released; a contested record is settled by a seal | same + Tg | **violated (expected)** | — |
 | `MC_expiry` | `SigilExpiry.tla` | **owner-signed expiry** + the wallet unpledge rule: with drifting clocks and arbitrarily delayed requests, once the wallet drops a pledge the tid can never be sealed | n=4 q=3, skew 1, `max_skew` 2, time 0..7 | hold | 113,030 |
 | `MC_expiry_mutant`, `MC_expiry_skew_mutant` | `SigilExpiry.tla` | witness ignores expiry / wallet margin `max_skew < 2·skew` | same | **violated (expected)** | — |
@@ -296,6 +298,36 @@ charter") both intend a single successor.
 their successor is unknown and any second freeze is refused. *(Confidence: the double-signing is certainly unintended;
 end-to-end exploitation additionally needs the victim to adopt the attacker's
 fork, which `verify_chain` currently accepts.)*
+
+### Bugs 3 and 4 — ADOPT re-opened higher generations (found by the unbounded proof)
+
+Found while proving rotation safety for unbounded versions
+(`formal/SigilRotProofs.tla`, work in progress), and fixed. Both come from the
+first version of the Bug 1 fix, which inherited a lone live binding `(g, t)`
+whenever nothing else was bound **at** `g`, and forgot that the evidence, or the
+adopter's own votes, already reached a **higher** generation. A later release
+then moved the record to `g + 1` only.
+
+* **Bug 3 (double spend).** `Tu` is sealed at `(s, 1)` and later released
+  (another input of it is consumed), while `Tb` stays bound at `(s, 0)`. ADOPT
+  inherited `Tb` at 0; once `Tb` died, the new charter sealed a second
+  transition at `(s, 1)`.
+* **Bug 4 (an honest re-used key framed).** A key that voted at `(s, 1)` and
+  missed the FREEZE inherited a lone binding at 0, and after its release voted
+  a different transition at `(s, 1)`: a valid SPEC §3.8 equivocation proof
+  against an honest witness.
+
+**Fixed** (SPEC §5.4, Python and Rust): a lone live binding is inherited only on
+top of the evidence (every other binding below `g`, or at most `g` with a valid
+seal for it) and when the key's own votes are at most `g`; otherwise the record
+is contested, and the contested release moves past every candidate and the
+key's own votes. A seal settles a contested record only under the same vote
+condition. Reproduced in `tests/test_conformance.py` `RotationOpenBugTests`
+(now regression tests), in the golden vectors (`rotation_top`, replayed by the
+Rust witness), and at the model level by `formal/MC_rot_sibling_cex.cfg`
+(the first rule, violated); `MC_rot_sibling_top.cfg` checks the fixed rule on
+that instance. The bounded configs missed it because their instances had one
+transition per higher generation and no re-used honest key.
 
 ### Not a bug, now covered
 

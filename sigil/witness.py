@@ -278,6 +278,7 @@ class Witness:
             top = max([rec.gen] + [kg + 1 for kg, _, _ in killed])
             ok = (seal["sigil"] == sigil and seal["gen"] == g and seal["tid"] == t
                   and seal["constellation"] == self.cid and top <= g + 1
+                  and all(v["gen"] <= g for v in rec.votes)  # never step back below our own votes
                   and verify_seal(seal, self.registry))
             return left[0] if ok else None
         except (KeyError, TypeError, AttributeError):
@@ -382,16 +383,22 @@ class Witness:
             # retires that binding wherever it was reported.
             alive = {(g, t): h for (g, t), h in binds.items() if t not in dead}
             rec = Record(gen=floor, log=log, votes=list(own.values()))
-            # Two tids bound at one generation mean the owner equivocated there,
-            # and the log cannot show which one (if either) a quorum sealed. So
-            # a lone live binding is inherited only if it had no sibling at its
-            # generation, dead or alive: re-binding a sibling of a sealed-then-
-            # released binding would let us seal a second tid at that generation.
-            # A verified seal settles its generation (SPEC §8 Lemma 1), as long as
-            # inheriting it does not step back over a later generation.
-            lone = len(alive) == 1 and (
-                sum(1 for (g, _) in binds if g == next(iter(alive))[0]) == 1
-                or (next(iter(alive)) in sealed and floor <= next(iter(alive))[0] + 1))
+            # A lone live binding (g, t) is inherited only if it is the top of
+            # the evidence: every other binding, dead or alive, is at a LOWER
+            # generation, and our own key never voted above g. Otherwise the log
+            # cannot show which binding (if any) a quorum sealed, or we would
+            # step back below generations already used: a later release would
+            # re-open them (a second seal there, or our key voting twice). Such
+            # a record is contested instead, and the contested release moves it
+            # past every candidate and our own votes. A verified seal for (g, t)
+            # settles generation g itself (SPEC §8 Lemma 1), so siblings AT g
+            # are then allowed (W9).
+            lone = False
+            if len(alive) == 1:
+                (g, t), = alive
+                others = [g2 for (g2, t2) in binds if (g2, t2) != (g, t)]
+                top = all(g2 <= g for g2 in others) if (g, t) in sealed else all(g2 < g for g2 in others)
+                lone = top and all(og <= g for og, _ in own)
             if lone:
                 ((g, t), h), = alive.items()
                 rec.gen, rec.tid, rec.header = g, t, h

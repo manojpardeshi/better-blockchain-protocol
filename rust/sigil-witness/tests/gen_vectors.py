@@ -606,6 +606,86 @@ def rotation_script():
     return sc.done(registries={"v0": {X: chain0}, "v1": {X: reg1.chain(X)}}, cid=X)
 
 
+def rotation_top_scripts():
+    """The two ADOPT bugs found by the unbounded rotation proof (formal/SigilRotProofs.tla,
+    tests/test_conformance.py RotationOpenBugTests), one script per constellation.
+
+    "top": a lone live binding (Tb at gen 0) below a dead binding that was SEALED (Tu at
+    gen 1) must not be inherited at gen 0. "reuse": a re-used key whose own vote is at
+    gen 1 must not inherit a lone binding at gen 0. Only the new members are replayed.
+    """
+    out = {}
+    for name, base in (("top", 900), ("reuse", 920)):
+        old = [kp(base + i) for i in range(4)]
+        body0 = charter_body(name, 0, [k.pk for k in old], None)
+        X = constellation_id(body0)
+        chain0 = [{"body": body0, "sigs": {}}]
+        reg0 = Registry()
+        reg0.add_chain(X, chain0)
+        clock = [1700000000]
+        sc = Script(clock)
+        o = [Witness(k, reg0, lambda: clock[0]) for k in old]
+        for w in o:
+            w.join(X, 0)
+        owner = kp(base + 50)
+        exp = 1700000000 + 10 ** 6
+
+        def mk(salt):
+            p = {"home": X, "lock": locks.sig(owner.pk), "salt": salt}
+            return p, model.sigil_of(p)
+
+        def hdr(inputs, tag):
+            return {"inputs": [list(i) for i in inputs], "body": tag * 32}
+
+        def req(h, sigil, p):
+            u = locks.empty_unlock(exp)
+            u["sigs"][owner.pk] = locks.sign_unlock(owner, sigil, model.transition_id(h), exp)
+            return {"sigil": sigil, "header": h, "home": X, "lock": p["lock"], "salt": p["salt"], "unlock": u}
+
+        ps, s_ = mk("aa")
+        px, x = mk("bb")
+        tgt = {"home": X, "lock": px["lock"], "salt": px["salt"]}
+        tgs = {"home": X, "lock": ps["lock"], "salt": ps["salt"]}
+        Ty, Tb = hdr([(x, 0)], "11"), hdr([(s_, 0), (x, 0)], "22")
+        seal_y = model.seal_from_votes([w.spend(req(Ty, x, px)) for w in o])
+        dp_y = {"kind": "seal", "sigil": x, "gen": 0, "parcel": tgt, "seal": seal_y}
+        if name == "top":
+            Tu, Tg, Th = hdr([(s_, 1), (x, 0)], "33"), hdr([(s_, 1)], "44"), hdr([(s_, 2)], "55")
+            o[3].spend(req(Tb, s_, ps))
+            seal_u = model.seal_from_votes([w.spend(req(Tu, s_, ps)) for w in o[:3]])
+            for w in o[:3]:
+                w.release(s_, dp_y)
+            freezing, own, new_key, who = o, [], kp(base + 10), "n0"
+        else:
+            Tu, Tg = hdr([(s_, 1)], "33"), hdr([(s_, 1), (x, 1)], "44")
+            o[1].spend(req(Tb, s_, ps))
+            o[0].spend(req(Tu, s_, ps))                 # o0's key votes at gen 1, then misses FREEZE
+            freezing = o[1:]
+            own = [{k: [{"kind": "vote", "vote": v} for v in r.votes] for k, r in o[0].records.items()}]
+            new_key, who = old[0], "r0"
+        new = [new_key] + [kp(base + 11 + i) for i in range(3)]
+        nxt = charter_body(name, 1, [k.pk for k in new], charter_hash(body0))
+        sigs, snaps = {}, []
+        for w in freezing:
+            sig, snap = w.freeze(nxt)
+            sigs[w.pk] = sig
+            snaps.append(snap)
+        reg1 = Registry()
+        reg1.add_chain(X, chain0 + [{"body": nxt, "sigs": sigs}])
+        seed = base + 10 if name == "top" else base
+        sc.add(who, Witness(new_key, reg1, lambda: clock[0]), seed, "v1", adopt=True)
+        sc.run(who, "adopt", 1700000100, X, 1, snaps + own)
+        sc.run(who, "record", 1700000101, s_)          # contested, not bound to Tb at gen 0
+        sc.run(who, "release", 1700000102, s_, dp_y)    # Tb is dead
+        sc.run(who, "record", 1700000103, s_)
+        sc.run(who, "spend", 1700000104, req(Tg, s_, ps))  # never at gen 1, which is already used
+        if name == "top":
+            sc.run(who, "release", 1700000105, s_, {"kind": "seal", "sigil": s_, "gen": 1, "parcel": tgs, "seal": seal_u})
+            sc.run(who, "spend", 1700000106, req(Th, s_, ps))
+        out[name] = sc.done(registries={"v0": {X: chain0}, "v1": {X: reg1.chain(X)}}, cid=X)
+    return out
+
+
 def stamp_key(bits: int = 1024):
     """A deterministic RSA key (seeded prime search), so the vectors never change."""
     r = random.Random(20261028)
@@ -788,7 +868,7 @@ def gossip_script():
 def main():
     vectors = {
         "canonical": canonical_cases(), "keys": key_cases(), "model": model_cases(), "locks": lock_cases(),
-        "proofs": proof_cases(), "witness": witness_script(), "rotation": rotation_script(),
+        "proofs": proof_cases(), "witness": witness_script(), "rotation": rotation_script(), "rotation_top": rotation_top_scripts(),
         "stamps": stamp_cases(), "gossip": gossip_script(),
     }
     json.dump(vectors, sys.stdout, sort_keys=True, indent=None, separators=(",", ":"))

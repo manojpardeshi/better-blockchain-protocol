@@ -454,5 +454,164 @@ class RotationRegressionTests(unittest.TestCase):
                         "honest witnesses signed a second, conflicting successor charter")
 
 
+class RotationOpenBugTests(unittest.TestCase):
+    """OPEN bugs in ``sigil/witness.py :: Witness.adopt`` found while proving
+    rotation safety for unbounded versions (formal/SigilRotProofs.tla).
+
+    Both come from the same line: when the evidence holds exactly one live
+    binding ``(g, t)`` with no sibling at ``g``, ADOPT inherits it with
+    ``rec.gen = g`` and forgets that the evidence (or the adopter's own votes)
+    already reached HIGHER generations. Once ``t`` is released, RELEASE moves
+    the record to ``g + 1`` only, re-opening those generations. The bounded
+    model (formal/SigilRot.tla, ``AdoptMode = "sibling"``) missed it because
+    its instances have one transition per higher generation and no re-used
+    honest key; ``formal/MC_rot_sibling_cex.cfg`` (SigilRot) and
+    ``formal/MC_rotp_cex_sibling.cfg`` (SigilRotProofs) are the TLC
+    counterexamples.
+
+    SUGGESTED FIX (the rule SigilRotProofs.tla proves safe, ``LoneOK``):
+    inherit a lone live binding only if it is the top of the evidence, i.e.
+    every other kept binding (dead or alive) is at a LOWER generation and every
+    vote the adopter's own key cast on the sigil is at a generation <= g;
+    otherwise make the record CONTESTED with that binding as its only
+    candidate, so the existing contested release moves it past every evidence
+    generation and past the key's own votes::
+
+        lone = False
+        if len(alive) == 1:
+            (g, t), = alive
+            lone = (all(g2 < g for (g2, t2) in binds if (g2, t2) != (g, t))
+                    and all(og <= g for og, _ in own))
+
+    An honest owner (SPEC Section 4 rules 1-3) never produces such evidence,
+    so the fix costs liveness only to an owner who authorised a later
+    generation while an earlier one was still bound. Equivalent alternative:
+    keep the inheritance, store the evidence floor in the record and make
+    RELEASE set ``gen = max(gen + 1, floor)``.
+
+    Each test is marked ``expectedFailure`` and passes (an "unexpected
+    success", which fails the run) once ADOPT is fixed; then drop the marker.
+    """
+
+    def _universe(self):
+        net = Network()
+        X = net.create_constellation("orion", 4)
+        owner = KeyPair.generate()
+        exp = int(net.clock()) + 10 ** 9
+
+        def mk(salt):
+            p = model.parcel(X, "x", 1, locks.sig(owner.pk), salt)
+            return p, model.sigil_of(p)
+
+        ps, s = mk("s")
+        px, x = mk("x")
+        tgt = lambda p: {"home": p["home"], "lock": p["lock"], "salt": p["salt"]}
+        hdr = lambda inputs, tag: {"inputs": [list(i) for i in inputs], "body": tag * 64}
+
+        def req(h, sigil, p):
+            u = locks.empty_unlock(exp)
+            u["sigs"][owner.pk] = locks.sign_unlock(owner, sigil, model.transition_id(h), exp)
+            return {"sigil": sigil, "header": h, "home": X, "lock": p["lock"], "salt": p["salt"], "unlock": u}
+
+        return net, X, (ps, s), (px, x), tgt, hdr, req
+
+    def test_adopt_does_not_reopen_a_dead_sealed_generation(self):
+        """Double spend: a lone live binding BELOW a dead binding that was SEALED.
+
+        All witnesses honest; only the owner misbehaves; standard Network.rotate.
+          * Ty = {(x,0)} is sealed, so Tb = {(s,0),(x,0)} and Tu = {(s,1),(x,0)}
+            are provably dead.
+          * d binds (s,0) to Tb and never releases it.
+          * a, b, c jump s to generation 1 and SEAL Tu at (s,1), then release it
+            (Ty's seal proves Tu dead).
+          * Rotation. The evidence is binds {(0,Tb), (1,Tu)}, dead {Tu}: one live
+            binding (Tb) with no sibling at generation 0, so the new charter
+            inherits Tb at generation 0 although the evidence reached (s,1).
+          * The new witnesses release Tb (Ty's seal) and land on generation 1,
+            where Tu is already sealed: they seal Tg = {(s,1)}.
+          * Tu's old seal at (s,1) is a valid death proof for Tg, so they release
+            Tg and seal Th = {(s,2)}. Tg and Th are both complete: s is spent twice.
+        With the suggested fix the record is contested at generation 2, so Tg is
+        never sealed and only Th consumes s.
+        """
+        net, X, (ps, s), (px, x), tgt, hdr, req = self._universe()
+        Ty, Tb, Tu = hdr([(x, 0)], "1"), hdr([(s, 0), (x, 0)], "2"), hdr([(s, 1), (x, 0)], "3")
+        Tg, Th = hdr([(s, 1)], "4"), hdr([(s, 2)], "5")
+        a, b, c, d = net.witnesses(X)
+        seal_y = model.seal_from_votes([w.spend(req(Ty, x, px)) for w in (a, b, c, d)])
+        d.spend(req(Tb, s, ps))
+        seal_u = model.seal_from_votes([w.spend(req(Tu, s, ps)) for w in (a, b, c)])
+        self.assertTrue(verify_seal(seal_u, net.registry))
+        dp_y = {"kind": "seal", "sigil": x, "gen": 0, "parcel": tgt(px), "seal": seal_y}
+        for w in (a, b, c):
+            w.release(s, dp_y)
+        net.rotate(X, [KeyPair.generate() for _ in range(4)])
+
+        def try_seal(h):
+            votes = []
+            for w in net.witnesses(X):
+                try:
+                    votes.append(w.spend(req(h, s, ps)))
+                except (Rejected, Conflict):
+                    pass
+            seal = model.seal_from_votes(votes) if votes else None
+            return seal if seal and verify_seal(seal, net.registry) else None
+
+        def release_all(proof):
+            for w in net.witnesses(X):
+                try:
+                    w.release(s, proof)
+                except Rejected:
+                    pass
+
+        release_all(dp_y)                         # Tb is dead
+        seal_g = try_seal(Tg)
+        release_all({"kind": "seal", "sigil": s, "gen": 1, "parcel": tgt(ps), "seal": seal_u})
+        seal_h = try_seal(Th)
+        self.assertFalse(seal_g is not None and seal_h is not None,
+                         "s was consumed by both Tg (gen 1) and Th (gen 2)")
+
+    def test_reused_key_never_signs_two_tids_for_one_generation(self):
+        """Equivocation by an honest re-used key (SPEC 5.4 promises it cannot happen).
+
+          * a binds (s,0) to Tb = {(s,0),(x,0)}; Ty = {(x,0)} is sealed, so Tb is dead.
+          * Honest key w jumps s to generation 1 and votes Tu = {(s,1)}.
+          * w is unreachable during the rotation (does not freeze) and is re-used
+            in the new charter; Network.rotate hands ADOPT w's own votes.
+          * The evidence holds one live binding (0,Tb), so w inherits Tb at
+            generation 0 -- below its own vote at generation 1 -- with abstain
+            unset (it never voted at generation 0).
+          * w releases Tb (Ty's seal), lands on generation 1 and votes
+            Tg = {(s,1),(x,1)}: two valid votes by one honest key for one
+            (constellation, sigil, gen) with different tids, a SPEC 3.8
+            equivocation proof against an honest witness.
+        With the suggested fix the record is contested and, once Tb is proven
+        dead, moves past w's own votes to generation 2, so the second vote is refused.
+        """
+        from sigil.proofs import verify_equivocation
+
+        net, X, (ps, s), (px, x), tgt, hdr, req = self._universe()
+        Ty, Tb = hdr([(x, 0)], "1"), hdr([(s, 0), (x, 0)], "2")
+        Tu, Tg = hdr([(s, 1)], "3"), hdr([(s, 1), (x, 1)], "4")
+        w, a, b, c = net.witnesses(X)
+        seal_y = model.seal_from_votes([k.spend(req(Ty, x, px)) for k in (w, a, b, c)])
+        a.spend(req(Tb, s, ps))
+        v_old = w.spend(req(Tu, s, ps))
+        net.down.add(w.pk)                       # w does not freeze
+        net.rotate(X, [w.kp] + [KeyPair.generate() for _ in range(3)])
+        net.down.discard(w.pk)
+        nw = next(k for k in net.witnesses(X) if k.pk == w.pk)
+        try:
+            nw.release(s, {"kind": "seal", "sigil": x, "gen": 0, "parcel": tgt(px), "seal": seal_y})
+        except Rejected:
+            pass
+        try:
+            v_new = nw.spend(req(Tg, s, ps))
+        except (Rejected, Conflict):
+            v_new = None
+        self.assertFalse(v_new is not None and verify_equivocation({"a": v_old, "b": v_new}),
+                         "an honest re-used key signed two tids at (s, 1)")
+
+
 if __name__ == "__main__":
     unittest.main()

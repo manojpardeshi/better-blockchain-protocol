@@ -188,6 +188,17 @@ fn rotation_script_matches_reference() {
     assert!(n > 60, "{n} steps");
 }
 
+/// The two ADOPT bugs found by the unbounded rotation proof: a lone binding below a sealed
+/// generation, and a re-used key below its own vote, are both contested, not inherited.
+#[test]
+fn rotation_top_scripts_match_reference() {
+    let v = vectors();
+    let scripts = v.get("rotation_top").unwrap();
+    for name in ["top", "reuse"] {
+        replay_script(scripts.get(name).unwrap(), None);
+    }
+}
+
 /// Charter chains, forks, equivocation proofs and the per-message caps of `/v0/gossip`.
 #[test]
 fn gossip_script_matches_reference() {

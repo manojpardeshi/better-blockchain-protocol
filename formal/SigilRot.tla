@@ -207,17 +207,24 @@ AdoptSeal(s) ==
 \* not inherited: the sigil becomes CONTESTED with every live binding as a
 \* candidate, and is only released once each candidate is proven dead.
 HasSibling(s, b) == \E u \in Tids : u # b[2] /\ <<b[1], u>> \in binds[s]
+\* The implemented rule: a lone live binding is inherited only if it is the top
+\* of the evidence (every other binding, dead or alive, at a LOWER generation).
+\* "sibling_v1" is the first version of the fix, which only excluded siblings
+\* AT its generation; it re-opens a higher generation (MC_rot_sibling_cex.cfg).
+OnTop(s, b) ==
+    IF AdoptMode = "sibling_v1" THEN ~HasSibling(s, b)
+    ELSE \A c \in binds[s] : c = b \/ c[1] < b[1]
 AdoptSib(s) ==
     IF AliveReal(s) = {}
         THEN [g |-> Floor(s), tid |-> NoTid, cand |-> {}]
     ELSE IF Cardinality(AliveReal(s)) = 1
-            /\ ~HasSibling(s, CHOOSE b \in AliveReal(s) : TRUE)
+            /\ OnTop(s, CHOOSE b \in AliveReal(s) : TRUE)
         THEN LET b == CHOOSE b \in AliveReal(s) : TRUE IN [g |-> b[1], tid |-> b[2], cand |-> {}]
     ELSE [g |-> Floor(s), tid |-> CONTESTED, cand |-> AliveReal(s)]
 
 AdoptRec(s) ==
     CASE AdoptMode = "sealaware" -> [g |-> AdoptSeal(s).g, tid |-> AdoptSeal(s).tid, cand |-> {}]
-      [] AdoptMode = "sibling"   -> AdoptSib(s)
+      [] AdoptMode \in {"sibling", "sibling_v1"} -> AdoptSib(s)
       [] OTHER                   -> [g |-> AdoptReal(s).g, tid |-> AdoptReal(s).tid, cand |-> {}]
 
 Adopt ==
@@ -235,7 +242,7 @@ Next ==
     \/ \E w \in HonestV(ver), s \in Sigils, t \in Tids : Spend(w, s, t)
     \/ \E w \in HonestV(ver), s \in Sigils : Release(w, s)
     \/ \E w \in HonestV(ver), s \in Sigils : ReleaseContested(w, s)
-    \/ AdoptMode = "sibling" /\ \E w \in HonestV(ver), s \in Sigils : ResolveContested(w, s)
+    \/ AdoptMode \in {"sibling", "sibling_v1"} /\ \E w \in HonestV(ver), s \in Sigils : ResolveContested(w, s)
     \/ Adopt
 
 Spec == Init /\ [][Next]_vars
