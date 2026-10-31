@@ -24,9 +24,16 @@ The honest conclusion first:
 > phishing operators, finding the one implementation bug, and racing timing
 > windows. The residual risk is almost entirely here.
 
-Three real defects were found while writing this (one critical), all recorded as
-`expectedFailure` regression tests in `tests/redteam/test_redteam.py` and
-summarised in [§3](#3-findings). They were **not** fixed, per the task.
+This review found **six defects**, summarised in [§3](#3-findings). Five are
+**still open** on the merged main branch (`a22e412`, which includes the
+wallet-verification fixes `91269ff` and the Rust rotation/stamps/gossip port
+`0b016ef`/`eca6edd`). They are recorded as `expectedFailure` tests in
+`tests/redteam/test_redteam.py`, and **one is critical** (BUG-1, a counterfeit
+through the holder's verifier cache). The sixth, BUG-2, was fixed upstream in
+parallel and is now a regression test. Three more attack hypotheses tested here
+(dossier merge poisoning, the default trust policy accepting a payer's rogue home,
+and shared-control locks accepted as payment) were also fixed by that wallet work.
+Per the task, nothing in `sigil/` was changed here.
 
 ---
 
@@ -42,7 +49,8 @@ summarised in [§3](#3-findings). They were **not** fixed, per the task.
 | Witnesses cannot inflate | Holder checks conservation (validate §6.5) | **No** — *except* via BUG-1, a cache defect, not a math break ([§3](#3-findings)) |
 | Fees cannot censor; witness cannot discriminate | Blind RSA-FDH stamps | Only by breaking RSA-FDH or the blinding |
 | Safety holds across rotation | ADOPT + evidence logs | Bounded-checked only (not size-free); see [§2.11](#211-rotation-and-succession) |
-| Liveness / recovery / deep confirmation | **Honest-majority of current operators, honest STATUS answers** | **Yes, at the assumption**: see BUG-2 and [§2.5](#25-timing-partitions-and-gossip-withholding) |
+| Liveness / recovery / deep confirmation | **Honest-majority of current operators, honest STATUS answers, cooperative counter-parties** | **Yes, at the assumption**: see BUG-2 (fixed), BUG-4, BUG-5 and [§2.5](#25-timing-partitions-and-gossip-withholding) |
+| Slashing deters a corrupt quorum | Bond economics + who can satisfy the equivocation branch | **Yes, by design flaw**: the equivocator claims its own bond (BUG-6, [§2.9](#29-economic-attacks-t9)) |
 
 The rest of this document walks each AI-relevant capability, cites the existing
 defence and why it works, and gives the residual risk and a concrete mitigation
@@ -55,18 +63,21 @@ with a priority (**P0** = before any real value; **P1** = before public testnet;
 
 ### Ranked summary (top risks first)
 
-| # | Threat | Property at stake | Rests on | Residual risk | Priority |
+Threat ids (T1–T10) are stable labels used in the section headings; the first
+column is the rank.
+
+| Rank | Threat | Property at stake | Rests on | Residual risk | Priority |
 |---|---|---|---|---|---|
-| T1 | **Implementation bugs** (the AI finds the one flaw) | all | correct code | **High** — BUG-1 is a live counterfeit; code is unaudited | **P0** |
-| T2 | **Key / dossier theft via agent subversion** (prompt injection) | no theft | key secrecy | **High** for AI-held wallets | **P0** |
-| T3 | **Operator compromise ≥ f per constellation** (phish/bribe/Sybil) | double-spend safety of that home | `≤ f` honest operators | **High**; AI scales phishing & Sybil | **P1** |
-| T4 | **Griefing via lying STATUS / partitions** | liveness, funds-stuck | honest STATUS, honest majority | **Medium** (BUG-2: third-party harm) | **P1** |
-| T5 | **Resource exhaustion** (CPU/mem/storage amplification) | availability | rate limiting (stamps) | **Medium**; stamps off by default | **P1** |
-| T6 | **Long-range forgery** by retired keys | safety of old history | long unbonding + deep confirmation | **Medium** | **P2** |
-| T7 | **Deanonymisation from dossiers** | privacy | nothing today (ancestry is in the clear) | **High** for privacy | **P2/P3** |
-| T8 | **Quantum / cryptanalysis** | everything | unbroken Ed25519 / RSA-2048 | **Low now, Catastrophic later** | **P2 plan, P3 impl** |
-| T9 | **Economic attacks** (stamp pricing, bond sizing, griefing) | availability, slashing economics | unspecified params | **Medium**; params undefined | **P2** |
-| T10 | **Protocol-level attacks** on recovery / swaps | liveness, atomicity | protocol design | **Medium** (swap hostage, [§2.8](#28-multi-party-swaps-and-counter-party-attacks)) | **P2** |
+| 1 (T1) | **Implementation bugs** (the AI finds the one flaw) | all | correct code | **High**: BUG-1 is a live counterfeit; code is unaudited | **P0** |
+| 2 (T2) | **Key theft via agent subversion** (prompt injection) | no theft | key secrecy | **High** for AI-held wallets | **P0** |
+| 3 (T9) | **Economic attacks** (bond self-claim, stamp pricing, bond sizing) | slashing economics, availability | lock design + unspecified params | **High**: BUG-6 voids slashing against the cheater | **P1** |
+| 4 (T3) | **Operator compromise ≥ f per constellation** (phish / bribe / Sybil) | double-spend safety of that home | `≤ f` honest operators | **High**; AI scales phishing and Sybil | **P1** |
+| 5 (T10) | **Protocol-level attacks** on recovery / swaps | liveness, atomicity | cooperative counter-party | **Medium–High** (BUG-5 swap hostage, [§2.8](#28-multi-party-swaps-and-counter-party-attacks)) | **P1** |
+| 6 (T5) | **Resource exhaustion** (CPU / memory / storage amplification) | availability | rate limiting (stamps) | **Medium**; stamps are opt-in in both witnesses | **P1** |
+| 7 (T6) | **Long-range forgery** by retired keys | safety of old history | long unbonding + deep confirmation | **Medium** (BUG-4 lets a payer skip deep confirmation) | **P1** |
+| 8 (T7) | **Deanonymisation from dossiers** | privacy | nothing today (ancestry is in the clear) | **High** for privacy, no loss of funds | **P2/P3** |
+| 9 (T4) | **Griefing via lying STATUS / partitions** | liveness | honest STATUS, honest majority | **Low–Medium** (BUG-2 fixed; induced owner equivocation remains) | **P2** |
+| 10 (T8) | **Quantum / cryptanalysis** | everything | unbroken Ed25519 / RSA-2048 | **Low now, catastrophic later** | **P2 plan, P3 implementation** |
 
 ---
 
@@ -126,11 +137,14 @@ charter registry.
   to accept, so Sybil constellations are inert unless someone trusts them.
 
 **Residual risk — Medium.**
-* **Stamps are off by default.** `Network.create_constellation(..., stamps=False)`
-  is the default, and the Rust witness refuses `--stamps` entirely
-  ([VERIFY_RUST §6 Informational](VERIFY_RUST.md)). A witness without stamps has
-  **no rate limit**: anyone can create sigils homed there and force unbounded work
-  and storage ([§2.6](#26-resource-exhaustion-t5)).
+* **Stamps are opt-in.** `Network.create_constellation(..., stamps=False)`, the
+  Python daemon (`sigil.witnessd --stamps`) and, since the merged port, the Rust
+  witness (`sigil-witness --stamps`) all default to *no* stamps. A witness without
+  stamps has **no rate limit**: anyone can create sigils homed there and force
+  unbounded work and storage ([§2.6](#26-resource-exhaustion-t5)). Note also that
+  `/v0/sell_stamp` blind-signs for anyone who asks: the payment step is outside the
+  protocol, so a deployment must put it behind a real payment channel or stamps
+  cost nothing.
 * The gossip constellation cap (10 000) bounds *count*, not *size*: one ~1 MiB
   message can register a charter listing 14 000 witnesses (measured,
   `tests/redteam/resources.py::gossip_store_growth`).
@@ -138,9 +152,17 @@ charter registry.
   constellation reputations could get a holder to trust a home it controls → then
   [§2.3](#23-corrupting-a-constellation-t3) applies directly.
 
+**Fixed on main (relevant here).** Wallets no longer trust every constellation they
+hear about: by default a wallet trusts only the constellations known when it was
+created plus its home, and charters learned from a payer's dossier are used to
+verify seals but never trusted unless the owner calls `trust` (`91269ff`). This
+review confirmed the earlier hole: a payer could home its coin in a one-member
+constellation it runs, seal a double spend there, and both payees accepted. That
+attack now fails with "untrusted constellation".
+
 **Mitigation:**
 * **P1:** make stamps (or an equivalent proof-of-work / rate limit) the default for
-  any witness exposed to the open network; have the Rust witness implement them.
+  any witness exposed to the open network, and gate `/v0/sell_stamp` behind payment.
 * **P2:** bound gossip by *total bytes and total witnesses*, not just item counts.
 * **P2:** a reputation/stake floor for trust-policy admission, so an AI cannot
   cheaply manufacture a trustworthy-looking home.
@@ -159,7 +181,9 @@ hold and are the real defence:
 1. **Witnesses still cannot steal or inflate** — holders re-check the owner's
    unlock and conservation (validate §6.4–6.5), proven in SPEC §8 "Holders cannot
    be robbed". A corrupt quorum can only double-spend a parcel *whose own owner
-   colludes*, and doing so **leaves equivocation proofs** that slash its bonds.
+   colludes*, and doing so **leaves equivocation proofs** against its keys, so its
+   votes stop counting for every holder who learns them. (Those proofs are meant to
+   slash its bonds too, but today the cheater can claim its own bond first: BUG-6.)
 2. **Per-holder trust and per-parcel homes** contain the blast radius: a corrupt
    home affects only parcels homed there, and holders can demand stronger homes for
    large value (SPEC §9 "Payment size").
@@ -194,7 +218,18 @@ both **assumptions**, not math.
 keys are secret and operators honest. The one structural help is that **witness
 compromise alone cannot steal** (§2.3), so phishing an *operator* is far less
 rewarding than phishing a *holder's* signing key — there is no "validator key that
-moves funds". Equivocation by a bribed operator is self-slashing (SPEC §7).
+moves funds". Equivocation by a bribed operator is self-incriminating (SPEC §7),
+though not yet self-slashing (BUG-6).
+
+Two wallet fixes on main (`91269ff`) close phishing-adjacent holes this review also
+reproduced: a wallet now accepts a payment only into an address it **issued**,
+exactly (home, lock and salt), so a payer can no longer credit it with a parcel
+locked `any(sig(victim), sig(payer))` that the payer can claw back; and `receive`
+merges only the **verified ancestry** of what it accepts, never over entries it
+already holds, so a payer can no longer overwrite the victim's own history with
+garbage and make its coins unprovable. The witness rotation calls `/v0/freeze`
+and `/v0/adopt` on the Rust witness now need an admin token, which removes an
+unauthenticated way to freeze a witness.
 
 **Residual risk — High.** This is the classic place a super-human social engineer
 wins, and Sigil offers no magic. An AI that phishes a **holder's** key spends that
@@ -216,8 +251,8 @@ keys, but can **destroy** the holder's money by deleting the only copy (the doss
 
 ### 2.5 Timing, partitions and gossip withholding (T4)
 
-**Property at stake:** liveness and recovery — and, via BUG-2, the funds of an
-*honest third party*.
+**Property at stake:** liveness and recovery, and (via BUG-2, now fixed) the
+spendability of an *honest third party's* funds.
 
 **What defends it, and why.** Safety is **timing-independent**: a network attacker
 can delay but not reorder or double-seal (SPEC §7 "network attacker"), because
@@ -228,15 +263,19 @@ delayed in-flight request from binding a coin after the owner has given up. Goss
 **withholding** is tolerated as long as one honest relay path exists; every item
 self-verifies ([WIRE.md Threats](WIRE.md)).
 
-**Residual risk — Medium, and this is where BUG-2 lives.** The pledge-release rule
-3 and deep confirmation both **trust STATUS answers**. A Byzantine witness within
-*f* that lies on STATUS ("I hold no binding") during a partition can induce an
-honest owner — following the spec exactly — to create a second binding, which after
-rotation turns an **honestly sealed** coin CONTESTED and fails deep confirmation for
-an innocent recipient (BUG-2, [§3](#3-findings)). Safety (no double spend) is
-preserved; the whitepaper's "only the equivocator loses" is not — the loss lands on
-a third party. An AI adversary is ideal for this: it can hold exactly the right
-STATUS lie across exactly the right partition and rotation timing.
+**Residual risk — Low–Medium (was Medium; BUG-2 is now fixed).** The pledge-release
+rule 3 **trusts STATUS answers**. A Byzantine witness within *f* that lies on STATUS
+("I hold no binding") during a partition can induce an honest owner, following the
+spec exactly, to sign a second transition at the same generation. Before the merged
+fix, the next rotation then turned the **honestly sealed** coin CONTESTED and deep
+confirmation failed for an innocent recipient (BUG-2, [§3](#3-findings)): safety
+held, but "only the equivocator loses" did not. Main now lets `deep_confirm`
+present the seal it holds, and the witness settles a CONTESTED record onto the
+sealed candidate (SPEC §8 Lemma 1), so the third party is no longer stranded. What
+remains is that a liar can still *induce* a second owner signature; it is harmless
+today because the first one can never reach a quorum, but it is a standing reason
+not to treat STATUS as evidence. An AI adversary is ideal for this kind of attack:
+it can hold exactly the right lie across exactly the right partition and rotation.
 
 The open "pathological split" problem (whitepaper §10.7) is the same family: if
 votes split without any quorum and some witnesses are unreachable forever, no death
@@ -244,11 +283,11 @@ proof exists and the honest party's input stays locked. An AI that controls netw
 timing maximises how often this happens.
 
 **Mitigation:**
-* **P1:** do not treat STATUS as authoritative for liveness decisions. For rule 3,
-  keep the pledge unless the owner holds **signed** evidence (a death proof) or
-  re-uses the same tid; for ADOPT/deep confirmation, treat a sibling attested only
-  by `≤ f` members (never a quorum, never a seal) as a non-binding *attempt*, so one
-  lying witness cannot contaminate an honestly sealed binding (BUG-2 fix).
+* **Done on main:** seal settlement of CONTESTED records (the BUG-2 fix proposed
+  here and landed independently in `91269ff`/`eca6edd`, Python and Rust).
+* **P2:** do not treat STATUS as authoritative for liveness decisions. For rule 3,
+  prefer re-authorising the *same* tid over signing a new one, and keep the pledge
+  unless the owner holds signed evidence (a death proof).
 * **P2:** bond counter-parties and retry swaps against fresh witnesses to shrink the
   pathological-split window (whitepaper §10.7); a formal treatment is open.
 
@@ -261,16 +300,20 @@ asymmetry between attacker and victim.
 
 **What defends it, and why.** Stamps bound request rate when enabled; the 1 MiB body
 cap bounds any single request; gossip caps bound a message; lock evaluation is
-total and linear, and the equivocation-proof memoisation fix (Rust/Python BUG-4,
-[VERIFY_RUST §6](VERIFY_RUST.md)) removed the worst amplifier.
+total and linear; and the equivocation-proof memoisation fix (Rust/Python bug 4 of
+[VERIFY_RUST §6](VERIFY_RUST.md)) plus the merged **64-proof cap** per unlock
+(`MAX_EQUIVOCATIONS`) removed the worst amplifier, equivocation locks.
 
 **Residual risk — Medium**, measured by `tests/redteam/resources.py`:
-* **CPU:** a sub-MiB SPEND with a large `sig`/`multi` lock tree forces thousands of
-  Ed25519 verifications. Measured: a **272 KiB** request → **3 780 verifies ≈ 0.58 s
-  CPU** on this VM (≈ 14 verifies/KiB); a full 1 MiB request is ≈ **2 s CPU**. This
-  generalises Rust BUG-4 beyond equivocation locks to ordinary multi-sig. SPEND runs
-  on the async worker in Rust (only RELEASE uses `spawn_blocking`), so a handful of
-  concurrent such requests stall the witness.
+* **CPU (still open after the merge):** the proof cap does not touch `sig`/`multi`
+  leaves. A sub-MiB SPEND with a large `sig`/`multi` lock tree forces thousands of
+  Ed25519 verifications, and the Python evaluator does not memoise `has_sig`, so
+  one key repeated across nodes is verified once per node. Measured on merged main:
+  a **272 KiB** request → **3 780 verifies ≈ 0.5 s CPU** on this VM (≈ 14
+  verifies/KiB; an honest one-signature SPEND costs 1 verify and 0.2 ms, so ≈ 2 500×
+  amplification per request); a full 1 MiB request is ≈ **2 s CPU**. The rejected
+  request still costs the full evaluation, and without stamps it costs the attacker
+  nothing. This is the same class as bug 4 of VERIFY_RUST, for ordinary multi-sig.
 * **Storage:** each accepted SPEND logs the full authorisation (salt + header +
   unlock) forever; measured ≈ **800 KiB stored per request**, ratio ≈ 1.0, and logs
   never compact (`store.py` docstring). Without stamps this is free to the attacker
@@ -281,9 +324,11 @@ An AI adversary with many cheap IPs and the default (stampless) witness can keep
 constellation's witnesses CPU-bound and fill their disks.
 
 **Mitigation:**
-* **P1:** stamps (or PoW) default-on for open witnesses; run SPEND on a blocking
-  pool; cap lock nodes × keys evaluated per request (e.g. 16), and cap stored
-  authorisation size.
+* **P1:** stamps (or PoW) default-on for open witnesses; memoise `has_sig` in
+  `sigil/locks.py` as Rust already does; cap the signature checks one request may
+  trigger (for example 64, which no 64-node lock needs to exceed by much) and the
+  keys in one `multi`; cap the stored authorisation size (salt length, header
+  inputs, unlock contents).
 * **P2:** log compaction (`store.py` notes it is deliberately omitted); bound total
   gossip bytes and witnesses, not just counts.
 
@@ -303,15 +348,21 @@ unbonding longer than the deep-confirmation horizon keep the forgers slashable.
 
 **Residual risk — Medium.** Deep confirmation is **off by default** (`deep_threshold
 = None`) and only as strong as the *current* honest majority and the `f+1`
-threshold (`MC_deep_mutant` shows `f` is unsafe). BUG-2 shows a way to make deep
-confirmation *falsely fail* for honest history. And the whole mechanism depends on
-bonds that are correctly sized and still bonded (economics, [§2.9](#29-economic-attacks-t9)).
-An AI that retired-key-forges will do so at the exact moment bonds have unbonded.
+threshold (`MC_deep_mutant` shows `f` is unsafe). Worse, **the threshold is applied
+per parcel** (BUG-4): a payer who wants to avoid deep confirmation splits one large
+payment into parcels just under the threshold. A wallet with `deep_threshold=1000`
+accepted 9 990 units as ten parcels of 999 and ran deep confirmation zero times.
+An automated adversary probes exactly this kind of parameter first. BUG-2 (now
+fixed) showed a way to make deep confirmation *falsely fail* for honest history.
+The mechanism also depends on bonds that are correctly sized, still bonded and
+actually punitive, which BUG-6 undermines ([§2.9](#29-economic-attacks-t9)). An AI
+that forges with retired keys will do so at the exact moment bonds have unbonded.
 
 **Mitigation:**
-* **P2:** sensible default `deep_threshold`; charters that **publish** minimum bond
-  and unbonding so holders can set it; fix BUG-2 so deep confirmation does not
-  false-negative.
+* **P1:** apply `deep_threshold` to the total value of one payment (and per
+  counter-party per time window), not per parcel (BUG-4).
+* **P2:** a sensible default `deep_threshold`; charters that **publish** minimum
+  bond and unbonding so holders can set it.
 * **P3:** the recursive-proof roadmap ([RECURSIVE_PROOFS.md](research/RECURSIVE_PROOFS.md))
   replaces full-ancestry dossiers with succinct proofs, which also removes the
   retired-key window for the ancestry (the proof, not the seals, carries validity).
@@ -328,20 +379,30 @@ signing (`atomic_swap` `_pays`). If a counter-party equivocates its own input fi
 the honest party uses a **death proof** to release and recover (SPEC §8 "Generations
 exist so honest parties can recover"; `tests/test_recovery_rotation.py`).
 
-**Residual risk — Medium.** Recovery needs a death proof to *exist*. If a malicious
-counter-party gets the honest party's unlock, binds only the honest input, and then
-never produces a conflicting spend (just walks away), **no death proof exists** and
-the honest input stays locked until expiry lets the pledge go — and if witnesses are
-unreachable, longer (the whitepaper §10.7 open problem; reproduced in this review:
-an input bound but never completed leaves the honest party stuck until expiry). An
-AI counter-party will choose exactly this "bind and vanish" strategy and time it
-against the victim's expiry and any pending rotation.
+**Residual risk — Medium–High (BUG-5).** Recovery needs a death proof to *exist*.
+A malicious counter-party that receives the honest party's unlock can submit **only
+the honest input** (binding it to the swap) and then never sign, submit or spend its
+own input. The swap can never complete, yet no death proof exists: one needs another
+input sealed to a different transition at its generation, or a quorum of votes for
+one (SPEC §3.9), and only the counter-party can create that. **Expiry does not
+help**: it only stops a witness from *newly* binding (SPEC §5.1), and the honest
+input is already bound. `Wallet.abort` reports "no proof that the transition is
+dead", and the honest coin stays locked for as long as the counter-party likes: a
+free option, or a ransom. This needs no equivocation, no Byzantine witness and no
+network fault, so it is distinct from the whitepaper §10.7 "pathological split" and
+contradicts its §7 table ("cannot hurt anyone else; honest co-signers recover"). The
+reference `atomic_swap` hides it because it signs both sides in one process. An AI
+counter-party will use exactly this "bind and vanish" strategy.
 
 **Mitigation:**
-* **P2:** the expiry rule already bounds the lock-up to `expires + skew` for
-  reachable witnesses; make swaps default to short expiries and automatic
-  retry-with-fresh-salt, and **bond counter-parties** so "bind and vanish" costs
-  them. A complete fix for the unreachable-forever case is open (whitepaper §10.7).
+* **P1 (protocol, cheap):** each party adds a small **kill-switch** input it
+  controls and withholds that input's unlock until it sees the other side's inputs
+  bound. If the counter-party stalls, it spends the kill switch elsewhere at the
+  swap's generation, which yields the death proof. With kill switches the worst case
+  becomes a bounded free option, not a hostage. Alternatively, never hand over an
+  unlock before holding the other side's. Build swaps this way in `sigil/swap.py`.
+* **P2:** bond counter-parties; a complete fix for the unreachable-forever split of
+  §10.7 is still open.
 
 ---
 
@@ -354,10 +415,25 @@ than it gains?).
 **What defends it, and why.** The mechanism exists: stamps price attention, bonds
 back honesty with equivocation locks ideally homed elsewhere with long unbonding
 (whitepaper §9). Crucially, **a corrupt-quorum double-spend necessarily emits
-equivocation proofs** (SPEC §7), so slashing is automatic and needs no governance —
-the economic defence has teeth the moment bonds are real.
+equivocation proofs** (SPEC §7), so detection is automatic and needs no
+governance. Detection is math; the *penalty* is a lock design, and that is where
+it currently fails.
 
-**Residual risk — Medium.** The **parameters are unspecified** (ROADMAP Phase 4:
+**Residual risk — High, because of a design flaw (BUG-6), before parameters even
+matter.** The bond lock `any(all(sig(operator), after(unbond)), equivocation(w))`
+pays whoever presents an equivocation proof, and **the first party to hold that
+proof is the equivocator**: it signed both votes. So an operator equivocates and,
+at once, spends its own bond to an address it controls through the equivocation
+branch; the honest witnesses of the bond's home vote for the first valid request.
+Reproduced: the claim is sealed by the bond home's honest quorum. The equivocation
+branch is also not bound to the claimant (only `sig`/`multi` leaves sign the tid),
+so any party that sees a bounty claim in flight, including the bond home's
+witnesses, which see lock, salt and unlock in the SPEND request, can race it with
+its own transition. That contradicts the whitepaper's "witnesses can't front-run
+what they can't read": for non-signature branches, they can read it. The lock
+language cannot constrain outputs, so whoever wins chooses where the bond goes.
+
+Second, the **parameters are unspecified** (ROADMAP Phase 4:
 "Stamp pricing and bond sizing" ⬜). Nothing today says how large a bond must be
 relative to the value a constellation homes, or how stamps are priced against
 spam cost. An AI adversary optimises against whatever numbers are chosen:
@@ -366,6 +442,12 @@ gain > slashed bonds; griefing where the attacker burns others' stamps / forces
 recovery work for little cost.
 
 **Mitigation:**
+* **P1 (BUG-6):** never let the slashing branch be satisfied by the proof alone.
+  Require a co-signature from parties independent of the operator, for example
+  `all(equivocation(w), multi(k, auditors))` or a victims' / burn committee key,
+  and give the operator branch a delay longer than the time to publish a proof.
+  Longer term, a holder-checked covenant on the slashing branch (outputs must burn
+  or pay a fixed pool). Until then, do not count bonds as a deterrent.
 * **P2:** define bond ≥ (value homed × safety margin) and make charters publish it;
   price stamps to exceed marginal spam cost; model griefing (who pays for a forced
   release / retry) and ensure the griefer's cost ≥ the victim's. This is a design
@@ -416,25 +498,39 @@ size-free ([VERIFICATION §5](VERIFICATION.md#5)): 2 versions, 2 sigils, ≤ 4
 transitions, gens 0..1. Succession (dead-man takeover) is **unimplemented** (ROADMAP
 Phase 4 ⬜), so a constellation that dies strands its parcels — an AI adversary that
 can DoS a small constellation into death permanently freezes its value. BUG-2
-exploits the rotation seam specifically.
+exploited the rotation seam specifically (fixed on main by seal settlement of
+CONTESTED records, in both the Python and the newly ported Rust witness).
 
-**Mitigation:** **P2** extend the rotation proof toward more versions; implement and
-model-check succession with partition tolerance (whitepaper §10.4). **P1** fix BUG-2.
+**Mitigation:** **P2** extend the rotation proof toward more versions, including the
+new seal-settlement path; implement and model-check succession with partition
+tolerance (whitepaper §10.4).
 
 ---
 
 ## 3. Findings
 
-All three are recorded as `expectedFailure` tests in
-`tests/redteam/test_redteam.py` (each with a full scenario/impact/fix docstring) and
-reproduced by the harness. None was fixed, per the task. `python3 -m unittest
-discover` stays green (expected failures count as passes).
+Every finding is a test in `tests/redteam/test_redteam.py` with a full
+scenario / impact / suggested-fix docstring. The open ones are `expectedFailure`
+tests that assert the property that *should* hold, and each was checked to fail for
+its intended reason (not a setup error) on merged main `a22e412`. Nothing was fixed
+in `sigil/`, per the task. `python3 -m unittest discover` stays green: 183 tests,
+5 expected failures.
 
-| # | Severity | Where | One line | Test |
-|---|---|---|---|---|
-| BUG-1 | **Critical** (conservation / counterfeit) | `sigil/validate.py` `Verifier._verify` cache | A warm recipient's verifier cache skips re-validating a cached transition's body, so a malicious **payer** reuses a public ancestor tid (e.g. the genesis) with a forged body and an output minted from thin air; a 1000-supply asset inflated a recipient to ~1e9. Cold recipients reject. | `Finding1Conservation` |
-| BUG-2 | Medium (liveness / third-party griefing) | `sigil/wallet.py` rule-3 release + `deep_confirm`, `sigil/witness.py` ADOPT | A Byzantine witness within *f* that lies on STATUS induces an honest owner to create a second binding; after rotation the honestly sealed coin is CONTESTED and deep confirmation fails for an innocent holder. Safety holds; "only the equivocator loses" is violated. | `Finding2InducedEquivocation` |
-| BUG-3 | Low (robustness / contract) | `sigil/witness.py` `authorises` | A malformed non-dict `unlock` raises `AttributeError` (not caught) instead of `Rejected` from in-process `Witness.spend`; the HTTP server masks it as 400, no state mutated. | `Finding3MalformedLeak` |
+| # | Severity | Status on main | Where | One line | Test |
+|---|---|---|---|---|---|
+| BUG-1 | **Critical** (conservation / counterfeit) | **open** | `sigil/validate.py` `Verifier._verify` cache | A warm recipient's verifier cache skips re-validating a cached transition's body, so a malicious **payer** reuses a public ancestor tid (e.g. the genesis) with a forged body and an output minted from thin air; a 1000-supply asset inflated a recipient to ~1e9. Cold recipients reject. | `Finding1Conservation` |
+| BUG-6 | **High** (economics: slashing void) | **open** (design) | bond lock pattern (whitepaper §7, SPEC §9); `locks.equivocation` | The equivocator holds its own equivocation proof first and claims its own bond; the claim is also front-runnable because the equivocation branch is not bound to the claimant. | `Finding6BondSelfClaim` |
+| BUG-5 | Medium–High (protocol: swap hostage) | **open** | multi-party flow; `sigil/swap.py`, `Wallet.abort` | A counter-party binds only the honest input and vanishes; no death proof can exist and expiry does not release a bound input, so the honest coin is locked indefinitely. | `Finding5SwapHostage` |
+| BUG-4 | Medium (policy evasion) | **open** | `sigil/wallet.py` `receive` | `deep_threshold` is applied per parcel, so splitting a payment into parcels just under it skips deep confirmation entirely. | `Finding4DeepConfirmSplit` |
+| BUG-2 | Medium (liveness / third-party griefing) | **fixed** in `91269ff`/`eca6edd` | `wallet.py` rule-3 release + `deep_confirm`, `witness.py` ADOPT | A witness within *f* lying on STATUS induced an honest owner to bind twice; after rotation the honestly sealed coin was CONTESTED and deep confirmation failed for an innocent holder. Now settled by seal. | `Finding2InducedEquivocation` (regression) |
+| BUG-3 | Low (robustness / contract) | **open** | `sigil/witness.py` `authorises` | A malformed non-dict `unlock` raises `AttributeError` (not caught) instead of `Rejected` from in-process `Witness.spend`; the HTTP server masks it as 400, no state mutated. | `Finding3MalformedLeak` |
+
+**Also reproduced here and fixed on main by the parallel wallet work (`91269ff`):**
+a payer overwriting the payee's own history through `Dossier.merge` of unverified
+entries (the payee's coins became unprovable); the default trust policy accepting a
+rogue home learned from the payer's dossier (double spend accepted by two payees);
+and a parcel locked `any(sig(payee), sig(payer))` accepted as payment and then
+clawed back. Each was re-run against main and now fails for the right reason.
 
 **BUG-1 is the headline.** It needs no witness, no key, and no `f`-corruption — only
 that the recipient previously verified a shared ancestor (the asset genesis id is
@@ -471,9 +567,22 @@ caught as S2 (`MutationChecks`), so the checks have teeth.
 
 ### Statistics (long run on this 4-core VM)
 
-<!-- REDTEAM_STATS -->
-*(filled in below from `python -m tests.redteam.runner` with
-`SIGIL_REDTEAM_SEEDS=300 SIGIL_REDTEAM_STEPS=200`, `SIGIL_REDTEAM_BEYOND=1`.)*
+Two long runs of `python -m tests.redteam.runner`, one before and one after merging
+main (with `SIGIL_REDTEAM_BEYOND=1`):
+
+| Engine / config | Before merge (`e02e82e`), 300 seeds × 200 steps | After merge (`a22e412`), 150 seeds × 200 steps | Violations |
+|---|---|---|---|
+| Explorer n = 4, b = f | 60 000 steps, 169 completions, 669 releases, 600 rotations | 30 000 steps, 95 completions, 346 releases, 300 rotations | none |
+| Explorer n = 4, b = f, crash/restart via durable store | 60 000 steps, 39 completions, 334 releases, 539 rotations | 30 000 steps, 18 completions, 187 releases, 267 rotations | none |
+| Explorer n = 7, b = f | 60 000 steps, 139 completions, 689 releases | 30 000 steps, 85 completions, 333 releases | none |
+| Explorer n = 10, b = f | 60 000 steps, 121 completions, 688 releases | 30 000 steps, 64 completions, 489 releases | none |
+| Explorer n = 4, **b = f+1** | S1 at seed 3 (613 steps) | S1 at seed 3 (613 steps) | **double spend, as expected** |
+| Payment fuzzer (S3–S5) | 40 seeds: 2 185 payments, 363 swaps | 30 seeds: 1 638 payments, 280 swaps | none |
+| Malformed-request leaks (BUG-3) | 1 888 | 897 | counted, not asserted |
+
+In total: **360 000 adversarial witness-level steps and 4 466 wallet-level
+operations with no safety violation within the fault bound.** The after-merge run
+took 1 min 52 s on 4 cores; the default unittest run takes about 8 s.
 
 Key results, independent of the exact counts:
 * **No S1/S2 violation** in any within-fault-bound configuration (n = 4, 7, 10;
@@ -644,10 +753,12 @@ Being honest about the ceiling:
 3. **Losing your dossier.** The dossier *is* the money; an AI that deletes your only
    backup destroys your funds, with no ledger to restore from (README). Redundant
    encrypted backup is the only answer, and it is operational, not cryptographic.
-4. **Pathological liveness** (whitepaper §10.7): a counter-party that binds and
-   vanishes while the right witnesses are unreachable forever can lock an honest
-   input with no death proof available. An AI that owns network timing maximises
-   this. A complete fix is open.
+4. **Liveness that depends on a counter-party.** A counter-party that binds the
+   honest input and vanishes leaves no death proof (BUG-5); kill-switch inputs turn
+   that hostage into a bounded free option, but cannot remove the option itself.
+   And the whitepaper §10.7 split (equivocation plus witnesses unreachable forever)
+   can still lock an honest input. An AI that owns network timing maximises both.
+   A complete fix for the second is open.
 5. **Traffic/metadata analysis and dossier graph linkage.** Until recursive proofs
    land, recipients see full ancestry; an AI linking pseudonymous keys and timings
    deanonymises holders with *no* crypto break. Succinct proofs fix the data exposure
@@ -662,7 +773,9 @@ machine-checked theorem** is as AI-proof as mathematics is. Everything resting o
 **people (honest operators, honest majority, secret keys, careful backups),
 unspecified economics, un-proved code paths (wallet/validator), and un-broken
 crypto** is exactly where a tireless, super-human adversary concentrates — and is
-where this review found a critical counterfeit (BUG-1), a third-party griefing path
-(BUG-2), and the measured amplification and privacy gaps above. Sigil's design
-*minimises* the assumption surface (no global state, no infrastructure that can
-steal, self-slashing cheating); it does not — and cannot — eliminate it.
+where this review found a critical counterfeit (BUG-1), a slashing scheme the
+cheater can defeat (BUG-6), a swap hostage (BUG-5), a way around deep confirmation
+(BUG-4), a third-party griefing path (BUG-2, since fixed), and the measured
+amplification and privacy gaps above. Sigil's design *minimises* the assumption
+surface (no global state, no infrastructure that can steal, self-incriminating
+cheating); it does not, and cannot, eliminate it.

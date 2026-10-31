@@ -5,10 +5,12 @@ conservation fuzz, resource sanity, and mutation checks that prove the harness
 catches seeded bugs. Longer runs are driven by ``python -m tests.redteam.runner``
 with the env knobs documented there.
 
-Three currently-failing findings are recorded as ``expectedFailure`` tests, each
-with a precise docstring (scenario / impact / suggested fix). They do not weaken
-any existing test; ``unittest discover`` stays green because an expected failure
-counts as a pass.
+Five currently-failing findings (BUG-1, 3, 4, 5, 6) are recorded as
+``expectedFailure`` tests, each with a precise docstring (scenario / impact /
+suggested fix); BUG-2 was fixed upstream and is a plain regression test. They do
+not weaken any existing test; ``unittest discover`` stays green because an
+expected failure counts as a pass. When a fix lands, the test reports an
+"unexpected success": remove its marker so it becomes a regression test.
 """
 
 import os
@@ -16,6 +18,8 @@ import unittest
 from unittest import mock
 
 from sigil import Network, Wallet, KeyPair, locks, model
+from sigil.swap import propose_swap
+from sigil.wallet import SealFailed
 from sigil.validate import InvalidDossier
 from sigil.witness import Rejected, Witness
 
@@ -134,42 +138,31 @@ class Finding1Conservation(unittest.TestCase):
 
 
 class Finding2InducedEquivocation(unittest.TestCase):
-    @unittest.expectedFailure
     def test_lying_status_cannot_strand_an_honest_holder(self):
-        """BUG-2 (MEDIUM -- liveness / griefing; third-party harm).
+        """BUG-2 (MEDIUM, liveness / third-party griefing). FIXED UPSTREAM in
+        91269ff / eca6edd ("contested-record settlement by seal"); now a
+        regression test. Found independently by this review.
 
         Scenario: a Byzantine witness within the fault bound (f=1 of n=4) binds a
         sigil like an honest witness but always answers STATUS "unbound". During a
-        partition (the honest majority briefly unreachable), an honest owner's
-        first payment reaches only this liar, which binds+votes tid1 at gen 0.
-        After expiry the owner runs the SPEC Section 4 rule-3 pledge release:
-        every member answers STATUS and none *reports* a binding/vote, so the
-        owner drops the pledge -- but the liar is hiding tid1. The owner re-pays
-        the same coin as tid2, which the honest quorum seals, and an innocent
-        third party (bob) receives a fully valid, quorum-sealed payment.
+        partition only this liar is reachable, so an honest owner's first payment
+        binds tid1 at the liar alone. After expiry the owner runs the SPEC
+        Section 4 rule-3 pledge release: every member answers and none *reports*
+        a binding, so the pledge is dropped, but the liar is hiding tid1. The
+        owner re-pays the coin as tid2, which the honest quorum seals, and an
+        innocent third party (bob) receives a valid payment.
 
-        On the next charter rotation, ADOPT sees two bound siblings at gen 0
-        (tid1 from the liar, tid2 from the honest quorum), neither proven dead, so
-        the record becomes CONTESTED. Every honest *current* witness now reports
-        the ancestry input as CONTESTED, so deep confirmation (SPEC Section 9) --
-        which assumes at most f faulty *current* members -- fails on an honestly
-        sealed input, and a deep-confirming recipient rejects bob's valid money.
+        On rotation, ADOPT sees two bound siblings at gen 0 and makes the record
+        CONTESTED. Before the fix every honest current witness reported the
+        ancestry input as CONTESTED, so deep confirmation failed on honestly
+        sealed history and a deep-confirming recipient rejected bob's money: the
+        loss landed on a third party, not the (induced) equivocator.
 
-        Safety (no double spend) is preserved: tid1 can never seal. The harm is
-        that the whitepaper's "only the equivocator loses" is violated -- the
-        owner was *induced* to equivocate by a lying witness, and the loss lands
-        on bob. Root cause: pledge release (rule 3) and deep confirmation trust
-        STATUS answers, a stronger assumption than the safety theorem needs; a
-        reachable Byzantine member can lie on STATUS.
-
-        Suggested fix: do not treat a witness's STATUS word as authoritative for
-        liveness decisions. For rule 3, require the owner to keep the pledge
-        unless it holds a death proof (signed evidence) OR to re-use the same tid;
-        and have ADOPT/deep-confirmation treat a sibling that is only ever
-        attested by <= f members (never a quorum, never a seal) as a non-binding
-        attempt rather than a live candidate, so a single lying witness cannot
-        contaminate an honestly sealed binding. At minimum, document that rule 3
-        assumes honest STATUS from reachable members.
+        The fix lets ``deep_confirm`` present the seal it holds, and the witness
+        settles a CONTESTED record onto the sealed candidate (SPEC Section 8
+        Lemma 1). Residual (documented, not a test): rule 3 still trusts STATUS,
+        so a liar can still induce a second owner signature at one generation;
+        it just no longer strands anyone.
         """
         net = Network()
         c = net.create_constellation("c", 4, byzantine={3: _LyingWitness})
@@ -185,10 +178,15 @@ class Finding2InducedEquivocation(unittest.TestCase):
         alice.release_expired_pledges()            # liar lies -> pledge dropped
         tid = alice.pay(bob, usd, 100)             # honest quorum seals tid2
         self.assertEqual(bob.balance(usd), 100)
+        s = bob.dossier.transitions[tid]["header"]["inputs"][0][0]
 
         net.rotate(c, [KeyPair.generate() for _ in range(4)])
+        # The induced second binding still makes the record contested ...
+        self.assertEqual(net.witnesses(c)[0].status(s)["tid"], "!contested")
+        # ... but a deep-confirming recipient settles it with the seal and accepts.
         carol = Wallet("c", net, c, deep_threshold=1)
-        bob.pay(carol, usd, 100)                   # raises InvalidDossier today
+        bob.pay(carol, usd, 100)
+        self.assertEqual(carol.balance(usd), 100)
 
 
 class Finding3MalformedLeak(unittest.TestCase):
@@ -224,6 +222,157 @@ class Finding3MalformedLeak(unittest.TestCase):
                "salt": "00" * 16, "unlock": []}   # non-dict unlock
         with self.assertRaises(Rejected):
             w.spend(req)
+
+
+class Finding4DeepConfirmSplit(unittest.TestCase):
+    @unittest.expectedFailure
+    def test_deep_threshold_applies_to_the_whole_payment(self):
+        """BUG-4 (MEDIUM, policy evasion of the long-range-forgery defence).
+
+        Scenario: ``Wallet.receive`` decides per *parcel* whether to run deep
+        confirmation: ``p["amount"] >= self.deep_threshold``. A payer who wants to
+        avoid deep confirmation (for example to pass a long-range forgery built
+        from retired witness keys, SPEC Section 9) simply splits one large payment
+        into many parcels each just below the threshold. Here a wallet with
+        ``deep_threshold=1000`` accepts 9 990 units as 10 parcels of 999 and runs
+        deep confirmation zero times.
+
+        Impact: the SPEC Section 9 defence the holder configured for "large
+        receipts" is bypassed at no cost; it is exactly the kind of parameter an
+        automated adversary probes first.
+
+        Suggested fix: apply the threshold to the total value received in one
+        ``receive`` call (and, ideally, per counter-party per time window), and
+        deep-confirm every parcel of a payment whose total crosses it.
+        """
+        net = Network()
+        c = net.create_constellation("c", 4)
+        m, b = Wallet("m", net, c), Wallet("b", net, c, deep_threshold=1000)
+        u = m.issue("USD", 10_000)
+        addrs = [b.address() for _ in range(10)]
+        refs, total = m.select(u, 9990)
+        outs = [model.parcel(c, u, 999, a["lock"], a["salt"]) for a in addrs]
+        ch = m.address()
+        outs.append(model.parcel(c, u, total - 9990, ch["lock"], ch["salt"]))
+        tid = m.transact(refs, outs)
+        with mock.patch.object(Wallet, "deep_confirm") as dc:
+            b.receive(m.dossier.ancestry([tid]), [model.ref(tid, i) for i in range(10)])
+        self.assertEqual(b.balance(u), 9990)
+        self.assertGreater(dc.call_count, 0)
+
+
+class Finding5SwapHostage(unittest.TestCase):
+    @unittest.expectedFailure
+    def test_honest_party_recovers_after_counterparty_vanishes(self):
+        """BUG-5 (MEDIUM-HIGH, protocol: recovery / atomicity; hostage).
+
+        Scenario: in a two-party swap the parties exchange unlocks. A malicious
+        counter-party that receives the honest party's unlock submits *only the
+        honest input* to its home's witnesses (binding it to the swap's tid) and
+        then never signs or submits its own input, and never spends it elsewhere.
+        The swap can never complete, but no death proof exists either: a death
+        proof needs another input of the swap sealed to a different transition at
+        its generation, or a quorum of votes for one (SPEC Section 3.9), and only
+        the counter-party can create that. Expiry does not help: it only stops a
+        witness from *newly* binding (SPEC Section 5.1); the honest input is
+        already bound and stays bound. ``Wallet.abort`` raises "no proof that the
+        transition is dead", and the honest coin is locked for as long as the
+        counter-party likes (a free option or ransom). No equivocation, no
+        Byzantine witness and no network fault are needed.
+
+        This contradicts the whitepaper Section 7 table ("A dishonest owner ...
+        cannot hurt anyone else; honest co-signers recover through release") and
+        is distinct from the Section 10.7 "pathological split", which needs
+        equivocation plus unreachable witnesses.
+
+        Suggested fix (protocol): each party adds a small *kill-switch* input it
+        controls to the swap and withholds that input's unlock until it sees the
+        other side's inputs bound; if the counter-party stalls, it spends the
+        kill switch elsewhere at the swap's generation, which yields the death
+        proof. Wallets should build swaps this way by default (``sigil/swap.py``
+        currently signs both sides in one process, which hides the issue).
+        Alternatively, never hand over an unlock before holding the other side's.
+        """
+        net = Network()
+        c = net.create_constellation("c", 4)
+        alice, mallory = Wallet("a", net, c), Wallet("m", net, c)
+        ua = alice.issue("A", 100)
+        um = mallory.issue("M", 100)
+        header, body, _terms = propose_swap(alice, ua, 100, mallory, um, 100)
+        unlocks = alice.authorise(header, body)      # alice hands her unlock over
+        r0 = body["inputs"][0]
+        p0 = alice.dossier.output(r0)
+        s0 = model.sigil_of(p0)
+        req = {"sigil": s0, "header": header, "home": c, "lock": p0["lock"],
+               "salt": p0["salt"], "unlock": unlocks[s0]}
+        for w in net.witnesses(c):                   # mallory binds only alice's input
+            w.spend(req)
+        net.clock.advance(10_000)                    # long past every expiry
+        released = alice.abort(header)               # raises today: no death proof
+        self.assertIn(s0, released)
+
+
+class Finding6BondSelfClaim(unittest.TestCase):
+    @unittest.expectedFailure
+    def test_equivocator_cannot_recover_its_own_bond(self):
+        """BUG-6 (HIGH, economics: slashing is void against the cheater).
+
+        Scenario: a witness bond is a parcel locked
+        ``any(all(sig(operator), after(unbond)), equivocation(witness))``
+        (whitepaper Section 7, SPEC Section 9 "Bond homes"): whoever holds an
+        equivocation proof claims it. The party that holds that proof *first* is
+        the equivocator itself; it signed both votes. So the operator equivocates
+        and, in the same breath, spends its own bond to an address it controls
+        through the equivocation branch. The witnesses of the bond's home vote
+        for the first valid request they see; honest behaviour gives the
+        cheater the bond back. Here the claim is sealed by the bond home's
+        honest quorum.
+
+        A related issue: the equivocation branch is not bound to the claimant
+        (only ``sig``/``multi`` leaves sign the tid), so any party who sees a
+        bounty claim in flight, including the bond home's witnesses, who see
+        lock, salt and unlock in the SPEND request, can race it with its own
+        transition. This contradicts the whitepaper's "witnesses can't front-run
+        what they can't read": for non-signature branches they can read it.
+
+        Impact: the only economic penalty in the protocol does not penalise; an
+        operator coordinating a double spend at or above f can recover its
+        bonds. The lock language cannot constrain outputs (no covenants), so the
+        claimant always chooses where the bond goes.
+
+        Suggested fix: never let the slashing branch be satisfied by the proof
+        alone. Require a co-signature from parties independent of the operator,
+        e.g. ``all(equivocation(w), multi(k, auditors))`` or a victims' / burn
+        committee key, and give the operator branch a delay longer than the time
+        to publish a proof. Longer term, a holder-checked covenant on the
+        slashing branch (outputs must burn or pay a fixed pool).
+        """
+        net = Network()
+        c = net.create_constellation("c", 4)
+        bonds = net.create_constellation("bonds", 4)
+        operator = Wallet("op", net, bonds)
+        usd = operator.issue("USD", 1000)
+        witness = net.witnesses(c)[0]                # run by the same operator
+        okey = operator.fresh_key()
+        bond_lock = locks.any_of(
+            locks.all_of(locks.sig(okey.pk), locks.after(int(net.clock()) + 10 ** 8)),
+            locks.equivocation(witness.pk))
+        refs, outs = operator.payment_outputs(usd, 500, {"home": bonds, "lock": bond_lock,
+                                                         "salt": "ab" * 16})
+        btid = operator.transact(refs, outs)
+        # The operator's witness equivocates, so the operator holds the proof first.
+        proof = {"a": witness._vote("ff" * 32, 0, "aa" * 32),
+                 "b": witness._vote("ff" * 32, 0, "bb" * 32)}
+        r = model.ref(btid, 0)
+        p = operator.dossier.output(r)
+        s = model.sigil_of(p)
+        dest = operator.address()
+        header, body, _ = operator.prepare(
+            [r], [model.parcel(bonds, usd, 500, dest["lock"], dest["salt"])], gens={s: 0})
+        unlock = locks.empty_unlock(int(net.clock()) + 600)
+        unlock["equivocations"] = [proof]
+        with self.assertRaises(SealFailed):          # today: sealed, cheater keeps its bond
+            operator.seal(header, body, {s: unlock})
 
 
 class _LyingWitness(Witness):
