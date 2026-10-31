@@ -22,7 +22,7 @@ from .charter import Registry, charter_hash, sign_charter
 from .crypto import KeyPair
 from .locks import evaluate
 from .model import sigil_of, transition_id, vote_payload
-from .proofs import proves_dead, verify_vote
+from .proofs import proves_dead, verify_seal, verify_vote
 from .stamps import StampMint
 from .store import WitnessStore
 
@@ -234,7 +234,8 @@ class Witness:
 
     def _release_contested(self, sigil: str, rec: Record, proof: dict) -> int:
         killed = [c for c in rec.candidates if proves_dead(c[2], c[1], proof, self.registry)]
-        if not killed:
+        sealed = self._sealed_candidate(sigil, rec, proof, killed)
+        if not killed and sealed is None:
             raise Rejected("invalid death proof")
         rec = rec.copy()
         for g, t, h in killed:
@@ -243,13 +244,44 @@ class Witness:
         # We never vote while contested, so the generation can rise as each
         # candidate dies; once none is left we sit past all of them, unbound.
         rec.gen = max([rec.gen] + [g + 1 for g, _, _ in killed])
-        if not rec.candidates:
+        if sealed is not None:
+            # The one candidate left is sealed at its generation (by any version
+            # of our home), so no other tid can ever be sealed there (SPEC §8
+            # Lemma 1): bind to it. Voting it again creates no second seal.
+            g, t, h = sealed
+            rec.log.append({"kind": "seal", "gen": g, "tid": t, "seal": proof["seal"]})
+            rec.gen, rec.tid, rec.header, rec.candidates = g, t, h, []
+            rec.abstain = any(v["gen"] == g and v["tid"] != t for v in rec.votes)
+        elif not rec.candidates:
             rec.tid = None
             if rec.votes:  # a re-used key skips every generation it voted at (abstention)
                 rec.gen = max(rec.gen, max(v["gen"] for v in rec.votes) + 1)
         self._persist(self._rec(sigil, rec))
         self.records[sigil] = rec
         return rec.gen
+
+    def _sealed_candidate(self, sigil: str, rec: Record, proof: dict, killed: list):
+        """The candidate ``proof`` shows sealed, if it would be the only one left.
+
+        Only when nothing at a higher generation has been passed over
+        (``gen <= g + 1`` once the killed candidates are counted): binding
+        back to ``g`` must not re-open a generation another candidate held.
+        """
+        try:
+            if proof.get("kind") != "seal":
+                return None
+            seal = proof["seal"]
+            left = [c for c in rec.candidates if c not in killed]
+            if len(left) != 1:
+                return None
+            g, t, h = left[0]
+            top = max([rec.gen] + [kg + 1 for kg, _, _ in killed])
+            ok = (seal["sigil"] == sigil and seal["gen"] == g and seal["tid"] == t
+                  and seal["constellation"] == self.cid and top <= g + 1
+                  and verify_seal(seal, self.registry))
+            return left[0] if ok else None
+        except (KeyError, TypeError, AttributeError):
+            return None
 
     # ----------------------------------------------------------------- query
 
@@ -295,17 +327,24 @@ class Witness:
         Only verifiable evidence is accepted: bindings must carry a valid
         owner authorisation and releases a valid death proof, so a lying
         predecessor can omit evidence (covered by the union) but never
-        invent it.
+        invent it. Snapshots arrive from untrusted predecessors (over the
+        wire, ``/v0/adopt``), so malformed parts are skipped like any other
+        unverifiable evidence: a snapshot that is not an object, a log that
+        is not a list, and log entries that are not objects.
         """
         self._check_member(cid, version)
         records: dict[str, Record] = {}
         evidence: dict[str, list] = {}
         for snap in snapshots:
+            if not isinstance(snap, dict):
+                continue
             for sigil, log in snap.items():
-                evidence.setdefault(sigil, []).extend(log)
+                if isinstance(log, list):
+                    evidence.setdefault(sigil, []).extend(e for e in log if isinstance(e, dict))
         for sigil, log in evidence.items():
             binds: dict[tuple, dict] = {}   # (gen, tid) -> header
             dead: set[str] = set()          # tids proven unsealable
+            sealed: set[tuple] = set()      # (gen, tid) with a verified seal in the evidence
             floor = 0                       # lowest generation still usable
             prior = self.records.get(sigil)
             own = {(v["gen"], v["tid"]): v for v in (prior.votes if prior else [])}  # votes our key cast
@@ -319,9 +358,20 @@ class Witness:
                     except (KeyError, TypeError):
                         pass
                 elif e.get("kind") == "bind":
-                    b = authorises(sigil, e.get("auth", {}))
+                    try:
+                        b = authorises(sigil, e.get("auth", {}))
+                    except AttributeError:  # a non-object unlock: never bound by an honest witness
+                        b = None
                     if b is not None:
                         binds[b] = e["auth"]["header"]
+                elif e.get("kind") == "seal":
+                    sl = e.get("seal")
+                    try:
+                        if (sl["sigil"] == sigil and sl["constellation"] == cid
+                                and verify_seal(sl, self.registry)):
+                            sealed.add((sl["gen"], sl["tid"]))
+                    except (KeyError, TypeError):
+                        pass
                 elif e.get("kind") == "release":
                     h, t = e.get("header"), e.get("tid")
                     try:
@@ -340,7 +390,11 @@ class Witness:
             # a lone live binding is inherited only if it had no sibling at its
             # generation, dead or alive: re-binding a sibling of a sealed-then-
             # released binding would let us seal a second tid at that generation.
-            lone = len(alive) == 1 and sum(1 for (g, _) in binds if g == next(iter(alive))[0]) == 1
+            # A verified seal settles its generation (SPEC §8 Lemma 1), as long as
+            # inheriting it does not step back over a later generation.
+            lone = len(alive) == 1 and (
+                sum(1 for (g, _) in binds if g == next(iter(alive))[0]) == 1
+                or (next(iter(alive)) in sealed and floor <= next(iter(alive))[0] + 1))
             if lone:
                 ((g, t), h), = alive.items()
                 rec.gen, rec.tid, rec.header = g, t, h

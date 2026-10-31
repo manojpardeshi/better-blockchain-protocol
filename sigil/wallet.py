@@ -10,14 +10,14 @@ import time
 from collections import defaultdict
 
 from . import locks, model
-from .charter import faults, quorum
+from .charter import faults
 from .crypto import KeyPair
 from .locks import keys_in, sign_unlock
 from .network import Network
 from .proofs import proves_dead, verify_seal, verify_vote
 from .stamps import buy_stamp
 from .validate import Dossier, InvalidDossier, TrustPolicy, Verifier
-from .witness import Conflict, Rejected
+from .witness import CONTESTED, Conflict, Rejected
 
 
 class SealFailed(Exception):
@@ -100,7 +100,7 @@ def _status(w, sigil: str) -> dict | None:
 class Wallet:
     def __init__(self, name: str, network: Network, home: str | None = None, *, trusted=None,
                  deep_threshold: int | None = None, clock=None, pledge_ttl: int = 600,
-                 max_skew: int = 120):
+                 max_skew: int = 120, on_pledge=None):
         self.name = name
         # Our clock bounds every authorisation we sign: a witness never newly
         # binds a sigil after ``expires`` by its own clock (SPEC §5.1), so
@@ -113,6 +113,12 @@ class Wallet:
         self._confirmed: set[tuple] = set()   # (sigil, gen, tid) already deep-confirmed
         self.network = network
         self.home = home
+        # Trust is the owner's choice, never a payer's: by default the wallet
+        # trusts its home plus the constellations its network was configured
+        # with *now*. Charters a received dossier introduces later are learned
+        # (to verify seals) but never trusted unless the owner calls ``trust``.
+        if trusted is None:
+            trusted = set(network.registry.ids()) | ({home} if home else set())
         self.policy = TrustPolicy(network.registry, trusted)
         self.verifier = Verifier(self.policy)
         self.keys: dict[str, KeyPair] = {}
@@ -120,10 +126,20 @@ class Wallet:
         self.dossier = Dossier()
         self.holdings: dict[str, dict] = {}   # parcel id -> {"ref", "parcel", "sigil", "gen"}
         self.pledged: dict[str, tuple] = {}   # sigil -> (gen, tid, expires) we authorised; never sign twice
+        self.pending: dict[str, dict] = {}    # tid -> {"header", "body", "extra"} authorised, not yet final
+        self.completed: list = []             # tids completed by a retry: hand their dossiers to the payees
+        self.issued: set[str] = set()         # sigils of addresses we handed out: the only ones we accept
+        # Called after every authorisation, before any witness sees it: save the
+        # wallet here so a crash can never forget a pledge (wallet_store.save).
+        self.on_pledge = on_pledge
         self.stamps: dict[str, list] = defaultdict(list)
 
     def __repr__(self):
         return f"Wallet({self.name})"
+
+    def trust(self, cid: str) -> None:
+        """Trust another constellation (the owner's decision)."""
+        self.policy.trust(cid)
 
     def _size(self, cid: str) -> int:
         """Members of a constellation's current charter (not just those reachable)."""
@@ -142,7 +158,9 @@ class Wallet:
     def address(self, home: str | None = None, lock: dict | None = None) -> dict:
         """A one-time receiving address: where the parcel lives and how it unlocks."""
         home = home or self.home
-        return {"home": home, "lock": lock or locks.sig(self.fresh_key().pk), "salt": secrets.token_hex(16)}
+        a = {"home": home, "lock": lock or locks.sig(self.fresh_key().pk), "salt": secrets.token_hex(16)}
+        self.issued.add(model.sigil_of(a))
+        return a
 
     def receive(self, dossier: Dossier, refs: list, *, deep: bool | None = None) -> list:
         """Verify incoming parcels end-to-end and take custody of them.
@@ -157,14 +175,19 @@ class Wallet:
                 self.deep_confirm(dossier, [r["tx"]])
             if not self.policy.trusts(p["home"]):
                 raise InvalidDossier("parcel lives in a constellation we do not trust")
-            if not keys_in(p["lock"]) & set(self.keys):
-                raise InvalidDossier("parcel is not addressed to us")
             s = model.sigil_of(p)
+            # Only an address we issued, exactly (home, lock and salt): a lock
+            # that merely mentions our key may still be spendable by the payer.
+            if s not in self.issued:
+                raise InvalidDossier("parcel is not addressed to us")
+            if any(h["sigil"] == s for h in self.holdings.values()):
+                raise InvalidDossier("address already used: one sigil can only ever be spent once")
             bound = sum(1 for w in self.network.witnesses(p["home"])
                         if (_status(w, s) or {}).get("tid") is not None)
             if bound > faults(self._size(p["home"])):
                 raise InvalidDossier("parcel's sigil is already consumed")
-            self.dossier.merge(dossier)
+            # Only the verified ancestry, and never over entries we already hold.
+            self.dossier.merge(dossier.ancestry([r["tx"]]))
             self.holdings[model.parcel_id(r)] = {"ref": r, "parcel": p, "sigil": s, "gen": 0}
             received.append(p)
         return received
@@ -190,11 +213,24 @@ class Wallet:
                 if members is None:
                     raise InvalidDossier(f"unknown constellation {home[:12]}")
                 current = set(members["witnesses"])
+                p = dossier.output(r)
+                seal = dossier.seals.get(model.seal_key(s, tid))
+                heal = None if seal is None else {
+                    "kind": "seal", "sigil": s, "gen": g, "seal": seal,
+                    "parcel": {"home": p["home"], "lock": p["lock"], "salt": p["salt"]}}
                 ok = 0
                 for w in self.network.witnesses(home):
                     if w.pk not in current:
                         continue
                     st = _status(w, s)
+                    if st is not None and st["tid"] == CONTESTED and heal is not None:
+                        # After a rotation the evidence may not show which sibling
+                        # was sealed; the seal we hold settles it (SPEC §5.2).
+                        try:
+                            w.release(s, heal)
+                        except Rejected:
+                            pass
+                        st = _status(w, s)
                     if st is None:
                         continue
                     if st["gen"] == g and st["tid"] == tid:
@@ -206,7 +242,7 @@ class Wallet:
     def watch(self, dossier: Dossier, r: dict) -> dict:
         """Track a parcel we may be able to unlock under some condition (e.g. a bond)."""
         p = self.verifier.verify_parcel(dossier, r)
-        self.dossier.merge(dossier)
+        self.dossier.merge(dossier.ancestry([r["tx"]]))
         self.holdings[model.parcel_id(r)] = {"ref": r, "parcel": p, "sigil": model.sigil_of(p), "gen": 0}
         return p
 
@@ -250,10 +286,43 @@ class Wallet:
     # --------------------------------------------------------------- spending
 
     def release_expired_pledges(self) -> list:
-        """Drop every pledge that has expired and provably bound nothing."""
+        """Settle every expired pledge; returns the sigils that are free again.
+
+        A pledge that provably bound nothing is dropped (SPEC §4 rule 3).
+        Otherwise its transition may be partly bound, so we finish it: retry
+        it with a fresh authorisation of the *same* tid (rule 1), or, if it
+        can never complete, abort it with a death proof (rule 2).
+        """
         now = int(self.clock())
-        return [s for s, (_g, _t, exp) in list(self.pledged.items())
-                if now > exp + self.max_skew and self.unpledge_if_unbound(s)]
+        freed = []
+        for s, (_g, tid, exp) in list(self.pledged.items()):
+            if s not in self.pledged or now <= exp + self.max_skew:
+                continue
+            if self.unpledge_if_unbound(s):
+                self.pending.pop(tid, None)
+                freed.append(s)
+            elif tid in self.pending:
+                self._settle(tid)
+                if s not in self.pledged:
+                    freed.append(s)
+        return freed
+
+    def _settle(self, tid: str) -> None:
+        """Complete a pending transition, or abort it if it is provably dead."""
+        p = self.pending[tid]
+        header, body = p["header"], p["body"]
+        try:
+            self.abort(header)
+            return
+        except ValueError:
+            pass  # not provably dead: try to complete it
+        unlocks = self.authorise(header, body, p.get("extra"))
+        try:
+            self.seal(header, body, unlocks)
+        except SealFailed:
+            return  # still in limbo; a later call tries again
+        self.finalise(header, body, unlocks)
+        self.completed.append(tid)
 
     def select(self, asset: str, amount: int) -> tuple[list, int]:
         self.release_expired_pledges()
@@ -299,19 +368,37 @@ class Wallet:
         Each authorisation expires ``pledge_ttl`` seconds from now: no
         witness will newly bind the sigil for it after that. Re-authorising
         the same transition is allowed and extends the expiry.
+
+        We sign only what we have checked: the header commits to ``body``,
+        every input we hold sits at its own position with its own sigil and
+        our current generation, and no other live pledge or binding exists.
         """
         tid = model.transition_id(header)
+        if (not isinstance(header.get("inputs"), list) or not isinstance(body.get("inputs"), list)
+                or header.get("body") != model.body_hash(body)
+                or len(header["inputs"]) != len(body["inputs"])):
+            raise ValueError("header does not commit to this body")
         expires = int(self.clock()) + self.pledge_ttl
-        unlocks = {}
+        ours = []
         for r, (s, g) in zip(body["inputs"], header["inputs"]):
             h = self.holdings.get(model.parcel_id(r))
             if h is None:
                 continue
+            if [s, g] != [h["sigil"], h["gen"]]:
+                raise ValueError("header names our input with the wrong sigil or generation")
             prior = self.pledged.get(s)
-            if prior is not None and prior[0] == g and prior[1] != tid and self.unpledge_if_unbound(s):
+            if prior is not None and prior[1] != tid and self.unpledge_if_unbound(s):
                 prior = None  # the earlier pledge expired and provably bound nothing
-            if prior is not None and prior[0] == g and prior[1] != tid:
+            if prior is not None and prior[1] != tid:
                 raise ValueError("refusing to equivocate: sigil already pledged")
+            if prior is None and self._bound_elsewhere(h, tid):
+                # A pledge we lost (e.g. a crash before it was saved): some
+                # member already holds a binding or vote at this generation.
+                raise ValueError("refusing to equivocate: sigil is already bound to another transition")
+            ours.append((r, s, g, h))
+        unlocks = {}
+        for r, s, g, h in ours:
+            prior = self.pledged.get(s)
             u = locks.empty_unlock(expires)
             for pk in keys_in(h["parcel"]["lock"]) & set(self.keys):
                 u["sigs"][pk] = sign_unlock(self.keys[pk], s, tid, expires)
@@ -320,7 +407,23 @@ class Wallet:
             # the pledge lasts until the latest one we ever signed expires.
             keep = prior[2] if prior is not None and prior[:2] == (g, tid) else expires
             self.pledged[s] = (g, tid, max(keep, expires))
+        if ours:
+            self.pending[tid] = {"header": header, "body": body, "extra": extra}
+            if self.on_pledge is not None:
+                self.on_pledge(self)
         return unlocks
+
+    def _bound_elsewhere(self, h: dict, tid: str) -> bool:
+        """Does any member of the home report a binding or vote at our generation for another tid?"""
+        s, g = h["sigil"], h["gen"]
+        for w in self.network.witnesses(h["parcel"]["home"]):
+            st = _status(w, s)
+            if st is None:
+                continue
+            if (st["gen"] == g and st["tid"] not in (None, tid)) or any(
+                    v["gen"] == g and v["tid"] != tid for v in st["votes"]):
+                return True
+        return False
 
     def seal(self, header: dict, body: dict, unlocks: dict) -> list:
         tid = model.transition_id(header)
@@ -337,12 +440,13 @@ class Wallet:
     def finalise(self, header: dict, body: dict, unlocks: dict) -> str:
         """Record a sealed transition and update holdings."""
         tid = self.dossier.add_transition(header, body, unlocks)
+        self.pending.pop(tid, None)
         homes = {o["home"] for o in body["outputs"]} | {self.dossier.output(r)["home"] for r in body["inputs"]}
         self.dossier.add_charters(self.network.registry, homes)
         for r in body["inputs"]:
             self.holdings.pop(model.parcel_id(r), None)
         for i, o in enumerate(body["outputs"]):
-            if keys_in(o["lock"]) & set(self.keys):
+            if model.sigil_of(o) in self.issued:
                 r = model.ref(tid, i)
                 p = self.dossier.output(r)
                 self.holdings[model.parcel_id(r)] = {"ref": r, "parcel": p, "sigil": model.sigil_of(p), "gen": 0}
@@ -397,22 +501,24 @@ class Wallet:
         proof = find_death_proof(self.network, header, tid, self._parcels_for(header))
         if proof is None:
             raise ValueError("no proof that the transition is dead")
+        # A verified death proof means ``tid`` can never be sealed (SPEC §8
+        # Lemma 2), so our inputs are free at the next generation now; the
+        # witnesses still bound to ``tid`` are released with the same proof.
         released = []
         for h in self.holdings.values():
             s = h["sigil"]
-            if self.pledged.get(s, (None, None))[1] != tid:
+            pledge = self.pledged.get(s)
+            if pledge is None or pledge[1] != tid:
                 continue
-            home = h["parcel"]["home"]
-            gens = []
-            for w in self.network.witnesses(home):
+            for w in self.network.witnesses(h["parcel"]["home"]):
                 try:
-                    gens.append(w.release(s, proof))
+                    w.release(s, proof)
                 except Rejected:
-                    pass
-            if len(gens) >= quorum(self._size(home)):
-                h["gen"] = max(gens)
-                del self.pledged[s]
-                released.append(s)
+                    pass  # not bound to tid (or unreachable): it accepts g + 1 anyway
+            h["gen"] = pledge[0] + 1
+            del self.pledged[s]
+            released.append(s)
+        self.pending.pop(tid, None)
         return released
 
     def _parcels_for(self, header: dict) -> dict:

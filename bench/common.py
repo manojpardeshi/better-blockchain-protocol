@@ -98,10 +98,48 @@ class Cluster:
             })
         return cid
 
-    def directory(self) -> dict:
+    def add_members(self, cid: str, kinds: list, extra_args: dict | None = None, keys: list | None = None) -> list:
+        """New witness processes for a later charter version of ``cid``, started with ``--adopt``.
+
+        ``keys[i]`` re-uses an existing key file (a re-used key gets a fresh store, as with
+        ``Network.rotate``); ``None`` makes a new key. Returns the new witnesses' indices.
+        """
+        out = []
+        for i, kind in enumerate(kinds):
+            n = len(self.witnesses)
+            key = (keys or [None] * len(kinds))[i]
+            if key is None:
+                key = os.path.join(self.dir, "keys", f"member-{n}.json")
+                witnessd("keygen", "--out", key)
+            ext = "redb" if kind == "rust" else "db"
+            self.witnesses.append({
+                "name": f"member-{n}", "cid": cid, "key": key, "kind": kind, "pending": True,
+                "store": os.path.join(self.dir, "data", f"member-{n}.{ext}"),
+                "log": os.path.join(self.dir, "logs", f"member-{n}.log"),
+                "port": free_port(self.host), "args": ["--adopt", *(extra_args or {}).get(kind, [])],
+            })
+            out.append(n)
+        return out
+
+    def write_chain(self, cid: str, chain: list) -> None:
+        """Record a longer charter chain in the registry file (what an operator does after a rotation)."""
+        with open(self.registry) as f:
+            reg = json.load(f)
+        reg[cid] = chain
+        tmp = self.registry + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(reg, f)
+        os.replace(tmp, self.registry)
+
+    def indices(self, cid: str, pending: bool = False) -> list:
+        return [i for i, w in enumerate(self.witnesses) if w["cid"] == cid and w.get("pending", False) == pending]
+
+    def directory(self, cids: list | None = None) -> dict:
+        """``{cid: [url, …]}`` of the founding members (members added for a rotation are left out)."""
         out: dict = {}
-        for w in self.witnesses:
-            out.setdefault(w["cid"], []).append(self.url(self.witnesses.index(w)))
+        for i, w in enumerate(self.witnesses):
+            if (cids is None or w["cid"] in cids) and not w.get("pending"):
+                out.setdefault(w["cid"], []).append(self.url(i))
         return out
 
     def url(self, i: int) -> str:
@@ -136,10 +174,11 @@ class Cluster:
                 raise TimeoutError(f"{self.witnesses[i]['name']} did not come up")
             time.sleep(0.02)
 
-    def start_all(self) -> None:
-        for i in range(len(self.witnesses)):
+    def start_all(self, only: list | None = None) -> None:
+        idx = list(range(len(self.witnesses))) if only is None else list(only)
+        for i in idx:
             self.start(i)
-        for i in range(len(self.witnesses)):
+        for i in idx:
             self.wait_ready(i)
 
     def kill(self, i: int, sig: int = signal.SIGKILL) -> None:

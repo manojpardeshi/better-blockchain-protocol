@@ -17,6 +17,9 @@ redb = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time", "io-util"] }
 axum = { version = "0.7", default-features = false, features = ["http1", "tokio"] }
 clap = { version = "4", features = ["derive"] }
+num-bigint-dig = { version = "0.8", default-features = false, features = ["std", "u64_digit", "prime", "rand"] }
+num-traits = "0.2"
+num-integer = "0.1"
 
 [profile.release]
 debug = false

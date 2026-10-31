@@ -13,12 +13,14 @@
 #     constellations. This is the real safety result.
 #   * TLC exhaustively checks the bounded models (the original witness model,
 #     the proof's own non-vacuity instance, charter rotation, owner-signed
-#     expiry and deep confirmation) on small instances, with mutation tests.
+#     expiry, deep confirmation and the wallet state machine) on small
+#     instances, with mutation tests.
 #
 # Module per config:
 #   MC_multi*  -> MC_multi.tla      MC_proofs* -> MC_proofs.tla (needs TLAPS libs)
 #   MC_rot*    -> MC_rot.tla        MC_expiry* -> SigilExpiry.tla
-#   MC_deep*   -> SigilDeep.tla     everything else -> MC.tla
+#   MC_deep*   -> SigilDeep.tla     MC_wallet* -> MC_wallet.tla (SigilWallet)
+#   everything else -> MC.tla
 #
 # Configs named *mutant* or *witness* are EXPECTED to report an invariant
 # violation; all others must pass. Exit status is non-zero if any expectation
@@ -110,9 +112,13 @@ else
     CONFIGS=(MC.cfg MC_all.cfg MC_lazy.cfg MC_mutant.cfg
              MC_multi.cfg MC_multi_all.cfg MC_multi_mutant.cfg
              MC_proofs_witness.cfg MC_proofs_witness2.cfg
-             MC_rot.cfg MC_rot_mutant.cfg MC_rot_sibling.cfg MC_rot_sibling4.cfg MC_rot_sibling_witness.cfg MC_rot_sibling_witness2.cfg
+             MC_rot.cfg MC_rot_mutant.cfg MC_rot_sibling.cfg MC_rot_sibling4.cfg MC_rot_sibling_witness.cfg MC_rot_sibling_witness2.cfg MC_rot_sibling_witness3.cfg
              MC_expiry.cfg MC_expiry_mutant.cfg MC_expiry_skew_mutant.cfg
              MC_deep.cfg MC_deep_mutant.cfg
+             MC_wallet.cfg MC_wallet_live.cfg MC_wallet_code.cfg
+             MC_wallet_gen_mutant.cfg MC_wallet_pending_mutant.cfg MC_wallet_abort_mutant.cfg
+             MC_wallet_crash_mutant.cfg MC_wallet_expiry_mutant.cfg MC_wallet_status_mutant.cfg
+             MC_wallet_noproof_mutant.cfg MC_wallet_witness.cfg MC_wallet_witness2.cfg
              ${SIGIL_TLC_EXTRA:-})
 fi
 
@@ -123,6 +129,7 @@ module_for() {   # map a config name to its TLA module
         MC_rot*)    echo MC_rot.tla ;;
         MC_expiry*) echo SigilExpiry.tla ;;
         MC_deep*)   echo SigilDeep.tla ;;
+        MC_wallet*) echo MC_wallet.tla ;;
         *)          echo MC.tla ;;
     esac
 }
@@ -155,7 +162,9 @@ for cfg in "${CONFIGS[@]}"; do
 
     case "$name" in
         *mutant*|*witness*)   # expected to find a counterexample
-            if [[ $rc -ne 0 ]] && grep -q "Invariant .* is violated" "$log"; then
+            # An invariant counterexample, or (for *_live / liveness mutants) a
+            # temporal-property counterexample.
+            if [[ $rc -ne 0 ]] && grep -qE "Invariant .* is violated|Temporal properties were violated" "$log"; then
                 echo ">>> $name: counterexample found as expected (${secs}s)"
             else
                 echo ">>> $name: FAIL - expected a violation, found none (rc=$rc)" >&2

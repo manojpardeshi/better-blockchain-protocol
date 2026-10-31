@@ -14,6 +14,11 @@ from .proofs import verify_equivocation
 
 MAX_DEPTH = 8
 MAX_NODES = 64
+# Equivocation proofs one unlock may carry. A well-formed lock has at most MAX_NODES nodes,
+# so it never needs more proofs than that; an unlock with more satisfies no lock. This bounds
+# the signature checks one evaluation can cost (3 per proof) far below what a 1 MiB body
+# could otherwise carry (about 1,400 proofs).
+MAX_EQUIVOCATIONS = 64
 
 
 def sig(pk: str) -> dict:
@@ -136,6 +141,8 @@ def evaluate(lock: dict, unlock: dict, sigil: str, tid: str, now: int | None) ->
         return x if isinstance(x, kind) else kind()
 
     sigs, preimages, equivocations = field("sigs", dict), field("preimages", dict), field("equivocations", list)
+    if len(equivocations) > MAX_EQUIVOCATIONS:
+        return False
 
     def has_sig(pk):
         s = sigs.get(pk)
