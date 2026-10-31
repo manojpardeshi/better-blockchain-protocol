@@ -455,7 +455,9 @@ class Interop:
         assert try_seal(Tg) is None
         release_all({"kind": "seal", "sigil": s, "gen": 0, "parcel": tgt(ps), "seal": seal_a})
         assert try_seal(Tg) is None, "s was consumed by Ta and again by Tg"
-        assert all(w.status(s)["tid"] == "!contested" for w in net.witnesses(X))
+        # Ta's seal settles the contested record: every member binds to Ta at gen 0 (SPEC §5.2).
+        ta = model.transition_id(Ta)
+        assert all((w.status(s)["gen"], w.status(s)["tid"]) == (0, ta) for w in net.witnesses(X))
 
     @check("stamps: Rust (+Python) witnesses sell blind stamps, redeem each once, remember across restarts")
     def stamps(self):

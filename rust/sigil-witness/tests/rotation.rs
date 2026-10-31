@@ -149,8 +149,8 @@ fn freeze_and_adopt_survive_restarts() {
     assert_eq!(cands, want);
     assert!(matches!(n.spend(&rb1).0, Err(Error::Conflict(None))), "contested: never votes");
 
-    // b1's seal proves b2 dead: one candidate goes, the generation rises past it, and the
-    // record stays contested (b1 may have been sealed).
+    // b1's seal proves b2 dead, and b1 is then the only candidate left and provably sealed:
+    // the record binds to b1 at generation 0 (SPEC §5.2), and the seal is logged.
     let seal = seal_from_votes(&b1_votes);
     let parcel = obj([
         ("home", Json::str(&w.cid)),
@@ -164,13 +164,15 @@ fn freeze_and_adopt_survive_restarts() {
         ("parcel", parcel),
         ("seal", seal),
     ]);
-    assert_eq!(ok(n.release(&Json::str(&sb), &proof), &n), Json::Int(1));
+    assert_eq!(ok(n.release(&Json::str(&sb), &proof), &n), Json::Int(0));
     close(n);
     let n = open(&p, "n0", &reg1, &w.cid, false);
     let rec = n.record(&sb).unwrap();
-    assert_eq!((rec.gen, rec.tid.as_deref(), rec.candidates.len()), (1, Some(CONTESTED), 1));
-    assert_eq!(rec.candidates[0].1, tb1);
+    assert_eq!((rec.gen, rec.tid.as_deref(), rec.candidates.len()), (0, Some(tb1.as_str()), 0));
+    assert!(rec.log.iter().any(|e| e.get("kind").and_then(Json::as_str) == Some("seal")));
+    // b1 is sealed, not dead: its own seal does not release it.
     assert_eq!(n.release(&Json::str(&sb), &proof).0, Err(Error::Rejected("invalid death proof".into())));
+    assert!(n.spend(&rb1).0.is_ok(), "bound to the sealed b1: voting it again creates no second seal");
     let st = ok(n.status(&Json::str(&sa)), &n);
     assert_eq!(st.get("votes").and_then(Json::as_arr).map(Vec::len), Some(1));
     close(n);

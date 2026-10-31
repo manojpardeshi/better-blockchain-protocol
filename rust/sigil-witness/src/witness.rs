@@ -23,7 +23,7 @@ use crate::gossip::{check_message, CowRegistry, GossipStore};
 use crate::json::{obj, Json};
 use crate::locks::evaluate;
 use crate::model::{sigil_of, transition_id, vote_payload};
-use crate::proofs::{proves_dead, verify_vote};
+use crate::proofs::{proves_dead, verify_seal, verify_vote};
 use crate::stamps::StampKey;
 use crate::store::{Entry, Loaded, Store};
 
@@ -488,6 +488,7 @@ impl Witness {
         };
         let sigil = sigil.as_str().expect("checked");
         let registry = self.registry();
+        let home = self.state.lock().expect("state lock").active().map(|(c, _)| c);
         // Verify against the snapshot, outside the lock, then re-check the record is unchanged.
         let contested = snapshot.tid.as_deref() == Some(CONTESTED);
         let killed: Vec<Candidate> = if contested {
@@ -501,7 +502,12 @@ impl Witness {
                 vec![]
             }
         };
-        if killed.is_empty() {
+        let sealed = if contested {
+            sealed_candidate(&snapshot, &killed, proof, sigil, home.as_deref(), &registry, self.batch_verify)
+        } else {
+            None
+        };
+        if killed.is_empty() && sealed.is_none() {
             return rejected("invalid death proof");
         }
         let mut st = self.state.lock().expect("state lock");
@@ -520,7 +526,24 @@ impl Witness {
             // We never vote while contested, so the generation can rise as each candidate
             // dies; once none is left we sit past all of them, unbound.
             rec.gen = killed.iter().map(|(g, _, _)| g + 1).fold(rec.gen, i128::max);
-            if rec.candidates.is_empty() {
+            if let Some((g, t, h)) = sealed {
+                // The one candidate left is sealed at its generation (by any version of our
+                // home), so no other tid can ever be sealed there (SPEC §8 Lemma 1): bind to
+                // it. Voting it again creates no second seal.
+                rec.log.push(obj([
+                    ("kind", "seal".into()),
+                    ("gen", Json::Int(g)),
+                    ("tid", Json::str(&t)),
+                    ("seal", proof.get("seal").cloned().unwrap_or(Json::Null)),
+                ]));
+                rec.abstain = rec.votes.iter().any(|v| {
+                    v.get("gen").and_then(Json::as_int) == Some(g) && v.get("tid").and_then(Json::as_str) != Some(t.as_str())
+                });
+                rec.gen = g;
+                rec.tid = Some(t);
+                rec.header = Some(h);
+                rec.candidates.clear();
+            } else if rec.candidates.is_empty() {
                 rec.tid = None;
                 // A re-used key skips every generation it voted at (abstention).
                 if let Some(top) = rec.votes.iter().filter_map(|v| v.get("gen").and_then(Json::as_int)).max() {
@@ -679,6 +702,7 @@ impl Witness {
             let sigil_j = Json::str(&sigil);
             let mut binds: OrderedMap<(i128, String), Json> = OrderedMap::new(); // (gen, tid) -> header
             let mut dead: HashSet<String> = HashSet::new(); // tids proven unsealable
+            let mut sealed: HashSet<(i128, String)> = HashSet::new(); // verified seals in the evidence
             let mut own: OrderedMap<(i128, String), Json> = OrderedMap::new(); // votes our key cast
             if let Some(prior) = st.records.get(&sigil) {
                 for v in &prior.votes {
@@ -705,6 +729,17 @@ impl Witness {
                             binds.insert(b, auth.get("header").cloned().unwrap_or(Json::Null));
                         }
                     }
+                    Some("seal") => {
+                        let Some(sl) = e.get("seal") else { continue };
+                        if sl.get("sigil").and_then(Json::as_str) == Some(sigil.as_str())
+                            && sl.get("constellation").and_then(Json::as_str) == Some(cid)
+                            && verify_seal(sl, &registry, &HashSet::new(), batch)
+                        {
+                            if let (Some(g), Some(t)) = (sl.get("gen").and_then(Json::as_int), sl.get("tid").and_then(Json::as_str)) {
+                                sealed.insert((g, t.to_string()));
+                            }
+                        }
+                    }
                     Some("release") => {
                         let null = Json::Null;
                         let h = e.get("header").unwrap_or(&null);
@@ -724,7 +759,11 @@ impl Witness {
             // Two tids bound at one generation mean the owner equivocated there, and the log
             // cannot show which one (if either) a quorum sealed. So a lone live binding is
             // inherited only if it had no sibling at its generation, dead or alive.
-            let lone = alive.len() == 1 && binds.items.iter().filter(|((g, _), _)| *g == alive[0].0 .0).count() == 1;
+            // A verified seal settles its generation (SPEC §8 Lemma 1), as long as inheriting it
+            // does not step back over a later generation.
+            let lone = alive.len() == 1
+                && (binds.items.iter().filter(|((g, _), _)| *g == alive[0].0 .0).count() == 1
+                    || (sealed.contains(&alive[0].0) && floor <= alive[0].0 .0 + 1));
             if lone {
                 let ((g, t), h) = alive[0];
                 rec.gen = *g;
@@ -798,6 +837,39 @@ impl Witness {
     pub fn record_count(&self) -> usize {
         self.state.lock().expect("state lock").records.len()
     }
+}
+
+/// The candidate `proof` shows sealed, if it would be the only one left (witness.py
+/// `_sealed_candidate`). Only when nothing at a higher generation has been passed over
+/// (`gen <= g + 1` once the killed candidates are counted): binding back to `g` must not
+/// re-open a generation another candidate held.
+fn sealed_candidate(
+    rec: &Record,
+    killed: &[Candidate],
+    proof: &Json,
+    sigil: &str,
+    home: Option<&str>,
+    registry: &Registry,
+    batch: bool,
+) -> Option<Candidate> {
+    if proof.get("kind").and_then(Json::as_str) != Some("seal") {
+        return None;
+    }
+    let seal = proof.get("seal")?;
+    let left: Vec<&Candidate> = rec.candidates.iter().filter(|c| !killed.contains(c)).collect();
+    if left.len() != 1 {
+        return None;
+    }
+    let (g, t, _) = left[0];
+    let top = killed.iter().map(|(kg, _, _)| kg + 1).fold(rec.gen, i128::max);
+    let ok = home.is_some()
+        && seal.get("sigil").and_then(Json::as_str) == Some(sigil)
+        && seal.get("gen").and_then(Json::as_int) == Some(*g)
+        && seal.get("tid").and_then(Json::as_str) == Some(t.as_str())
+        && seal.get("constellation").and_then(Json::as_str) == home
+        && top <= g + 1
+        && verify_seal(seal, registry, &HashSet::new(), batch);
+    ok.then(|| left[0].clone())
 }
 
 fn release_entry(gen: i128, tid: &str, header: Json, proof: &Json) -> Json {
