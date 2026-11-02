@@ -84,20 +84,31 @@ ensure_tlapm() {
     [[ -x "$TLAPM" ]]
 }
 
-# Only run the proof when invoked with no explicit config list.
+prove() {   # machine-check one TLAPS proof module
+    local mod="$1" name="${1%.tla}"
+    echo "=== TLAPS: $mod (unbounded proof) ==="
+    start=$(date +%s)
+    if (cd "$HERE" && "$TLAPM" -I "$STDLIB" --cache-dir "$WORK/tlapscache" \
+            --strict "$mod") >"$WORK/tlaps-$name.log" 2>&1; then
+        secs=$(( $(date +%s) - start ))
+        grep -E 'obligations' "$WORK/tlaps-$name.log" || true
+        echo ">>> $name: OK, all obligations proved (${secs}s)"
+    else
+        echo ">>> $name: FAIL - proof did not check" >&2
+        tail -40 "$WORK/tlaps-$name.log" >&2
+        status=1
+    fi
+}
+
+# Only run the proofs when invoked with no explicit config list. The rotation
+# proof (SigilRotProofs.tla, ~3,500 obligations) and its TLC instances are long,
+# so they are opt-in: SIGIL_ROT_PROOF=1 runs both instead of the default TLC
+# configs (CI runs it in its own job).
 if [[ $# -eq 0 && "${SIGIL_SKIP_TLAPS:-0}" != "1" ]]; then
-    echo "=== TLAPS: SigilProofs.tla (unbounded safety proof) ==="
     if [[ "$(uname -s)-$(uname -m)" == "Linux-x86_64" ]] && ensure_tlapm; then
-        start=$(date +%s)
-        if (cd "$HERE" && "$TLAPM" -I "$STDLIB" --cache-dir "$WORK/tlapscache" \
-                --strict SigilProofs.tla) >"$WORK/tlaps.log" 2>&1; then
-            secs=$(( $(date +%s) - start ))
-            grep -E 'obligations' "$WORK/tlaps.log" || true
-            echo ">>> SigilProofs: OK, all obligations proved (${secs}s)"
-        else
-            echo ">>> SigilProofs: FAIL - proof did not check" >&2
-            tail -40 "$WORK/tlaps.log" >&2
-            status=1
+        prove SigilProofs.tla
+        if [[ "${SIGIL_ROT_PROOF:-0}" == "1" ]]; then
+            prove SigilRotProofs.tla
         fi
     else
         echo ">>> TLAPS unavailable on this platform; skipping the proof" >&2
@@ -108,11 +119,17 @@ fi
 # ----------------------------------------------------------------- TLC configs
 if [[ $# -gt 0 ]]; then
     CONFIGS=("$@")
+elif [[ "${SIGIL_ROT_PROOF:-0}" == "1" ]]; then
+    # The rotation proof's TLC instances (slow; CI job rotation-proof).
+    CONFIGS=(MC_rotp.cfg MC_rotp_cex.cfg MC_rotp_noown_mutant.cfg MC_rotp_resolve_mutant.cfg
+             MC_rotp_sibling_mutant.cfg MC_rotp_top_mutant.cfg
+             MC_rotp_witness.cfg MC_rotp_witness_abstain.cfg MC_rotp_witness_crel.cfg
+             MC_rotp_witness_lone.cfg MC_rotp_witness_resolve.cfg)
 else
     CONFIGS=(MC.cfg MC_all.cfg MC_lazy.cfg MC_mutant.cfg
              MC_multi.cfg MC_multi_all.cfg MC_multi_mutant.cfg
              MC_proofs_witness.cfg MC_proofs_witness2.cfg
-             MC_rot.cfg MC_rot_mutant.cfg MC_rot_sibling.cfg MC_rot_sibling4.cfg MC_rot_sibling_witness.cfg MC_rot_sibling_witness2.cfg MC_rot_sibling_witness3.cfg MC_rot_sibling_cex.cfg MC_rot_sibling_top.cfg
+             MC_rot.cfg MC_rot_mutant.cfg MC_rot_sibling.cfg MC_rot_sibling4.cfg MC_rot_sibling_witness.cfg MC_rot_sibling_witness2.cfg MC_rot_sibling_witness3.cfg MC_rot_sibling_v1_mutant.cfg
              MC_expiry.cfg MC_expiry_mutant.cfg MC_expiry_skew_mutant.cfg
              MC_deep.cfg MC_deep_mutant.cfg
              MC_wallet.cfg MC_wallet_live.cfg MC_wallet_code.cfg
@@ -126,6 +143,8 @@ module_for() {   # map a config name to its TLA module
     case "$1" in
         MC_multi*)  echo MC_multi.tla ;;
         MC_proofs*) echo MC_proofs.tla ;;
+        MC_rotp_witness*) echo MC_rotpw.tla ;;
+        MC_rotp*)   echo MC_rotp.tla ;;
         MC_rot*)    echo MC_rot.tla ;;
         MC_expiry*) echo SigilExpiry.tla ;;
         MC_deep*)   echo SigilDeep.tla ;;
@@ -138,9 +157,9 @@ for cfg in "${CONFIGS[@]}"; do
     name="$(basename "$cfg" .cfg)"
     case "$cfg" in /*) cfgpath="$cfg" ;; *) cfgpath="$HERE/$cfg" ;; esac
     module="$(module_for "$name")"
-    # MC_proofs* extend the TLAPS standard library (FiniteSetTheorems, TLAPS).
+    # MC_proofs* and MC_rotp* extend the TLAPS standard library (FiniteSetTheorems, TLAPS).
     libarg=()
-    if [[ "$name" == MC_proofs* ]]; then
+    if [[ "$name" == MC_proofs* || "$name" == MC_rotp* ]]; then
         if [[ -d "$STDLIB" ]] || ensure_tlapm; then
             libarg=("-DTLA-Library=$STDLIB")
         else

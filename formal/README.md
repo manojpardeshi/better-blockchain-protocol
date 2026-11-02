@@ -97,3 +97,14 @@ With the fixed rule (`AnyConstellationProof = FALSE`), the proof in step 4 must 
 * `MC.cfg`, `MC_all.cfg`, `MC_lazy.cfg`, `MC_mutant.cfg`, `MC_multi.cfg`, `MC_multi_all.cfg`, `MC_multi_mutant.cfg`: TLC configurations.
 * `check.sh`: downloads TLC, runs the configs, and checks that the mutants fail and the others pass.
 * `SigilWallet.tla`, `MC_wallet.tla`, `MC_wallet*.cfg`: the honest wallet's state machine (authorise, failed seal, finalise, unpledge, abort, crash/restart) composed with the witness protocol of its home, a Byzantine witness and a swap counter-party. `MC_wallet`, `MC_wallet_live` (liveness) and `MC_wallet_code` must hold; the `*_mutant` configs reproduce the wallet bugs of docs/VERIFICATION.md §4b and three pure mutations; the `*_witness` configs are non-vacuity checks. `MC_wallet_big.cfg` is an opt-in larger instance (`SIGIL_TLC_EXTRA=MC_wallet_big.cfg`, about 5 min). Liveness counterexamples are accepted as expected violations by `check.sh`.
+
+## Rotation proof
+
+`SigilRotProofs.tla` is an unbounded TLAPS proof of safety under charter
+rotation (3,467 obligations; see docs/VERIFICATION.md §1b). It is long, so
+`check.sh` runs it, with its TLC instances instead of the default configs, only
+with `SIGIL_ROT_PROOF=1`; CI runs that in the `rotation-proof` job. `MC_rotp*.cfg` are
+TLC instances of the proved spec (`MC_rotp.tla`, and `MC_rotpw.tla` for the
+non-vacuity configs): the proved rule must hold, and each mutant (the rule
+without one of its conditions) must be caught.
+

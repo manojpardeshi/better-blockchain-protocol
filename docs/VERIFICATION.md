@@ -76,6 +76,51 @@ all-Byzantine constellation). It and `SigilProofs.tla` describe the same
 transition system; `MC_proofs.cfg` (below) cross-checks that the proof's own
 module is non-vacuous and that its invariant holds on reachable states.
 
+### 1b. Safety under charter rotation, unbounded (`formal/SigilRotProofs.tla`)
+
+`SigilRotProofs.tla` proves the same safety theorems **under charter rotation**,
+for any number of charter versions (keys may be re-used across versions),
+witnesses per version, sigils, transitions and generations: **3,467 proof
+obligations, all checked by tlapm 1.6.0-pre with `--strict`**, none omitted.
+Run it with `SIGIL_ROT_PROOF=1 formal/check.sh`, which also runs its TLC
+instances (CI job `rotation-proof`); it takes tens of minutes, so the default
+run skips both.
+
+* `SpecSafety`: no sigil is an input of two different complete transitions.
+* `SpecOneSealAcrossVersions`: at most one tid is sealed per (sigil, gen),
+  counting the seals of every version.
+* `SpecDeathProofsSound`: a death proof means the transition never completes.
+* `SpecHonestNoEquiv`: an honest key, re-used or not, never signs two tids for
+  one (sigil, gen), even across versions.
+
+What is modelled, per honest key: it runs in one version at a time and only
+moves forward; it may stay unfrozen in an old version (an ex-member that keeps
+voting), FREEZE there, and ADOPT any later version it is a member of. Per sigil
+it keeps the record of `sigil/witness.py` (gen, tid or NoTid or Contested,
+candidates, abstain, the log of bind/release/seal entries) and performs SPEND,
+RELEASE, the contested RELEASE, the seal-settled contested RELEASE (W9), FREEZE
+and ADOPT with own-vote abstention. ADOPT reads the union of the snapshots of
+the honest members of a freezing quorum of the previous version, plus what its
+Byzantine members may add (bind entries for any transition, release entries
+only with a valid death proof, seal entries only with a valid seal). Quorum
+intersection between every seal or against-quorum of a version and every
+freezing quorum of it is **proved**, not assumed. The ADOPT rule proved
+(`LoneOK`, `ResolveOK`) is exactly the one in `sigil/witness.py` and the Rust
+witness (§4, Bugs 3 and 4).
+
+Assumptions: each version's charter is finite and non-empty with `q = n − f`,
+`f = ⌊(n−1)/3⌋` and at most `f` Byzantine members (`VersionsFaultBounded`);
+idealised cryptography (only `w` creates votes carrying `w`); one home
+constellation whose charter chain is fixed (FREEZE binding one successor makes
+it the only verifiable chain). Not modelled: holder validation, expiry and
+time, the network, and wallets (see §2 and §3b for those).
+
+TLC instances of the proved spec (`MC_rotp*.cfg`) check that it is non-vacuous
+(recovery after rotation, abstention, contested release, lone inheritance and
+seal settlement are all reachable) and that each condition of the rule is
+needed: removing the own-vote condition, the seal-settlement condition or the
+`top <= g + 1` guard, or using the first sibling rule, is caught.
+
 ---
 
 ## 2. What is model-checked exhaustively (TLC)
@@ -95,8 +140,8 @@ from TLC 1.8.0 on 4 cores. All of these run from `formal/check.sh`.
 | `MC_rot_mutant` | `MC_rot.tla` | the **old** ADOPT (before the Bug 1 fix) | same | **violated (expected)** — reproduces the double-spend of §4, Bug 1 | ~4k (depth 10) |
 | `MC_rot_sibling` | `MC_rot.tla` | the **implemented** ADOPT (`AdoptMode = "sibling"`, SPEC §5.4 / `witness.py`): same-generation siblings make the sigil contested; contested release | same | hold | 77,392 |
 | `MC_rot_sibling4` | `MC_rot.tla` | as above, plus `Tg = {(s,1)}` (recovery spend at gen 1) | same + Tg | hold | 157,441 |
-| `MC_rot_sibling_cex` | `MC_rot.tla` | the first sibling rule (`AdoptMode = "sibling_v1"`) on an instance where a sealed generation lies above a lone binding | Ty, Tb, Tu, Tg | **violated (expected)**, Bugs 3/4 | — |
-| `MC_rot_sibling_top` | `MC_rot.tla` | the implemented rule (top of the evidence) on the same instance | Ty, Tb, Tu, Tg | hold | see check.sh |
+| `MC_rot_sibling_v1_mutant` | `MC_rot.tla` | the first sibling rule (`AdoptMode = "sibling_v1"`) on an instance where a sealed generation lies above a lone binding | Ty, Tb, Tu, Tg | **violated (expected)**, Bugs 3/4 | — |
+| `MC_rot_sibling_top` | `MC_rot.tla` | the implemented rule (top of the evidence) on the same instance | Ty, Tb, Tu, Tg | opt-in (`SIGIL_TLC_EXTRA`): the state space exceeds the CI budget; `MC_rotp_cex` checks this instance in the proved spec, and `SigilRotProofs.tla` proves the rule for every instance | — |
 | `MC_rot_sibling_witness`, `…_witness2`, `…_witness3` | `MC_rot.tla` | non-vacuity: Tg completes after rotation; a contested record is released; a contested record is settled by a seal | same + Tg | **violated (expected)** | — |
 | `MC_expiry` | `SigilExpiry.tla` | **owner-signed expiry** + the wallet unpledge rule: with drifting clocks and arbitrarily delayed requests, once the wallet drops a pledge the tid can never be sealed | n=4 q=3, skew 1, `max_skew` 2, time 0..7 | hold | 113,030 |
 | `MC_expiry_mutant`, `MC_expiry_skew_mutant` | `SigilExpiry.tla` | witness ignores expiry / wallet margin `max_skew < 2·skew` | same | **violated (expected)** | — |
@@ -324,7 +369,7 @@ is contested, and the contested release moves past every candidate and the
 key's own votes. A seal settles a contested record only under the same vote
 condition. Reproduced in `tests/test_conformance.py` `RotationOpenBugTests`
 (now regression tests), in the golden vectors (`rotation_top`, replayed by the
-Rust witness), and at the model level by `formal/MC_rot_sibling_cex.cfg`
+Rust witness), and at the model level by `formal/MC_rot_sibling_v1_mutant.cfg`
 (the first rule, violated); `MC_rot_sibling_top.cfg` checks the fixed rule on
 that instance. The bounded configs missed it because their instances had one
 transition per higher generation and no re-used honest key.
@@ -418,10 +463,9 @@ two protocol-level gaps remain (below).
 The results above concern the **witness protocol and its abstract model** under
 **idealised cryptography**. None of the following is verified:
 
-* **Rotation is only bounded-checked.** The proof covers a single charter
-  version. The implemented ADOPT is model-checked for two versions, two
-  sigils, up to four transitions and generations 0..1, with the freezing
-  quorum's logs modelled as the full honest union.
+* **Rotation is proved, but on an abstract model.** `SigilRotProofs.tla`
+  proves rotation safety for unbounded versions and sizes (§1b); the code is
+  linked to it by tests and golden vectors, not by a proof of the code itself.
 * **Wallet logic** is now model-checked on small instances (one parcel,
   ≤ 4 transitions, generations ≤ 2, `SigilWallet.tla`) and conformance-tested
   (§3b) — not proved for all sizes, and not composed with rotation (W9 was

@@ -210,7 +210,7 @@ HasSibling(s, b) == \E u \in Tids : u # b[2] /\ <<b[1], u>> \in binds[s]
 \* The implemented rule: a lone live binding is inherited only if it is the top
 \* of the evidence (every other binding, dead or alive, at a LOWER generation).
 \* "sibling_v1" is the first version of the fix, which only excluded siblings
-\* AT its generation; it re-opens a higher generation (MC_rot_sibling_cex.cfg).
+\* AT its generation; it re-opens a higher generation (MC_rot_sibling_v1_mutant.cfg).
 OnTop(s, b) ==
     IF AdoptMode = "sibling_v1" THEN ~HasSibling(s, b)
     ELSE \A c \in binds[s] : c = b \/ c[1] < b[1]

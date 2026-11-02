@@ -326,9 +326,10 @@ class ConformanceTests(unittest.TestCase):
 class RotationRegressionTests(unittest.TestCase):
     """Regressions for two rotation bugs the bounded explorer found.
 
-    The TLAPS proof (formal/SigilProofs.tla) models one charter version.
-    Rotation (SPEC 5.4) is model-checked in formal/SigilRot.tla, whose
-    "sibling" mode is the ADOPT implemented in sigil/witness.py.
+    The TLAPS proof formal/SigilProofs.tla models one charter version;
+    formal/SigilRotProofs.tla proves rotation (SPEC 5.4) safe, with the ADOPT
+    implemented in sigil/witness.py, for unbounded versions. Rotation is also
+    model-checked in formal/SigilRot.tla (its "sibling" mode).
     """
 
     def _scenario(self, sealed: str):
@@ -455,42 +456,34 @@ class RotationRegressionTests(unittest.TestCase):
 
 
 class RotationOpenBugTests(unittest.TestCase):
-    """OPEN bugs in ``sigil/witness.py :: Witness.adopt`` found while proving
-    rotation safety for unbounded versions (formal/SigilRotProofs.tla).
+    """Regression tests for two bugs in ``sigil/witness.py :: Witness.adopt``
+    (docs/VERIFICATION.md Bugs 3 and 4) found while proving rotation safety
+    for unbounded versions (formal/SigilRotProofs.tla). Both are FIXED; each
+    test failed against the first sibling rule and passes with the fix.
 
-    Both come from the same line: when the evidence holds exactly one live
-    binding ``(g, t)`` with no sibling at ``g``, ADOPT inherits it with
-    ``rec.gen = g`` and forgets that the evidence (or the adopter's own votes)
-    already reached HIGHER generations. Once ``t`` is released, RELEASE moves
+    Both came from the same line: when the evidence held exactly one live
+    binding ``(g, t)`` with no sibling at ``g``, ADOPT inherited it with
+    ``rec.gen = g`` and forgot that the evidence (or the adopter's own votes)
+    already reached HIGHER generations. Once ``t`` was released, RELEASE moved
     the record to ``g + 1`` only, re-opening those generations. The bounded
-    model (formal/SigilRot.tla, ``AdoptMode = "sibling"``) missed it because
-    its instances have one transition per higher generation and no re-used
-    honest key; ``formal/MC_rot_sibling_cex.cfg`` (SigilRot) and
-    ``formal/MC_rotp_cex_sibling.cfg`` (SigilRotProofs) are the TLC
-    counterexamples.
+    model (formal/SigilRot.tla) missed it because its instances had one
+    transition per higher generation and no re-used honest key;
+    ``formal/MC_rot_sibling_v1_mutant.cfg`` (SigilRot) and
+    ``formal/MC_rotp_sibling_mutant.cfg`` (the proved spec, SigilRotProofs)
+    are the TLC counterexamples for the first rule.
 
-    SUGGESTED FIX (the rule SigilRotProofs.tla proves safe, ``LoneOK``):
-    inherit a lone live binding only if it is the top of the evidence, i.e.
-    every other kept binding (dead or alive) is at a LOWER generation and every
-    vote the adopter's own key cast on the sigil is at a generation <= g;
-    otherwise make the record CONTESTED with that binding as its only
-    candidate, so the existing contested release moves it past every evidence
-    generation and past the key's own votes::
-
-        lone = False
-        if len(alive) == 1:
-            (g, t), = alive
-            lone = (all(g2 < g for (g2, t2) in binds if (g2, t2) != (g, t))
-                    and all(og <= g for og, _ in own))
+    THE FIX (the rule SigilRotProofs.tla proves safe, ``LoneOK``): inherit a
+    lone live binding only if it is the top of the evidence, i.e. every other
+    kept binding (dead or alive) is at a LOWER generation (or at most at g
+    when the evidence holds a valid seal for ``(g, t)``) and every vote the
+    adopter's own key cast on the sigil is at a generation <= g; otherwise the
+    record is CONTESTED, so the contested release moves it past every evidence
+    generation and past the key's own votes. A seal settles a contested record
+    (W9) only under the same own-vote condition (``ResolveOK``).
 
     An honest owner (SPEC Section 4 rules 1-3) never produces such evidence,
     so the fix costs liveness only to an owner who authorised a later
-    generation while an earlier one was still bound. Equivalent alternative:
-    keep the inheritance, store the evidence floor in the record and make
-    RELEASE set ``gen = max(gen + 1, floor)``.
-
-    Each test is marked ``expectedFailure`` and passes (an "unexpected
-    success", which fails the run) once ADOPT is fixed; then drop the marker.
+    generation while an earlier one was still bound.
     """
 
     def _universe(self):
