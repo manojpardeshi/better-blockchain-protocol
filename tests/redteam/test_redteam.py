@@ -276,9 +276,10 @@ class Finding4DeepConfirmSplit(unittest.TestCase):
 
 
 class Finding5SwapHostage(unittest.TestCase):
-    @unittest.expectedFailure
     def test_honest_party_recovers_after_counterparty_vanishes(self):
-        """BUG-5 (MEDIUM-HIGH, protocol: recovery / atomicity; hostage).
+        """BUG-5 (MEDIUM-HIGH, protocol: recovery / atomicity; hostage). FIXED:
+        swaps carry a kill switch per party, withheld until the other side is
+        bound; ``abort`` spends it elsewhere to obtain the death proof.
 
         Scenario: in a two-party swap the parties exchange unlocks. A malicious
         counter-party that receives the honest party's unlock submits *only the
@@ -326,10 +327,25 @@ class Finding5SwapHostage(unittest.TestCase):
         self.assertIn(s0, released)
 
 
+    def test_a_released_kill_switch_is_never_spent_elsewhere(self):
+        """Once a party has signed its kill switch for the swap, pulling it would
+        sign a second transition at that generation (SPEC Section 4 rule 1)."""
+        net = Network()
+        c = net.create_constellation("c", 4)
+        alice, mallory = Wallet("a", net, c), Wallet("m", net, c)
+        header, body, _ = propose_swap(alice, alice.issue("A", 100), 100, mallory, mallory.issue("M", 100), 100)
+        alice.authorise(header, body, release_kill=True)
+        self.assertFalse(alice._pull_kill_switch(header))
+        with self.assertRaises(ValueError):
+            alice.abort(header)
+
+
 class Finding6BondSelfClaim(unittest.TestCase):
-    @unittest.expectedFailure
     def test_equivocator_cannot_recover_its_own_bond(self):
-        """BUG-6 (HIGH, economics: slashing is void against the cheater).
+        """BUG-6 (HIGH, economics: slashing is void against the cheater). FIXED
+        by the bond construction ``locks.bond``: the slashing branch needs the
+        proof AND k-of-n auditors independent of the operator. The scenario
+        below used the bare pattern ``any(all(sig(op), after(t)), equivocation(w))``.
 
         Scenario: a witness bond is a parcel locked
         ``any(all(sig(operator), after(unbond)), equivocation(witness))``
@@ -368,9 +384,8 @@ class Finding6BondSelfClaim(unittest.TestCase):
         usd = operator.issue("USD", 1000)
         witness = net.witnesses(c)[0]                # run by the same operator
         okey = operator.fresh_key()
-        bond_lock = locks.any_of(
-            locks.all_of(locks.sig(okey.pk), locks.after(int(net.clock()) + 10 ** 8)),
-            locks.equivocation(witness.pk))
+        auditors = [KeyPair.generate().pk for _ in range(3)]
+        bond_lock = locks.bond(okey.pk, int(net.clock()) + 10 ** 8, witness.pk, auditors, 2)
         refs, outs = operator.payment_outputs(usd, 500, {"home": bonds, "lock": bond_lock,
                                                          "salt": "ab" * 16})
         btid = operator.transact(refs, outs)
@@ -385,8 +400,10 @@ class Finding6BondSelfClaim(unittest.TestCase):
             [r], [model.parcel(bonds, usd, 500, dest["lock"], dest["salt"])], gens={s: 0})
         unlock = locks.empty_unlock(int(net.clock()) + 600)
         unlock["equivocations"] = [proof]
-        with self.assertRaises(SealFailed):          # today: sealed, cheater keeps its bond
+        with self.assertRaises(SealFailed):          # the proof alone no longer releases it
             operator.seal(header, body, {s: unlock})
+        with self.assertRaises(ValueError):          # and an operator cannot audit itself
+            locks.bond(okey.pk, 1, witness.pk, [okey.pk], 1)
 
 
 class _LyingWitness(Witness):

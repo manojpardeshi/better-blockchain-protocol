@@ -28,8 +28,7 @@ This review found **six defects**, summarised in [§3](#3-findings). After the
 review, BUG-1 (critical: a counterfeit through the holder's verifier cache),
 BUG-3 and BUG-4 were fixed, along with the `sig`/`multi` CPU amplification
 (`MAX_KEYS`); their tests are now regression tests in
-`tests/redteam/test_redteam.py`. **Two remain open** as `expectedFailure` tests,
-both design questions: BUG-5 (swap hostage) and BUG-6 (bond self-claim). The sixth, BUG-2, was fixed upstream in
+`tests/redteam/test_redteam.py`. BUG-5 (swap hostage) and BUG-6 (bond self-claim) were then fixed by design changes (kill switches; auditor co-signed bonds). The sixth, BUG-2, was fixed upstream in
 parallel and is now a regression test. Three more attack hypotheses tested here
 (dossier merge poisoning, the default trust policy accepting a payer's rogue home,
 and shared-control locks accepted as payment) were also fixed by that wallet work.
@@ -510,8 +509,8 @@ in `sigil/`, per the task. `python3 -m unittest discover` stays green: 183 tests
 | # | Severity | Status on main | Where | One line | Test |
 |---|---|---|---|---|---|
 | BUG-1 | **Critical** (conservation / counterfeit) | **fixed** (every cached id reused is re-checked to hash to the presented entry) | `sigil/validate.py` `Verifier._verify` cache | A warm recipient's verifier cache skips re-validating a cached transition's body, so a malicious **payer** reuses a public ancestor tid (e.g. the genesis) with a forged body and an output minted from thin air; a 1000-supply asset inflated a recipient to ~1e9. Cold recipients reject. | `Finding1Conservation` |
-| BUG-6 | **High** (economics: slashing void) | **open** (design) | bond lock pattern (whitepaper §7, SPEC §9); `locks.equivocation` | The equivocator holds its own equivocation proof first and claims its own bond; the claim is also front-runnable because the equivocation branch is not bound to the claimant. | `Finding6BondSelfClaim` |
-| BUG-5 | Medium–High (protocol: swap hostage) | **open** | multi-party flow; `sigil/swap.py`, `Wallet.abort` | A counter-party binds only the honest input and vanishes; no death proof can exist and expiry does not release a bound input, so the honest coin is locked indefinitely. | `Finding5SwapHostage` |
+| BUG-6 | **High** (economics: slashing void) | **fixed** (bond construction `locks.bond`: proof plus k-of-n independent auditors) | bond lock pattern (whitepaper §7, SPEC §9); `locks.equivocation` | The equivocator holds its own equivocation proof first and claims its own bond; the claim is also front-runnable because the equivocation branch is not bound to the claimant. | `Finding6BondSelfClaim` |
+| BUG-5 | Medium–High (protocol: swap hostage) | **fixed** (per-party kill switches, withheld until the other side is bound; `abort` pulls ours) | multi-party flow; `sigil/swap.py`, `Wallet.abort` | A counter-party binds only the honest input and vanishes; no death proof can exist and expiry does not release a bound input, so the honest coin is locked indefinitely. | `Finding5SwapHostage` |
 | BUG-4 | Medium (policy evasion) | **fixed** (threshold on the payment total per asset; per-counter-party windows not done) | `sigil/wallet.py` `receive` | `deep_threshold` is applied per parcel, so splitting a payment into parcels just under it skips deep confirmation entirely. | `Finding4DeepConfirmSplit` |
 | BUG-2 | Medium (liveness / third-party griefing) | **fixed** in `91269ff`/`eca6edd` | `wallet.py` rule-3 release + `deep_confirm`, `witness.py` ADOPT | A witness within *f* lying on STATUS induced an honest owner to bind twice; after rotation the honestly sealed coin was CONTESTED and deep confirmation failed for an innocent holder. Now settled by seal. | `Finding2InducedEquivocation` (regression) |
 | BUG-3 | Low (robustness / contract) | **fixed** | `sigil/witness.py` `authorises` | A malformed non-dict `unlock` raises `AttributeError` (not caught) instead of `Rejected` from in-process `Witness.spend`; the HTTP server masks it as 400, no state mutated. | `Finding3MalformedLeak` |

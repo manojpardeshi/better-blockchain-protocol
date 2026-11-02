@@ -24,7 +24,9 @@ class RecoveryTests(unittest.TestCase):
 
     def _swap_and_betray(self):
         header, body, _ = propose_swap(self.alice, self.usd, 100, self.mallory, self.gold, 10)
-        unlocks = {**self.alice.authorise(header, body), **self.mallory.authorise(header, body)}
+        # Both parties have fully signed, kill switches included.
+        unlocks = {**self.alice.authorise(header, body, release_kill=True),
+                   **self.mallory.authorise(header, body, release_kill=True)}
         me = self.mallory.address()
         betrayal = manual_spend(self.mallory, [body["inputs"][1]], [model.parcel(self.Y, self.gold, 10, me["lock"], me["salt"])])
         return header, body, unlocks, betrayal
@@ -35,7 +37,7 @@ class RecoveryTests(unittest.TestCase):
         with self.assertRaises(SealFailed):
             self.alice.seal(header, body, unlocks)    # Alice's input is now bound to a dead swap
         released = self.alice.abort(header)
-        self.assertEqual(len(released), 1)
+        self.assertEqual(len(released), 2)              # her input and her signed kill switch
         self.alice.pay(self.bob, self.usd, 100)       # spent again, at generation 1
         self.assertEqual(self.bob.balance(self.usd), 100)
 
@@ -50,7 +52,7 @@ class RecoveryTests(unittest.TestCase):
         wy[2].spend(reqs2[0]); wy[3].spend(reqs2[0])
         with self.assertRaises(SealFailed):
             self.alice.seal(header, body, unlocks)
-        self.assertEqual(len(self.alice.abort(header)), 1)
+        self.assertEqual(len(self.alice.abort(header)), 2)  # her input and her kill switch
         self.alice.pay(self.bob, self.usd, 40)
 
     def test_cannot_release_a_live_transition(self):

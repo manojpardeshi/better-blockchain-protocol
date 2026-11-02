@@ -47,6 +47,23 @@ def equivocation(witness_pk: str) -> dict:
     return {"op": "equivocation", "witness": witness_pk}
 
 
+def bond(operator_pk: str, unbond_time: int, witness_pk: str, auditors: list, k: int) -> dict:
+    """A witness bond: the operator recovers it after ``unbond_time``; a proof
+    that ``witness_pk`` equivocated releases it only together with ``k`` of the
+    independent ``auditors``.
+
+    A bare ``equivocation(w)`` branch is unsafe: the equivocator holds its own
+    proof first and claims its own bond, and a lock cannot say where outputs
+    go, so anyone who sees a claim in flight can race it. Requiring auditors'
+    signatures binds the slashing claim to parties independent of the operator
+    (they decide whether it pays a bounty, the victims, or a burn address).
+    """
+    if not auditors or not 1 <= k <= len(auditors) or operator_pk in auditors:
+        raise ValueError("a bond needs k-of-n auditors independent of the operator")
+    return any_of(all_of(sig(operator_pk), after(unbond_time)),
+                  all_of(equivocation(witness_pk), multi(k, list(auditors))))
+
+
 def all_of(*locks) -> dict:
     return {"op": "all", "of": list(locks)}
 

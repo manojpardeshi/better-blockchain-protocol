@@ -183,7 +183,7 @@ class Universe:
         self.crash_armed = False
         self.mode = "good"                    # link quality to the home: good | lossy | partition
         self.delayed: list = []
-        self.alice = Wallet("alice", self.net, self.X)
+        self.alice = Wallet("alice", self.net, self.X, on_pledge=self._autosave)
         self.usd = self.alice.issue("USD", 1_000)
         self.sinks = [Wallet(f"sink{i}", self.net, self.X) for i in range(2)]
         self.mallory = Wallet("mallory", self.net, self.Y)
@@ -203,13 +203,33 @@ class Universe:
     def save(self):
         wallet_store.save(self.alice, self.path)
 
+    def _autosave(self, wallet):
+        """The wallet's on_pledge hook, as sigil.cli sets it: every authorisation,
+        including ones the wallet makes by itself, is saved before a witness sees it."""
+        wallet_store.save(wallet, self.path)
+
     def restart(self):
         self.track()
         self.alice = wallet_store.load(self.path, self.net)
+        self.alice.on_pledge = self._autosave
         self.check_drops()
 
     def track(self):
         self.tracked |= {(s, p[0], p[1]) for s, p in self.alice.pledged.items()}
+        self.learn_headers()
+        # The wallet also authorises by itself (a retry in _settle, the kill
+        # switch abort spends); its pledge records the latest expiry it signed.
+        for s, (g, t, exp) in self.alice.pledged.items():
+            d = self.signed.setdefault((s, g), {})
+            d[t] = max(d.get(t, exp), exp)
+
+    def learn_headers(self):
+        """Headers of transitions the wallet authorised by itself (e.g. the kill
+        switch that ``abort`` spends), from its pending list or its dossier."""
+        for t, p in self.alice.pending.items():
+            self.headers.setdefault(t, p["header"])
+        for t, tx in self.alice.dossier.transitions.items():
+            self.headers.setdefault(t, tx["header"])
 
     def votes(self, s, g):
         out: dict[str, set] = {}
@@ -249,7 +269,7 @@ class Universe:
 
     # -------------------------------------------------------- the wallet ops
 
-    def sign(self, header, body):
+    def sign(self, header, body, release_kill=False):
         """Wallet.authorise, with the NoSelfEquiv check at signing time."""
         tid = model.transition_id(header)
         for r, (s, _g) in zip(body["inputs"], header["inputs"]):
@@ -258,7 +278,7 @@ class Universe:
             except InvalidDossier:
                 pass
         self.track()
-        unlocks = self.alice.authorise(header, body)
+        unlocks = self.alice.authorise(header, body, release_kill=release_kill)
         self.headers[tid] = header
         self.track()   # pledges made here and dropped later in this op are checked too
         for s, g in header["inputs"]:
@@ -329,8 +349,11 @@ class Universe:
         mode = self.rng.choice(["coop", "coop", "betray", "split", "withhold"])
         unlocks = self.sign(header, body)
         self.save()
-        um = {} if mode == "withhold" else m.authorise(header, body)
-        mref = body["inputs"][-1]
+        # Kill switches (sigil/swap.py): Mallory releases hers unless she
+        # withholds everything; Alice releases hers only in a cooperative swap,
+        # once Mallory's input will be bound. Otherwise abort pulls Alice's.
+        um = {} if mode == "withhold" else m.authorise(header, body, release_kill=True)
+        mref = next(r for r in body["inputs"] if m.dossier.output(r)["asset"] == gold)
         me = m.address()
         out = [model.parcel(self.Y, gold, 10, me["lock"], me["salt"])]
         if mode == "betray":
@@ -344,6 +367,9 @@ class Universe:
                     w.spend(r)
                 except Rejected:
                     pass
+        if mode == "coop":
+            unlocks.update(self.sign(header, body, release_kill=True))
+            self.save()  # every authorisation is saved before a witness sees it
         for s, g in header["inputs"]:
             self.homes.setdefault(s, self.Y)
         self.seal_and_finalise(header, body, unlocks, um)
@@ -429,6 +455,7 @@ class Universe:
     # ------------------------------------------------------------- checks
 
     def check_drops(self):
+        self.learn_headers()
         now = self.alice.pledged
         before = self.tracked
         self.tracked = {(s, p[0], p[1]) for s, p in now.items()}
@@ -505,9 +532,9 @@ class WalletConformanceTests(unittest.TestCase):
         """Mutation: authorise ignores earlier pledges (no equivocation guard). Must be caught."""
         real = Wallet.authorise
 
-        def forgetful(self, header, body, extra=None):
+        def forgetful(self, header, body, extra=None, **kw):
             self.pledged.clear()
-            return real(self, header, body, extra)
+            return real(self, header, body, extra, **kw)
         self.assertTrue(self._caught(mock.patch.object(Wallet, "authorise", forgetful)),
                         "the checks missed a wallet that signs two spends of one sigil")
 

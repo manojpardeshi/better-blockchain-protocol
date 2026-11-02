@@ -129,6 +129,7 @@ class Wallet:
         self.pending: dict[str, dict] = {}    # tid -> {"header", "body", "extra"} authorised, not yet final
         self.completed: list = []             # tids completed by a retry: hand their dossiers to the payees
         self.issued: set[str] = set()         # sigils of addresses we handed out: the only ones we accept
+        self.kill_switches: set[str] = set()  # sigils of kill-switch parcels (multi-party transitions)
         # Called after every authorisation, before any witness sees it: save the
         # wallet here so a crash can never forget a pledge (wallet_store.save).
         self.on_pledge = on_pledge
@@ -322,11 +323,11 @@ class Wallet:
             return
         except ValueError:
             pass  # not provably dead: try to complete it
-        unlocks = self.authorise(header, body, p.get("extra"))
         try:
+            unlocks = self.authorise(header, body, p.get("extra"))
             self.seal(header, body, unlocks)
-        except SealFailed:
-            return  # still in limbo; a later call tries again
+        except (SealFailed, ValueError):
+            return  # still in limbo (or refused for now); a later call tries again
         self.finalise(header, body, unlocks)
         self.completed.append(tid)
 
@@ -368,7 +369,8 @@ class Wallet:
         hd = model.header(sigils, b)
         return hd, b, model.transition_id(hd)
 
-    def authorise(self, header: dict, body: dict, extra: dict | None = None) -> dict:
+    def authorise(self, header: dict, body: dict, extra: dict | None = None, *,
+                  release_kill: bool = False) -> dict:
         """Sign for our own inputs. Refuses to ever sign two spends of one sigil.
 
         Each authorisation expires ``pledge_ttl`` seconds from now: no
@@ -378,6 +380,11 @@ class Wallet:
         We sign only what we have checked: the header commits to ``body``,
         every input we hold sits at its own position with its own sigil and
         our current generation, and no other live pledge or binding exists.
+
+        Kill-switch inputs (see ``kill_switch``) are not signed unless
+        ``release_kill``: in a multi-party transition a party withholds its kill
+        switch until it has seen the other parties' inputs bound, so a party
+        that stalls can always be answered with a death proof (``abort``).
         """
         tid = model.transition_id(header)
         if (not isinstance(header.get("inputs"), list) or not isinstance(body.get("inputs"), list)
@@ -404,6 +411,8 @@ class Wallet:
             ours.append((r, s, g, h))
         unlocks = {}
         for r, s, g, h in ours:
+            if s in self.kill_switches and not release_kill:
+                continue  # withheld: no unlock and no pledge yet
             prior = self.pledged.get(s)
             u = locks.empty_unlock(expires)
             for pk in keys_in(h["parcel"]["lock"]) & set(self.keys):
@@ -431,10 +440,12 @@ class Wallet:
                 return True
         return False
 
-    def seal(self, header: dict, body: dict, unlocks: dict) -> list:
-        tid = model.transition_id(header)
+    def seal(self, header: dict, body: dict, unlocks: dict, only=None) -> list:
+        """Seal the inputs of a transition (all of them, or the sigils in ``only``)."""
         seals = []
         for r, (s, _g) in zip(body["inputs"], header["inputs"]):
+            if only is not None and s not in only:
+                continue
             p = self.dossier.output(r)
             req = {"sigil": s, "header": header, "home": p["home"], "lock": p["lock"],
                    "salt": p["salt"], "unlock": unlocks.get(s, locks.empty_unlock())}
@@ -505,6 +516,8 @@ class Wallet:
         """Recover our inputs from a transition that can never complete."""
         tid = model.transition_id(header)
         proof = find_death_proof(self.network, header, tid, self._parcels_for(header))
+        if proof is None and self._pull_kill_switch(header):
+            proof = find_death_proof(self.network, header, tid, self._parcels_for(header))
         if proof is None:
             raise ValueError("no proof that the transition is dead")
         # A verified death proof means ``tid`` can never be sealed (SPEC §8
@@ -526,6 +539,44 @@ class Wallet:
             released.append(s)
         self.pending.pop(tid, None)
         return released
+
+    def kill_switch(self, home: str | None = None) -> dict:
+        """A fresh one-unit parcel to add to a multi-party transition as a kill switch.
+
+        It is its own asset (a genesis needs no witness), comes back to us in
+        the transition's outputs, and its unlock is withheld until the other
+        parties' inputs are bound. Returns its holding.
+        """
+        tid = self.issue("kill-switch", 1, home)
+        h = self.holdings[model.parcel_id(model.ref(tid, 0))]
+        self.kill_switches.add(h["sigil"])
+        return h
+
+    def _pull_kill_switch(self, header: dict) -> bool:
+        """Spend a kill switch of ``header`` we never signed for it, so it can never complete.
+
+        Sealing it to another transition at the generation ``header`` names is
+        a death proof for ``header`` (SPEC §3.9), with which ``abort`` frees our
+        other inputs. A kill switch we already signed for ``header`` is pledged
+        and is never spent elsewhere (SPEC §4 rule 1).
+        """
+        tid = model.transition_id(header)
+        for s, g in header["inputs"]:
+            h = next((h for h in self.holdings.values() if h["sigil"] == s), None)
+            if h is None or s not in self.kill_switches or s in self.pledged or h["gen"] != g:
+                continue
+            a = self.address(h["parcel"]["home"])
+            out = model.parcel(a["home"], h["parcel"]["asset"], h["parcel"]["amount"], a["lock"], a["salt"])
+            try:
+                hd, bd, _ = self.prepare([h["ref"]], [out], memo=f"kill {tid[:16]}")
+                unlocks = self.authorise(hd, bd, release_kill=True)
+                self.seal(hd, bd, unlocks)
+                self.finalise(hd, bd, unlocks)
+            except (SealFailed, ValueError):
+                continue
+            self.kill_switches.add(model.sigil_of(out))
+            return True
+        return False
 
     def _parcels_for(self, header: dict) -> dict:
         """The parcels behind a header's input sigils, as far as our dossier knows them."""
