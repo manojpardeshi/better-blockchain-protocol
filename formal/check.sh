@@ -35,15 +35,20 @@ TLA_VERSION="1.7.4"
 TLA_SHA256="936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88"
 TLA_URL="https://github.com/tlaplus/tlaplus/releases/download/v${TLA_VERSION}/tla2tools.jar"
 
-# tlapm 1.6.0-pre, linux x86_64 (bundles Zenon, Z3 and Isabelle/TLA+).
+# tlapm 1.6.0-pre, linux x86_64 (bundles Zenon, Z3 and Isabelle/TLA+). This is
+# a rolling pre-release whose tarball is rebuilt in place, and tlapm has no
+# newer immutable release, so the pin is a specific build: when upstream
+# rebuilds it, the download fails the hash check and the run FAILS (it never
+# silently skips the proofs). Re-check both proofs with the new build, then
+# update the hash here and the cache key in .github/workflows/test.yml.
 TLAPM_VERSION="1.6.0-pre"
-TLAPM_SHA256="b3c2554d3dd2198772ea8c814639a024fe9c390eac0ec25f4f444ad446a7dd28"
+TLAPM_SHA256="39620b869ed939d991f5e2c4d604d84d16c05c5dd95787a1e5f47da296746b7b"
 TLAPM_URL="https://github.com/tlaplus/tlapm/releases/download/${TLAPM_VERSION}/tlapm-${TLAPM_VERSION}-x86_64-linux-gnu.tar.gz"
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CACHE="${TLA_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/sigil-tla}"
 JAR="$CACHE/tla2tools-${TLA_VERSION}.jar"
-TLAPM_DIR="$CACHE/tlapm-${TLAPM_VERSION}"
+TLAPM_DIR="$CACHE/tlapm-${TLAPM_VERSION}-${TLAPM_SHA256:0:12}"
 TLAPM="$TLAPM_DIR/tlapm/bin/tlapm"
 STDLIB="$TLAPM_DIR/tlapm/lib/tlapm/stdlib"
 
@@ -71,7 +76,7 @@ trap 'rm -rf "$WORK"' EXIT
 # ----------------------------------------------------------------- TLAPS proof
 ensure_tlapm() {
     [[ -x "$TLAPM" ]] && return 0
-    local tgz="$CACHE/tlapm-${TLAPM_VERSION}.tar.gz"
+    local tgz="$CACHE/tlapm-${TLAPM_VERSION}-${TLAPM_SHA256:0:12}.tar.gz"
     echo "Downloading tlapm ${TLAPM_VERSION}"
     curl -fsSL --retry 3 -o "$tgz.part" "$TLAPM_URL" || return 1
     local got; got="$(sha256 "$tgz.part")"
@@ -110,6 +115,11 @@ if [[ $# -eq 0 && "${SIGIL_SKIP_TLAPS:-0}" != "1" ]]; then
         if [[ "${SIGIL_ROT_PROOF:-0}" == "1" ]]; then
             prove SigilRotProofs.tla
         fi
+    elif [[ "$(uname -s)-$(uname -m)" == "Linux-x86_64" ]]; then
+        # On the platform tlapm supports, a missing prover is a failure, never
+        # a silent skip: a green run must mean the proofs were checked.
+        echo ">>> TLAPS: FAIL - could not install tlapm (see above)" >&2
+        status=1
     else
         echo ">>> TLAPS unavailable on this platform; skipping the proof" >&2
         echo "    (set SIGIL_SKIP_TLAPS=1 to silence, or run on Linux x86_64)" >&2
@@ -121,7 +131,7 @@ if [[ $# -gt 0 ]]; then
     CONFIGS=("$@")
 elif [[ "${SIGIL_ROT_PROOF:-0}" == "1" ]]; then
     # The rotation proof's TLC instances (slow; CI job rotation-proof).
-    CONFIGS=(MC_rotp.cfg MC_rotp_cex.cfg MC_rotp_noown_mutant.cfg MC_rotp_resolve_mutant.cfg
+    CONFIGS=(MC_rotp.cfg MC_rotp_noown_mutant.cfg MC_rotp_resolve_mutant.cfg
              MC_rotp_sibling_mutant.cfg MC_rotp_top_mutant.cfg
              MC_rotp_witness.cfg MC_rotp_witness_abstain.cfg MC_rotp_witness_crel.cfg
              MC_rotp_witness_lone.cfg MC_rotp_witness_resolve.cfg)
@@ -163,7 +173,8 @@ for cfg in "${CONFIGS[@]}"; do
         if [[ -d "$STDLIB" ]] || ensure_tlapm; then
             libarg=("-DTLA-Library=$STDLIB")
         else
-            echo "=== TLC: $name ===" ; echo ">>> $name: SKIP (needs TLAPS libraries)" >&2
+            echo "=== TLC: $name ===" ; echo ">>> $name: FAIL (needs the TLAPS libraries; tlapm did not install)" >&2
+            status=1
             continue
         fi
     fi

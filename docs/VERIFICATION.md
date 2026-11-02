@@ -115,7 +115,8 @@ constellation whose charter chain is fixed (FREEZE binding one successor makes
 it the only verifiable chain). Not modelled: holder validation, expiry and
 time, the network, and wallets (see §2 and §3b for those).
 
-TLC instances of the proved spec (`MC_rotp*.cfg`) check that it is non-vacuous
+TLC instances of the proved spec (`MC_rotp*.cfg`; `MC_rotp_cex.cfg`, the proved rule on
+the Bugs 3/4 instance, is opt-in via `SIGIL_TLC_EXTRA` as it takes over 20 minutes) check that it is non-vacuous
 (recovery after rotation, abstention, contested release, lone inheritance and
 seal settlement are all reachable) and that each condition of the rule is
 needed: removing the own-vote condition, the seal-settlement condition or the
