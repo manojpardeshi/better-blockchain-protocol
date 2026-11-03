@@ -1,7 +1,7 @@
 import json
 import unittest
 
-from sigil import InvalidDossier, Network, SealFailed, Wallet
+from sigil import InvalidDossier, KeyPair, Network, SealFailed, Wallet
 from sigil import locks, model
 from sigil.encoding import hash_preimage
 from sigil.proofs import proves_dead, verify_equivocation, verify_seal
@@ -83,26 +83,32 @@ class DoubleSpendTests(unittest.TestCase):
         self.assertFalse(verify_seal(seal1, self.net.registry, self.bob.policy.convicted))
 
     def test_equivocation_slashes_a_bond(self):
-        """A witness's bond is a parcel anyone can claim with proof of equivocation."""
+        """A witness's bond is released by a proof of equivocation plus k-of-n auditors."""
         byz = self.net.witnesses(self.X)[3]
         operator = Wallet("operator", self.net, self.X)
         stake = operator.issue("STAKE", 1_000)
         T = self.net.clock() + 365 * 86400
         op_key = operator.fresh_key()
-        bond_lock = locks.any_of(locks.all_of(locks.sig(op_key.pk), locks.after(T)),
-                                 locks.equivocation(byz.pk))
+        auditors = [KeyPair.generate() for _ in range(3)]
+        bond_lock = locks.bond(op_key.pk, T, byz.pk, [k.pk for k in auditors], 2)
         refs, _ = operator.select(stake, 1_000)
         bond_tid = operator.transact(refs, [model.parcel(self.X, stake, 1_000, bond_lock, "bond")])
         # Byzantine witness equivocates.
         (h1, *_, r1), (h2, *_, r2) = self._two_spends()
         proof = {"a": byz.spend(r1[0]), "b": byz.spend(r2[0])}
-        # A bounty hunter claims the bond, years before the operator could unbond.
+        # A bounty hunter claims the bond with two auditors, years before the operator could unbond.
         hunter = Wallet("hunter", self.net, self.X)
         hunter.watch(operator.dossier.ancestry([bond_tid]), model.ref(bond_tid, 0))
         bond = next(h for h in hunter.holdings.values() if h["parcel"]["asset"] == stake)
         a = hunter.address()
-        hunter.transact([bond["ref"]], [model.parcel(self.X, stake, 1_000, a["lock"], a["salt"])],
-                                extra_unlocks={bond["sigil"]: {"equivocations": [proof]}})
+        out = [model.parcel(self.X, stake, 1_000, a["lock"], a["salt"])]
+        header, body, tid = hunter.prepare([bond["ref"]], out)
+        exp = int(self.net.clock()) + hunter.pledge_ttl
+        claim = {"equivocations": [proof], "expires": exp,
+                 "sigs": {k.pk: locks.sign_unlock(k, bond["sigil"], tid, exp) for k in auditors[:2]}}
+        unlocks = hunter.authorise(header, body, {bond["sigil"]: claim})
+        hunter.seal(header, body, unlocks)
+        hunter.finalise(header, body, unlocks)
         self.assertEqual(hunter.balance(stake), 1_000)
 
 

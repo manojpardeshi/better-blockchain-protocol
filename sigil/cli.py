@@ -47,7 +47,10 @@ def _network(path: str):
 def _load(args) -> Wallet:
     if not wallet_store.exists(args.wallet):
         raise CliError(f"no wallet at {args.wallet} (run init)")
-    return wallet_store.load(args.wallet, _network(args.directory))
+    w = wallet_store.load(args.wallet, _network(args.directory))
+    # Every authorisation is saved before any witness sees it (also on retries).
+    w.on_pledge = lambda w: wallet_store.save(w, args.wallet)
+    return w
 
 
 def _asset_name(w: Wallet, asset: str) -> str | None:

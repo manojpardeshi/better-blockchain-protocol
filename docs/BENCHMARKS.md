@@ -237,7 +237,8 @@ remaining serial work is cloning the record under the lock, plus allocator and l
 
 * is a library plus the `sigil-witness` binary;
 * uses the same files and flags as `python -m sigil.witnessd`;
-* `run` takes `--key`, `--registry`, `--constellation`, `--store`, `--host` and `--port`;
+* `run` takes `--key`, `--registry`, `--constellation`, `--store`, `--host`, `--port`,
+  `--stamps`, `--admin-token FILE` and `--adopt`;
 * also provides `keygen` and `genesis`;
 * reads key files `{"seed", "pk"}` and charter registries `{cid: [charter…]}` written by the
   Python daemon, and the reverse works too.
@@ -255,20 +256,25 @@ remaining serial work is cloning the record under the lock, plus allocator and l
   equivocation, all/any and never, with the same well-formedness rules and node budget.
 * Charter chain verification.
 * Durable state with group commit.
+* §5.4 rotation: FREEZE binds to one successor (its hash is the persisted `frozen` value, the
+  same successor is re-signed, any other refused) and hands over the log plus the witness's
+  own votes; ADOPT is the reference's fixed rule (a lone live binding is inherited only without
+  a sibling at its generation, otherwise CONTESTED with `candidates`; a re-used key abstains
+  where it already voted); RELEASE of a CONTESTED record removes the candidates a proof kills.
+  A new member is started with `--adopt` and waits for `/v0/adopt`.
+* §3.10 stamps: blind RSA-FDH selling (`/v0/sell_stamp`), one redemption per serial on SPEND,
+  redeemed serials in the store, the key in `<store>.stamps.json` (the reference's file and
+  format, created on first use).
+* Gossip storage (WIRE.md "Gossip"): chains extend the witness's registry, fork evidence and
+  equivocation proofs are kept with the reference's admission rules and caps.
 
-**Endpoints**
+**Endpoints**: every call of WIRE.md, with the same semantics: `/v0/info`, `/v0/charters`,
+`/v0/spend`, `/v0/release`, `/v0/status`, `/v0/sell_stamp`, `/v0/proofs`, `/v0/gossip`, and the
+operator calls `/v0/freeze` and `/v0/adopt`. SPEND, RELEASE, gossip, FREEZE and ADOPT run on the
+blocking thread pool, never on the async workers.
 
-* `/v0/info`, `/v0/charters`, `/v0/spend`, `/v0/release` and `/v0/status` are implemented.
-* `/v0/proofs` and `/v0/gossip` answer but store nothing: they return empty lists and zero
-  counts.
-* `/v0/sell_stamp` answers `rejected`, as a Python witness without stamps does.
-
-**Omitted**
-
-* Stamps: `--stamps` is refused.
-* Gossip storage: the registry is fixed at startup.
-* Rotation (§5.4 FREEZE/ADOPT). Records still keep the reference's `log` (bind and release
-  evidence), so ADOPT can be added later without migrating stores.
+**Store**: the store kinds of `sigil/store.py` (`pk`, `member`, `frozen`, `record`, `stamp`);
+records carry `candidates`, and stores written before rotation was ported load unchanged.
 
 **Byte compatibility** is checked by golden vectors generated from the Python reference
 (`rust/sigil-witness/tests/gen_vectors.py` → `vectors.json`, checked in and compared in CI):
@@ -277,10 +283,17 @@ remaining serial work is cloning the record under the lock, plus allocator and l
   control characters and big integers, each with its BLAKE2b digest;
 * Ed25519 keys and signatures from Python seeds;
 * sigils, body hashes and transition ids;
-* 33 lock cases evaluated at four clock values;
+* 36 lock cases evaluated at four clock values, including the 64-proof cap;
 * seals, equivocation proofs and death proofs;
 * a 33-step scripted run of a reference witness that the Rust witness replays. Every vote
-  must match byte for byte, and every rejection must have the same kind and message.
+  must match byte for byte, and every rejection must have the same kind and message;
+* a 68-step rotation script on three witnesses: FREEZE (wrong predecessor, the same successor
+  twice, a second successor), ADOPT by a new key (with junk evidence) and by a re-used key
+  (own-vote abstention), full records after ADOPT, RELEASE of CONTESTED records, and both
+  rotation regressions of `tests/test_conformance.py`;
+* stamps: full-domain hashes, blind signatures, 12 verification cases, and a 16-step script of
+  a stamp-selling witness (sale, redemption, double redemption, forged and missing stamps);
+* a 22-step gossip script: chains, a fork, proofs, forks and every per-message cap.
 
 `bench/interop.py` then starts Rust witness processes from Python-generated files and drives
 them with `sigil.server.RemoteNetwork` and `sigil.wallet.Wallet`. It covers:
@@ -294,7 +307,18 @@ them with `sigil.server.RemoteNetwork` and `sigil.wallet.Wallet`. It covers:
 * authorisation expiry and time locks;
 * SIGKILL and restart on the same store, after which the witness returns the same vote byte
   for byte and refuses the conflicting spend;
-* the error kinds for malformed requests.
+* the error kinds for malformed requests;
+* rotation with `RemoteNetwork.rotate` from 4 Rust witnesses to 2 Rust and 2 Python ones (one a
+  re-used key): bindings inherited, frozen witnesses refuse, payments continue and deep
+  confirmation works under the new version, restarts keep both sides' state, and the rotation
+  calls are refused without the admin token;
+* the two rotation regressions of `RotationRegressionTests`, one on Rust witnesses and one on
+  mixed Rust+Python constellations in both versions;
+* stamps on a constellation of 3 Rust and 1 Python witnesses: sale, single redemption, the key
+  and redeemed serials across a SIGKILL, and wallet payments with stamps;
+* gossip: an equivocation proof, a rotation and a fork told to single witnesses reach every Rust
+  and Python witness and the wallet through `gossip_round`, and junk and oversized messages
+  are refused.
 
 ### Compatibility notes (deliberate differences)
 
@@ -339,4 +363,9 @@ abstain, which the protocol tolerates.
   * The record update is serialised and made durable (group commit) before any reply that
     depends on it.
 * **Store format** is redb, not the reference's SQLite log, so stores are not interchangeable
-  between implementations. Keys, registries and the wire are.
+  between implementations. Keys, registries, stamp keys and the wire are.
+* **Hex in stamps** must be plain `[0-9a-fA-F]+`. Python's `int(x, 16)` also takes a sign, a
+  `0x` prefix, underscores and surrounding whitespace (vectors `"python": true, "rust": false`).
+* **Gossip order within one message**: the reference admits a message's charter chains in the
+  order the JSON lists them, Rust in key order. This only matters when the store reaches its
+  10 000-constellation cap within one message.

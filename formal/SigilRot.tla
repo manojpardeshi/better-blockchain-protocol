@@ -91,6 +91,24 @@ DeathProof(t) ==
 
 MaxOr0(F) == IF F = {} THEN 0 ELSE CHOOSE m \in F : \A k \in F : k <= m
 
+\* A CONTESTED record may also be settled by a SEAL (any version) for one of
+\* its candidates: the other candidates are dead by that seal, and binding
+\* the sealed tid at its generation creates no second seal (witness.py
+\* _sealed_candidate). Only if no later generation is passed over.
+ResolveContested(w, s) ==
+    /\ w \in HonestV(ver)
+    /\ bound[ver][w][s] = CONTESTED
+    /\ \E b \in cand[ver][w][s] :
+        LET killed == { c \in cand[ver][w][s] \ {b} : DeathProof(c[2]) }
+            top    == MaxOr0({gen[ver][w][s]} \cup { c[1] + 1 : c \in killed })
+        IN /\ Sealed(s, b[1], b[2])
+           /\ cand[ver][w][s] = killed \cup {b}
+           /\ top <= b[1] + 1
+           /\ gen' = [gen EXCEPT ![ver][w][s] = b[1]]
+           /\ bound' = [bound EXCEPT ![ver][w][s] = b[2]]
+           /\ cand' = [cand EXCEPT ![ver][w][s] = {}]
+    /\ UNCHANGED <<ver, votes, binds, rel, adopted>>
+
 -----------------------------------------------------------------------------
 TypeOK ==
     /\ ver \in {0, 1}
@@ -189,17 +207,24 @@ AdoptSeal(s) ==
 \* not inherited: the sigil becomes CONTESTED with every live binding as a
 \* candidate, and is only released once each candidate is proven dead.
 HasSibling(s, b) == \E u \in Tids : u # b[2] /\ <<b[1], u>> \in binds[s]
+\* The implemented rule: a lone live binding is inherited only if it is the top
+\* of the evidence (every other binding, dead or alive, at a LOWER generation).
+\* "sibling_v1" is the first version of the fix, which only excluded siblings
+\* AT its generation; it re-opens a higher generation (MC_rot_sibling_v1_mutant.cfg).
+OnTop(s, b) ==
+    IF AdoptMode = "sibling_v1" THEN ~HasSibling(s, b)
+    ELSE \A c \in binds[s] : c = b \/ c[1] < b[1]
 AdoptSib(s) ==
     IF AliveReal(s) = {}
         THEN [g |-> Floor(s), tid |-> NoTid, cand |-> {}]
     ELSE IF Cardinality(AliveReal(s)) = 1
-            /\ ~HasSibling(s, CHOOSE b \in AliveReal(s) : TRUE)
+            /\ OnTop(s, CHOOSE b \in AliveReal(s) : TRUE)
         THEN LET b == CHOOSE b \in AliveReal(s) : TRUE IN [g |-> b[1], tid |-> b[2], cand |-> {}]
     ELSE [g |-> Floor(s), tid |-> CONTESTED, cand |-> AliveReal(s)]
 
 AdoptRec(s) ==
     CASE AdoptMode = "sealaware" -> [g |-> AdoptSeal(s).g, tid |-> AdoptSeal(s).tid, cand |-> {}]
-      [] AdoptMode = "sibling"   -> AdoptSib(s)
+      [] AdoptMode \in {"sibling", "sibling_v1"} -> AdoptSib(s)
       [] OTHER                   -> [g |-> AdoptReal(s).g, tid |-> AdoptReal(s).tid, cand |-> {}]
 
 Adopt ==
@@ -217,6 +242,7 @@ Next ==
     \/ \E w \in HonestV(ver), s \in Sigils, t \in Tids : Spend(w, s, t)
     \/ \E w \in HonestV(ver), s \in Sigils : Release(w, s)
     \/ \E w \in HonestV(ver), s \in Sigils : ReleaseContested(w, s)
+    \/ AdoptMode \in {"sibling", "sibling_v1"} /\ \E w \in HonestV(ver), s \in Sigils : ResolveContested(w, s)
     \/ Adopt
 
 Spec == Init /\ [][Next]_vars
@@ -250,4 +276,8 @@ TgNeverCompletes == ~(adopted /\ "Tg" \in Tids /\ Complete("Tg"))
 NoContestedRelease ==
     ~(adopted /\ \E w \in Honest1, s \in Sigils :
         AdoptRec(s).tid = CONTESTED /\ bound[1][w][s] = NoTid)
+\* ...and a CONTESTED record really is settled by a seal (ResolveContested).
+NoContestedResolve ==
+    ~(adopted /\ \E w \in Honest1, s \in Sigils :
+        AdoptRec(s).tid = CONTESTED /\ bound[1][w][s] \in Tids)
 ================================================================================

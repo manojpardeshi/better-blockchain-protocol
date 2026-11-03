@@ -42,10 +42,17 @@ class Dossier:
                 self.charters[cid] = chain
 
     def merge(self, other: "Dossier") -> "Dossier":
-        self.transitions.update(other.transitions)
-        self.seals.update(other.seals)
+        """Add what ``other`` has and we lack. Entries we already hold are
+        never replaced: a tid fixes the header and body but not the unlocks,
+        and a seal key not its votes, so a hostile copy could otherwise make
+        our own history unprovable."""
+        for tid, tx in other.transitions.items():
+            self.transitions.setdefault(tid, tx)
+        for key, seal in other.seals.items():
+            self.seals.setdefault(key, seal)
         for cid, chain in other.charters.items():
-            if len(chain) > len(self.charters.get(cid, [])):
+            mine = self.charters.get(cid, [])
+            if len(chain) > len(mine) and chain[: len(mine)] == mine:  # extensions only, never a fork
                 self.charters[cid] = chain
         return self
 
@@ -168,21 +175,42 @@ class Verifier:
             self._epoch = self.policy.epoch
         if not isinstance(tid, str):
             raise InvalidDossier("transition id must be a string")
-        stack, expanded = [tid], set()
+        stack, expanded, intact = [tid], set(), set()
+
+        def check_intact(t: str) -> None:
+            # The cache remembers *ids*. A dossier entry under a cached id is
+            # the verified transition only if it hashes to that id (the
+            # header commits to the body), so check that before trusting it:
+            # otherwise a payer could pair a known id with a forged body.
+            if t in intact:
+                return
+            tx = dossier.transitions.get(t)
+            if not isinstance(tx, dict):
+                raise InvalidDossier(f"missing transition {t[:12]}")
+            h = tx["header"]
+            if model.transition_id(h) != t or model.body_hash(tx["body"]) != h["body"]:
+                raise InvalidDossier("transition does not match its id")
+            intact.add(t)
+
         while stack:
             cur = stack[-1]
             if cur in self._ok:
+                check_intact(cur)
                 stack.pop()
                 continue
             tx = dossier.transitions.get(cur)
             if not isinstance(tx, dict):
                 raise InvalidDossier(f"missing transition {cur[:12]}")
             try:
-                pending = [r["tx"] for r in tx["body"]["inputs"] if r["tx"] not in self._ok]
+                parents = [r["tx"] for r in tx["body"]["inputs"]]
             except (KeyError, TypeError) as e:
                 raise InvalidDossier("malformed inputs") from e
-            if not all(isinstance(p, str) for p in pending):
+            if not all(isinstance(p, str) for p in parents):
                 raise InvalidDossier("malformed inputs")
+            for p in parents:
+                if p in self._ok:
+                    check_intact(p)  # its outputs are read from this dossier
+            pending = [p for p in parents if p not in self._ok]
             if pending:
                 # Ancestors were pushed once already and are still not
                 # verified: the history loops back on itself.

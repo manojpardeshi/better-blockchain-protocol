@@ -105,6 +105,8 @@ fn expand(world: &World, st: &State, op: &Op) -> State {
         pk: None,
         member: None,
         frozen: false,
+        frozen_for: None,
+        stamps: Default::default(),
         records: st.records.iter().map(|(k, v)| (k.clone(), v.clone())).collect::<HashMap<_, _>>(),
     };
     let clock = Arc::new(AtomicI64::new(NOW as i64));
@@ -169,6 +171,7 @@ fn initial_states(world: &World, with_restored: bool) -> Vec<State> {
             log: vec![],
             votes: vec![old_vote],
             abstain: true,
+            candidates: vec![],
         };
         records.insert(b.clone(), abst.to_json());
         shadow.insert(b.clone(), RustRec { gen: 0, tid: Some(5), vote: None, abstain: true, votes: vec![(0, 10_000)] });

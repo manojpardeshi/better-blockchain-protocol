@@ -127,7 +127,7 @@ These arguments are spelled out in [SPEC §8](SPEC.md#8-safety-argument). They a
 Two of these properties have no equivalent in blockchains:
 
 * **The infrastructure can't steal.** Even if every witness of a constellation is corrupt, it can't move a parcel without the owner's signature, because holders verify every unlock.
-* **Cheating leaves evidence.** Witnesses never coordinate, so the only way to double-certify is for one witness to sign two conflicting votes, and a pair of signed votes is a self-contained proof. A witness's **bond** is just a parcel locked with `any(all(sig(operator), after(unbond_time)), equivocation(witness))`, so whoever holds the proof claims the bond. Slashing needs no chain, no governance and no court.
+* **Cheating leaves evidence.** Witnesses never coordinate, so the only way to double-certify is for one witness to sign two conflicting votes, and a pair of signed votes is a self-contained proof. A witness's **bond** is just a parcel locked with `any(all(sig(operator), after(unbond_time)), all(equivocation(witness), multi(k, auditors)))` (`locks.bond`): the proof plus *k* of *n* auditors independent of the operator release it. The proof alone must not, because the equivocator holds its own proof first and a lock cannot say where its outputs go. Slashing needs no chain, no governance and no court.
 
 ## 8. Properties
 
@@ -156,7 +156,8 @@ Sigil doesn't do everything a blockchain does, and this paper doesn't claim it d
 4. **Constellation death.** If a constellation disappears permanently, parcels homed there are stuck. Planned extension: charters name a *successor* that mirrors the evidence log and takes over after a dead-man period. Partition tolerance during takeover still needs work.
 5. **Long-range forgery** by retired witnesses is visible (it produces equivocation proofs) but needs bonds with long unbonding and optional *deep confirmation* (asking the current charter whether old sigils are bound as the dossier claims).
 6. **Witness clocks** are trusted for time-locks, but only to within the honest-quorum assumption. Each honest witness enforces time locally, so a seal shows that an honest quorum member saw the time.
-7. **Pathological splits in multi-party transitions.** If a counter-party equivocates and the votes split *without* reaching a quorum on anything (some witnesses unreachable forever), a death proof may not exist and the honest party's input stays locked until those witnesses come back. Bonding counter-parties and retrying with fresh witnesses reduce this. A complete fix is open.
+7. **Stalling counter-parties** are answered by *kill switches*: each party adds a one-unit parcel of its own to a multi-party transition and withholds its unlock until the others' inputs are bound. A counter-party that binds our inputs and stalls is answered by spending our kill switch elsewhere, which is a death proof (`Wallet.abort`).
+8. **Pathological splits in multi-party transitions.** If a counter-party equivocates and the votes split *without* reaching a quorum on anything (some witnesses unreachable forever), a death proof may not exist and the honest party's input stays locked until those witnesses come back. Bonding counter-parties and retrying with fresh witnesses reduce this. A complete fix is open.
 8. **Formal verification.** The safety argument is a proof sketch backed by randomised model checking. A TLA+ or Ivy proof is the next step.
 
 ## 11. Lineage

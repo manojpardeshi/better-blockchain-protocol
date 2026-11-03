@@ -28,5 +28,16 @@ RotHeader ==
 RotTids4   == RotTids \cup {"Tg"}
 RotHeader4 == [t \in RotTids4 |-> IF t = "Tg" THEN {<<"s", 1>>} ELSE RotHeader[t]]
 
+\* The counterexample instance for the first sibling rule: Tu = {(s,1),(x,0)}
+\* is killed by Ty like Tb, so v0 can seal Tu at (s,1) and release it while a
+\* lone Tb stays bound at (s,0); Tg = {(s,1)} is a later spend at generation 1.
+CexTids   == {"Ty", "Tb", "Tu", "Tg"}
+CexHeader ==
+    [t \in CexTids |->
+        CASE t = "Ty" -> {<<"x", 0>>}
+          [] t = "Tb" -> {<<"s", 0>>, <<"x", 0>>}
+          [] t = "Tu" -> {<<"s", 1>>, <<"x", 0>>}
+          [] t = "Tg" -> {<<"s", 1>>}]
+
 SymHonest == Permutations(Honest0) \cup Permutations(Honest1)
 =============================================================================

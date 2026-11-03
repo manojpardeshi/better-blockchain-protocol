@@ -14,6 +14,12 @@ from .proofs import verify_equivocation
 
 MAX_DEPTH = 8
 MAX_NODES = 64
+MAX_KEYS = 64   # keys a lock may name in all (sig and multi): bounds signature checks per spend
+# Equivocation proofs one unlock may carry. A well-formed lock has at most MAX_NODES nodes,
+# so it never needs more proofs than that; an unlock with more satisfies no lock. This bounds
+# the signature checks one evaluation can cost (3 per proof) far below what a 1 MiB body
+# could otherwise carry (about 1,400 proofs).
+MAX_EQUIVOCATIONS = 64
 
 
 def sig(pk: str) -> dict:
@@ -39,6 +45,23 @@ def hashlock(h: str) -> dict:
 def equivocation(witness_pk: str) -> dict:
     """Satisfied by anyone holding proof that ``witness_pk`` equivocated."""
     return {"op": "equivocation", "witness": witness_pk}
+
+
+def bond(operator_pk: str, unbond_time: int, witness_pk: str, auditors: list, k: int) -> dict:
+    """A witness bond: the operator recovers it after ``unbond_time``; a proof
+    that ``witness_pk`` equivocated releases it only together with ``k`` of the
+    independent ``auditors``.
+
+    A bare ``equivocation(w)`` branch is unsafe: the equivocator holds its own
+    proof first and claims its own bond, and a lock cannot say where outputs
+    go, so anyone who sees a claim in flight can race it. Requiring auditors'
+    signatures binds the slashing claim to parties independent of the operator
+    (they decide whether it pays a bounty, the victims, or a burn address).
+    """
+    if not auditors or not 1 <= k <= len(auditors) or operator_pk in auditors:
+        raise ValueError("a bond needs k-of-n auditors independent of the operator")
+    return any_of(all_of(sig(operator_pk), after(unbond_time)),
+                  all_of(equivocation(witness_pk), multi(k, list(auditors))))
 
 
 def all_of(*locks) -> dict:
@@ -86,16 +109,25 @@ def keys_in(lock: dict) -> set:
 
 
 def well_formed(lock, depth: int = 0, budget: list | None = None) -> bool:
-    budget = budget if budget is not None else [MAX_NODES]
+    if budget is None:
+        # The top-level call: at most MAX_NODES nodes and MAX_KEYS keys in all.
+        budget = [MAX_NODES, MAX_KEYS]
+        return _well_formed(lock, depth, budget)
+    return _well_formed(lock, depth, budget)
+
+
+def _well_formed(lock, depth: int, budget: list) -> bool:
     budget[0] -= 1
     if budget[0] < 0 or depth > MAX_DEPTH or not isinstance(lock, dict):
         return False
     op = lock.get("op")
     try:
         if op == "sig":
-            return isinstance(lock["pk"], str) and len(lock) == 2
+            budget[1] -= 1
+            return isinstance(lock["pk"], str) and len(lock) == 2 and budget[1] >= 0
         if op == "multi":
-            return (
+            budget[1] -= len(lock["pks"]) if isinstance(lock.get("pks"), list) else 0
+            return budget[1] >= 0 and (
                 isinstance(lock["k"], int) and not isinstance(lock["k"], bool)
                 and 1 <= lock["k"] <= len(lock["pks"]) and len(set(lock["pks"])) == len(lock["pks"])
                 and all(isinstance(p, str) for p in lock["pks"]) and len(lock) == 3
@@ -109,7 +141,7 @@ def well_formed(lock, depth: int = 0, budget: list | None = None) -> bool:
         if op in ("all", "any"):
             return (
                 isinstance(lock["of"], list) and len(lock["of"]) > 0 and len(lock) == 2
-                and all(well_formed(x, depth + 1, budget) for x in lock["of"])
+                and all(_well_formed(x, depth + 1, budget) for x in lock["of"])
             )
         if op == "never":
             return len(lock) == 1
@@ -136,10 +168,16 @@ def evaluate(lock: dict, unlock: dict, sigil: str, tid: str, now: int | None) ->
         return x if isinstance(x, kind) else kind()
 
     sigs, preimages, equivocations = field("sigs", dict), field("preimages", dict), field("equivocations", list)
+    if len(equivocations) > MAX_EQUIVOCATIONS:
+        return False
+
+    checked = {}  # pk -> bool: each key's signature is verified at most once
 
     def has_sig(pk):
-        s = sigs.get(pk)
-        return isinstance(s, str) and verify(pk, "unlock", msg, s)
+        if pk not in checked:
+            s = sigs.get(pk)
+            checked[pk] = isinstance(s, str) and verify(pk, "unlock", msg, s)
+        return checked[pk]
 
     convicted = {}  # witness -> bool, so each proof is verified at most once per witness
 

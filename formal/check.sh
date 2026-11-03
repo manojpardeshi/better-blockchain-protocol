@@ -13,12 +13,14 @@
 #     constellations. This is the real safety result.
 #   * TLC exhaustively checks the bounded models (the original witness model,
 #     the proof's own non-vacuity instance, charter rotation, owner-signed
-#     expiry and deep confirmation) on small instances, with mutation tests.
+#     expiry, deep confirmation and the wallet state machine) on small
+#     instances, with mutation tests.
 #
 # Module per config:
 #   MC_multi*  -> MC_multi.tla      MC_proofs* -> MC_proofs.tla (needs TLAPS libs)
 #   MC_rot*    -> MC_rot.tla        MC_expiry* -> SigilExpiry.tla
-#   MC_deep*   -> SigilDeep.tla     everything else -> MC.tla
+#   MC_deep*   -> SigilDeep.tla     MC_wallet* -> MC_wallet.tla (SigilWallet)
+#   everything else -> MC.tla
 #
 # Configs named *mutant* or *witness* are EXPECTED to report an invariant
 # violation; all others must pass. Exit status is non-zero if any expectation
@@ -33,15 +35,20 @@ TLA_VERSION="1.7.4"
 TLA_SHA256="936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88"
 TLA_URL="https://github.com/tlaplus/tlaplus/releases/download/v${TLA_VERSION}/tla2tools.jar"
 
-# tlapm 1.6.0-pre, linux x86_64 (bundles Zenon, Z3 and Isabelle/TLA+).
+# tlapm 1.6.0-pre, linux x86_64 (bundles Zenon, Z3 and Isabelle/TLA+). This is
+# a rolling pre-release whose tarball is rebuilt in place, and tlapm has no
+# newer immutable release, so the pin is a specific build: when upstream
+# rebuilds it, the download fails the hash check and the run FAILS (it never
+# silently skips the proofs). Re-check both proofs with the new build, then
+# update the hash here and the cache key in .github/workflows/test.yml.
 TLAPM_VERSION="1.6.0-pre"
-TLAPM_SHA256="b3c2554d3dd2198772ea8c814639a024fe9c390eac0ec25f4f444ad446a7dd28"
+TLAPM_SHA256="39620b869ed939d991f5e2c4d604d84d16c05c5dd95787a1e5f47da296746b7b"
 TLAPM_URL="https://github.com/tlaplus/tlapm/releases/download/${TLAPM_VERSION}/tlapm-${TLAPM_VERSION}-x86_64-linux-gnu.tar.gz"
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CACHE="${TLA_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/sigil-tla}"
 JAR="$CACHE/tla2tools-${TLA_VERSION}.jar"
-TLAPM_DIR="$CACHE/tlapm-${TLAPM_VERSION}"
+TLAPM_DIR="$CACHE/tlapm-${TLAPM_VERSION}-${TLAPM_SHA256:0:12}"
 TLAPM="$TLAPM_DIR/tlapm/bin/tlapm"
 STDLIB="$TLAPM_DIR/tlapm/lib/tlapm/stdlib"
 
@@ -69,7 +76,7 @@ trap 'rm -rf "$WORK"' EXIT
 # ----------------------------------------------------------------- TLAPS proof
 ensure_tlapm() {
     [[ -x "$TLAPM" ]] && return 0
-    local tgz="$CACHE/tlapm-${TLAPM_VERSION}.tar.gz"
+    local tgz="$CACHE/tlapm-${TLAPM_VERSION}-${TLAPM_SHA256:0:12}.tar.gz"
     echo "Downloading tlapm ${TLAPM_VERSION}"
     curl -fsSL --retry 3 -o "$tgz.part" "$TLAPM_URL" || return 1
     local got; got="$(sha256 "$tgz.part")"
@@ -82,21 +89,37 @@ ensure_tlapm() {
     [[ -x "$TLAPM" ]]
 }
 
-# Only run the proof when invoked with no explicit config list.
+prove() {   # machine-check one TLAPS proof module
+    local mod="$1" name="${1%.tla}"
+    echo "=== TLAPS: $mod (unbounded proof) ==="
+    start=$(date +%s)
+    if (cd "$HERE" && "$TLAPM" -I "$STDLIB" --cache-dir "$WORK/tlapscache" \
+            --strict "$mod") >"$WORK/tlaps-$name.log" 2>&1; then
+        secs=$(( $(date +%s) - start ))
+        grep -E 'obligations' "$WORK/tlaps-$name.log" || true
+        echo ">>> $name: OK, all obligations proved (${secs}s)"
+    else
+        echo ">>> $name: FAIL - proof did not check" >&2
+        tail -40 "$WORK/tlaps-$name.log" >&2
+        status=1
+    fi
+}
+
+# Only run the proofs when invoked with no explicit config list. The rotation
+# proof (SigilRotProofs.tla, ~3,500 obligations) and its TLC instances are long,
+# so they are opt-in: SIGIL_ROT_PROOF=1 runs both instead of the default TLC
+# configs (CI runs it in its own job).
 if [[ $# -eq 0 && "${SIGIL_SKIP_TLAPS:-0}" != "1" ]]; then
-    echo "=== TLAPS: SigilProofs.tla (unbounded safety proof) ==="
     if [[ "$(uname -s)-$(uname -m)" == "Linux-x86_64" ]] && ensure_tlapm; then
-        start=$(date +%s)
-        if (cd "$HERE" && "$TLAPM" -I "$STDLIB" --cache-dir "$WORK/tlapscache" \
-                --strict SigilProofs.tla) >"$WORK/tlaps.log" 2>&1; then
-            secs=$(( $(date +%s) - start ))
-            grep -E 'obligations' "$WORK/tlaps.log" || true
-            echo ">>> SigilProofs: OK, all obligations proved (${secs}s)"
-        else
-            echo ">>> SigilProofs: FAIL - proof did not check" >&2
-            tail -40 "$WORK/tlaps.log" >&2
-            status=1
+        prove SigilProofs.tla
+        if [[ "${SIGIL_ROT_PROOF:-0}" == "1" ]]; then
+            prove SigilRotProofs.tla
         fi
+    elif [[ "$(uname -s)-$(uname -m)" == "Linux-x86_64" ]]; then
+        # On the platform tlapm supports, a missing prover is a failure, never
+        # a silent skip: a green run must mean the proofs were checked.
+        echo ">>> TLAPS: FAIL - could not install tlapm (see above)" >&2
+        status=1
     else
         echo ">>> TLAPS unavailable on this platform; skipping the proof" >&2
         echo "    (set SIGIL_SKIP_TLAPS=1 to silence, or run on Linux x86_64)" >&2
@@ -106,13 +129,23 @@ fi
 # ----------------------------------------------------------------- TLC configs
 if [[ $# -gt 0 ]]; then
     CONFIGS=("$@")
+elif [[ "${SIGIL_ROT_PROOF:-0}" == "1" ]]; then
+    # The rotation proof's TLC instances (slow; CI job rotation-proof).
+    CONFIGS=(MC_rotp.cfg MC_rotp_noown_mutant.cfg MC_rotp_resolve_mutant.cfg
+             MC_rotp_sibling_mutant.cfg MC_rotp_top_mutant.cfg
+             MC_rotp_witness.cfg MC_rotp_witness_abstain.cfg MC_rotp_witness_crel.cfg
+             MC_rotp_witness_lone.cfg MC_rotp_witness_resolve.cfg)
 else
     CONFIGS=(MC.cfg MC_all.cfg MC_lazy.cfg MC_mutant.cfg
              MC_multi.cfg MC_multi_all.cfg MC_multi_mutant.cfg
              MC_proofs_witness.cfg MC_proofs_witness2.cfg
-             MC_rot.cfg MC_rot_mutant.cfg MC_rot_sibling.cfg MC_rot_sibling4.cfg MC_rot_sibling_witness.cfg MC_rot_sibling_witness2.cfg
+             MC_rot.cfg MC_rot_mutant.cfg MC_rot_sibling.cfg MC_rot_sibling4.cfg MC_rot_sibling_witness.cfg MC_rot_sibling_witness2.cfg MC_rot_sibling_witness3.cfg MC_rot_sibling_v1_mutant.cfg
              MC_expiry.cfg MC_expiry_mutant.cfg MC_expiry_skew_mutant.cfg
              MC_deep.cfg MC_deep_mutant.cfg
+             MC_wallet.cfg MC_wallet_live.cfg MC_wallet_code.cfg
+             MC_wallet_gen_mutant.cfg MC_wallet_pending_mutant.cfg MC_wallet_abort_mutant.cfg
+             MC_wallet_crash_mutant.cfg MC_wallet_expiry_mutant.cfg MC_wallet_status_mutant.cfg
+             MC_wallet_noproof_mutant.cfg MC_wallet_witness.cfg MC_wallet_witness2.cfg
              ${SIGIL_TLC_EXTRA:-})
 fi
 
@@ -120,9 +153,12 @@ module_for() {   # map a config name to its TLA module
     case "$1" in
         MC_multi*)  echo MC_multi.tla ;;
         MC_proofs*) echo MC_proofs.tla ;;
+        MC_rotp_witness*) echo MC_rotpw.tla ;;
+        MC_rotp*)   echo MC_rotp.tla ;;
         MC_rot*)    echo MC_rot.tla ;;
         MC_expiry*) echo SigilExpiry.tla ;;
         MC_deep*)   echo SigilDeep.tla ;;
+        MC_wallet*) echo MC_wallet.tla ;;
         *)          echo MC.tla ;;
     esac
 }
@@ -131,13 +167,14 @@ for cfg in "${CONFIGS[@]}"; do
     name="$(basename "$cfg" .cfg)"
     case "$cfg" in /*) cfgpath="$cfg" ;; *) cfgpath="$HERE/$cfg" ;; esac
     module="$(module_for "$name")"
-    # MC_proofs* extend the TLAPS standard library (FiniteSetTheorems, TLAPS).
+    # MC_proofs* and MC_rotp* extend the TLAPS standard library (FiniteSetTheorems, TLAPS).
     libarg=()
-    if [[ "$name" == MC_proofs* ]]; then
+    if [[ "$name" == MC_proofs* || "$name" == MC_rotp* ]]; then
         if [[ -d "$STDLIB" ]] || ensure_tlapm; then
             libarg=("-DTLA-Library=$STDLIB")
         else
-            echo "=== TLC: $name ===" ; echo ">>> $name: SKIP (needs TLAPS libraries)" >&2
+            echo "=== TLC: $name ===" ; echo ">>> $name: FAIL (needs the TLAPS libraries; tlapm did not install)" >&2
+            status=1
             continue
         fi
     fi
@@ -155,7 +192,9 @@ for cfg in "${CONFIGS[@]}"; do
 
     case "$name" in
         *mutant*|*witness*)   # expected to find a counterexample
-            if [[ $rc -ne 0 ]] && grep -q "Invariant .* is violated" "$log"; then
+            # An invariant counterexample, or (for *_live / liveness mutants) a
+            # temporal-property counterexample.
+            if [[ $rc -ne 0 ]] && grep -qE "Invariant .* is violated|Temporal properties were violated" "$log"; then
                 echo ">>> $name: counterexample found as expected (${secs}s)"
             else
                 echo ">>> $name: FAIL - expected a violation, found none (rc=$rc)" >&2
