@@ -865,12 +865,163 @@ def gossip_script():
     return sc.done(registries={"v0": {X: chain0}}, cid=X)
 
 
+def limits_script():
+    """Resource bounds (docs/AI_THREAT_MODEL.md §2.6): the authorisation, death-proof and
+    per-sigil binding caps of SPEND and RELEASE, ADOPT keeping each evidence entry once, and the
+    charter caps in gossip. Every refusal is a clean rejection: the ``record`` steps show the
+    state did not change. Old charter X v0 = l0..l3; l3 takes the size and binding steps, l0
+    (with l1, l2, not replayed) freezes for v1 = m0, which adopts their snapshots twice over.
+    """
+    from sigil import witness as W
+    from sigil.charter import MAX_CHARTER_BYTES, MAX_WITNESSES
+
+    old = [kp(1100 + i) for i in range(4)]
+    body0 = charter_body("lim", 0, [k.pk for k in old], None)
+    X = constellation_id(body0)
+    chain0 = [{"body": body0, "sigs": {}}]
+    reg0 = Registry()
+    reg0.add_chain(X, chain0)
+    clock = [1700000000]
+    sc = Script(clock)
+    o = [Witness(k, reg0, lambda: clock[0]) for k in old]
+    for w in o:
+        w.join(X, 0)
+    sc.add("l0", o[0], 1100, "v0")
+    sc.add("l3", o[3], 1103, "v0")
+    owner = kp(1150)
+    exp = 1700000000 + 10 ** 6
+    t = [1700000100]
+
+    def mk(salt):
+        p = {"home": X, "lock": locks.sig(owner.pk), "salt": salt}
+        return p, model.sigil_of(p)
+
+    def req(h, sigil, p):
+        u = locks.empty_unlock(exp)
+        u["sigs"][owner.pk] = locks.sign_unlock(owner, sigil, model.transition_id(h), exp)
+        return {"sigil": sigil, "header": h, "home": X, "lock": p["lock"], "salt": p["salt"], "unlock": u}
+
+    def auth_len(r):
+        return len(canonical({k: r[k] for k in ("home", "lock", "salt", "unlock", "header")}))
+
+    def step(op, *args, who="l3"):
+        t[0] += 1
+        return sc.run(who, op, t[0], *args)
+
+    # SPEND: an authorisation of exactly MAX_AUTH_BYTES binds; one byte more is refused.
+    p1, s1 = mk("e")
+    n = W.MAX_AUTH_BYTES - auth_len(req({"inputs": [[s1, 0]], "body": "11" * 32}, s1, p1)) + 1
+    p_fit, s_fit = mk("e" * n)
+    p_big, s_big = mk("e" * (n + 1))
+    r_fit = req({"inputs": [[s_fit, 0]], "body": "11" * 32}, s_fit, p_fit)
+    assert auth_len(r_fit) == W.MAX_AUTH_BYTES
+    step("spend", req({"inputs": [[s_big, 0]], "body": "11" * 32}, s_big, p_big))
+    step("record", s_big)
+    step("spend", r_fit)
+    step("spend", dict(r_fit, unlock=dict(r_fit["unlock"], pad="0" * 64)))  # padding past the cap
+
+    # A kill switch k sealed once kills every header {[s, g], [k, 0]}.
+    pk_, k = mk("ab" * 16)
+    hk = {"inputs": [[k, 0]], "body": "22" * 32}
+    votes = [step("spend", req(hk, k, pk_), who="l0")["ok"]]
+    for w in o[1:3]:
+        votes.append(w.spend(req(hk, k, pk_)))
+    votes.append(step("spend", req(hk, k, pk_))["ok"])
+    seal = model.seal_from_votes(votes)
+    proof = {"kind": "seal", "sigil": k, "gen": 0, "seal": seal,
+             "parcel": {"home": X, "lock": pk_["lock"], "salt": pk_["salt"]}}
+    pad = len(canonical(dict(proof, junk="")))
+    exact = dict(proof, junk="0" * (W.MAX_PROOF_BYTES - pad))
+    over = dict(proof, junk="0" * (W.MAX_PROOF_BYTES - pad + 1))
+    p, s = mk("cd" * 16)
+    for g in range(W.MAX_BINDS + 1):
+        h = {"inputs": [[s, g], [k, 0]], "body": "%064x" % g}
+        if step("spend", req(h, s, p)).get("error"):
+            step("spend", req(h, s, p))                     # still refused (the record below is unchanged)
+            break
+        if g == 0:
+            step("release", s, over)                        # one byte past the cap
+            step("record", s)
+            step("release", s, exact)                       # exactly the cap: released
+        else:
+            step("release", s, proof)
+    step("record", s)
+    step("status", s)
+
+    # ADOPT: three signers hand over the same entries (twice over); each is kept once.
+    p2, s2 = mk("ef" * 16)
+    h2 = {"inputs": [[s2, 0]], "body": "33" * 32}
+    step("spend", req(h2, s2, p2), who="l0")
+    for w in o[1:]:
+        w.spend(req(h2, s2, p2))
+    newk = [kp(1120)]
+    nxt = charter_body("lim", 1, [k_.pk for k_ in newk], charter_hash(body0))
+    t[0] += 1
+    snap0 = sc.run("l0", "freeze", t[0], nxt)["ok"]["snapshot"]
+    sigs, snaps = {old[0].pk: sign_charter(old[0], nxt)}, [snap0]
+    for w in o[1:3]:
+        sig, snap = w.freeze(nxt)
+        sigs[w.pk] = sig
+        snaps.append(snap)
+    reg1 = Registry()
+    reg1.add_chain(X, chain0 + [{"body": nxt, "sigs": sigs}])
+    sc.add("m0", Witness(newk[0], reg1, lambda: clock[0]), 1120, "v1", adopt=True)
+    sc.run("m0", "adopt", 1700001000, X, 1, snaps + snaps)
+    for x in (s2, k, s):
+        sc.run("m0", "record", 1700001001, x)
+
+    # Gossip: charters over MAX_WITNESSES or MAX_CHARTER_BYTES are dropped.
+    def genesis_chain(witnesses, name="g", sigs=None):
+        b = {"name": name, "version": 0, "witnesses": witnesses, "prev": None}
+        return constellation_id(b), [{"body": b, "sigs": sigs or {}}]
+
+    many = ["%064x" % i for i in range(MAX_WITNESSES + 1)]
+    run = lambda op, *a: sc.run("l3", op, 1700002000 + len(sc.steps), *a)  # noqa: E731
+    for chain in (genesis_chain(many), genesis_chain(many[:MAX_WITNESSES]),
+                  genesis_chain(many[:4], name="n" * MAX_CHARTER_BYTES),
+                  genesis_chain(many[:4], sigs={"%064x" % (10 ** 6 + i): "00" * 64 for i in range(400)})):
+        run("gossip", {"charters": {chain[0]: chain[1]}})
+    extra = MAX_CHARTER_BYTES - len(canonical(genesis_chain(many[:4], name="")[1][0]))  # the longest name that fits
+    for name_len in (extra, extra + 1):
+        c = genesis_chain(many[:4], name="n" * name_len)
+        run("gossip", {"charters": {c[0]: c[1]}})
+    return sc.done(registries={"v0": {X: chain0}, "v1": {X: reg1.chain(X)}}, cid=X)
+
+
+def ratelimit_cases():
+    """``sigil.ratelimit``: token-bucket verdicts for a fixed clock script, client keys, loopback."""
+    from sigil import ratelimit as RL
+    out = {"defaults": {"rate": RL.DEFAULT_RATE, "burst": RL.DEFAULT_BURST, "max_clients": RL.MAX_CLIENTS,
+                        "max_connections": RL.MAX_CONNECTIONS, "max_client_connections": RL.MAX_CLIENT_CONNECTIONS,
+                        "idle_timeout": RL.IDLE_TIMEOUT}}
+    scripts = []
+    for rate, burst, max_clients in ((2.0, 3, 2), (RL.DEFAULT_RATE, RL.DEFAULT_BURST, 3), (0.3, 1, 4), (7.5, 5, 1)):
+        lim = RL.RateLimiter(rate, burst, max_clients=max_clients)
+        calls = []
+        now = 0.0
+        for i in range(400):
+            key = "abcde"[rng.randrange(5 if max_clients > 1 else 2)]
+            now += rng.choice([0.0, 0.0, 0.01, 0.05, 0.1, 0.333, 1.0, 2.5])
+            calls.append([key, now, lim.admit(key, now)])
+        scripts.append({"rate": rate, "burst": burst, "max_clients": max_clients, "calls": calls})
+    out["buckets"] = scripts
+    out["keys"] = [[h, RL.client_key(h)] for h in (
+        "10.1.2.3", "127.0.0.1", "::ffff:10.1.2.3", "2001:db8:1:2:3:4:5:6", "2001:db8::1", "::1", "::",
+        "fe80::1:2:3:4", "2001:db8:ffff:ffff:ffff:ffff:ffff:ffff", "example", "")]
+    out["loopback"] = [[h, RL.is_loopback(h)] for h in (
+        "127.0.0.1", "127.9.9.9", "::1", "localhost", "0.0.0.0", "::", "10.0.0.1", "192.168.1.1", "host", "")]
+    return out
+
+
 def main():
     vectors = {
         "canonical": canonical_cases(), "keys": key_cases(), "model": model_cases(), "locks": lock_cases(),
         "proofs": proof_cases(), "witness": witness_script(), "rotation": rotation_script(), "rotation_top": rotation_top_scripts(),
         "stamps": stamp_cases(), "gossip": gossip_script(),
     }
+    # Last, so the seeded RNG gives every earlier section the same values as before.
+    vectors["limits"] = limits_script()
+    vectors["ratelimit"] = ratelimit_cases()
     json.dump(vectors, sys.stdout, sort_keys=True, indent=None, separators=(",", ":"))
     sys.stdout.write("\n")
 
