@@ -267,7 +267,7 @@ fn witness_script_matches_reference() {
 
 #[test]
 fn limits_script_matches_reference() {
-    // The size caps of SPEND and RELEASE, the per-sigil binding cap, ADOPT keeping each evidence
+    // The size caps of SPEND and RELEASE, the per-sigil generation cap, ADOPT keeping each evidence
     // entry once and the charter caps in gossip (docs/AI_THREAT_MODEL.md §2.6).
     let v = vectors();
     let n = replay_script(v.get("limits").unwrap(), None);

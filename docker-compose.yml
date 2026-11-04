@@ -8,6 +8,12 @@
 # `init` creates the keys, the genesis charter and directory.json once, in the
 # shared `net` volume. Each witness keeps its durable store in its own volume.
 # Witnesses are published on host ports 7001-7004. See testnet/README.md.
+#
+# Each witness listens on 0.0.0.0 inside its container, which turns on the per-client
+# rate limit by default (docs/WIRE.md "Admission control"). The ports are published on
+# 127.0.0.1 only and every host client reaches a container from the bridge's one
+# address, so this local testnet disables it with --rate-limit 0. Drop that flag (and
+# publish on a public address) to run the containers as open-network witnesses.
 
 x-witness: &witness
   build: .
@@ -33,25 +39,25 @@ services:
 
   witness1:
     <<: *witness
-    command: ["exec python -m sigil.witnessd run --key /net/keys/w1.json --registry /net/registry.json --constellation $$(cat /net/cid) --store /data/witness.db --host 0.0.0.0 --port 7000"]
+    command: ["exec python -m sigil.witnessd run --key /net/keys/w1.json --registry /net/registry.json --constellation $$(cat /net/cid) --store /data/witness.db --host 0.0.0.0 --port 7000 --rate-limit 0"]
     ports: ["127.0.0.1:7001:7000"]
     volumes: ["net:/net:ro", "data1:/data"]
 
   witness2:
     <<: *witness
-    command: ["exec python -m sigil.witnessd run --key /net/keys/w2.json --registry /net/registry.json --constellation $$(cat /net/cid) --store /data/witness.db --host 0.0.0.0 --port 7000"]
+    command: ["exec python -m sigil.witnessd run --key /net/keys/w2.json --registry /net/registry.json --constellation $$(cat /net/cid) --store /data/witness.db --host 0.0.0.0 --port 7000 --rate-limit 0"]
     ports: ["127.0.0.1:7002:7000"]
     volumes: ["net:/net:ro", "data2:/data"]
 
   witness3:
     <<: *witness
-    command: ["exec python -m sigil.witnessd run --key /net/keys/w3.json --registry /net/registry.json --constellation $$(cat /net/cid) --store /data/witness.db --host 0.0.0.0 --port 7000"]
+    command: ["exec python -m sigil.witnessd run --key /net/keys/w3.json --registry /net/registry.json --constellation $$(cat /net/cid) --store /data/witness.db --host 0.0.0.0 --port 7000 --rate-limit 0"]
     ports: ["127.0.0.1:7003:7000"]
     volumes: ["net:/net:ro", "data3:/data"]
 
   witness4:
     <<: *witness
-    command: ["exec python -m sigil.witnessd run --key /net/keys/w4.json --registry /net/registry.json --constellation $$(cat /net/cid) --store /data/witness.db --host 0.0.0.0 --port 7000"]
+    command: ["exec python -m sigil.witnessd run --key /net/keys/w4.json --registry /net/registry.json --constellation $$(cat /net/cid) --store /data/witness.db --host 0.0.0.0 --port 7000 --rate-limit 0"]
     ports: ["127.0.0.1:7004:7000"]
     volumes: ["net:/net:ro", "data4:/data"]
 

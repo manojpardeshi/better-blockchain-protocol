@@ -25,7 +25,7 @@ from sigil.encoding import canonical
 from sigil.gossip import GossipStore
 from sigil.server import RemoteWitness, WitnessServer
 from sigil.store import WitnessStore
-from sigil.witness import MAX_AUTH_BYTES, MAX_BINDS, MAX_PROOF_BYTES, Rejected, Witness
+from sigil.witness import MAX_AUTH_BYTES, MAX_GEN, MAX_PROOF_BYTES, Rejected, Witness
 
 FAR = 4_000_000_000
 
@@ -189,7 +189,7 @@ class StorageBounds(unittest.TestCase):
         pad = len(canonical(dict(proof, junk="")))
         w = self.ws[0]
         s = None
-        for g in range(MAX_BINDS):
+        for g in range(MAX_GEN):
             p = model.parcel(self.c, "x", 1, locks.sig(self.owner.pk), "cd" * 16)
             s = model.sigil_of(p)
             req, _ = spend_req(self.c, self.owner, "cd" * 16, inputs=[[s, g], [k, 0]], memo="%064x" % g)
@@ -199,9 +199,9 @@ class StorageBounds(unittest.TestCase):
                 w.release(s, dict(proof, junk="0" * (MAX_PROOF_BYTES - pad + 1)))
             self.assertEqual(asdict(w.records[s]), before)
             self.assertEqual(w.release(s, dict(proof, junk="0" * (MAX_PROOF_BYTES - pad)) if g == 0 else proof), g + 1)
-        req, _ = spend_req(self.c, self.owner, "cd" * 16, inputs=[[s, MAX_BINDS], [k, 0]], memo="ff" * 32)
+        req, _ = spend_req(self.c, self.owner, "cd" * 16, inputs=[[s, MAX_GEN], [k, 0]], memo="ff" * 32)
         before = asdict(w.records[s])
-        with self.assertRaisesRegex(Rejected, "too many bindings for this sigil"):
+        with self.assertRaisesRegex(Rejected, "generation limit reached for this sigil"):
             w.spend(req)
         self.assertEqual(asdict(w.records[s]), before)
 
@@ -216,6 +216,28 @@ class StorageBounds(unittest.TestCase):
         # Before: 8, 32, 128, 512 (every signer handed over the same entries).
         self.assertEqual(lengths, [lengths[0]] * 4)
         self.assertLessEqual(lengths[0], 5)
+
+    def test_junk_adopt_evidence_cannot_block_an_honest_owner(self):
+        """A per-log count of bind entries would let a Byzantine predecessor freeze an
+        honest coin by padding its evidence with junk binds; the cap reads the
+        record's generation, which junk cannot raise."""
+        from sigil.charter import charter_hash
+        kp = KeyPair.generate()
+        cur = self.net.registry.latest(self.c)
+        nxt = charter_body(cur["name"], 1, [kp.pk], charter_hash(cur))
+        sigs, snaps = {}, []
+        for w in self.ws[:3]:
+            sig, snap = w.freeze(nxt)
+            sigs[w.pk] = sig
+            snaps.append(snap)
+        self.net.registry.add_chain(self.c, self.net.registry.chain(self.c) + [{"body": nxt, "sigs": sigs}])
+        fresh, _ = spend_req(self.c, self.owner, "cd" * 16)
+        junk = {fresh["sigil"]: [{"kind": "bind", "gen": i, "auth": None} for i in range(3 * MAX_GEN)]}
+        a = Witness(kp, self.net.registry, self.net.clock)
+        a.adopt(self.c, 1, snaps + [junk])
+        self.assertEqual(len(a.records[fresh["sigil"]].log), 3 * MAX_GEN)
+        self.assertEqual(a.records[fresh["sigil"]].gen, 0)
+        self.assertEqual(a.spend(fresh)["witness"], kp.pk)
 
     def test_store_keeps_one_row_per_key(self):
         """Before: every update appended the whole record again, so a sigil with L

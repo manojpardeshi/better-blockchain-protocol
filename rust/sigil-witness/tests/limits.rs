@@ -14,7 +14,7 @@ use sigil_witness::json::{obj, parse, Json};
 use sigil_witness::ratelimit::{ConnectionLimiter, RateLimiter};
 use sigil_witness::store::Store;
 use sigil_witness::testkit::{genesis, seal_from_votes, spend_request};
-use sigil_witness::witness::{system_clock, Error, Witness, MAX_AUTH_BYTES, MAX_BINDS, MAX_PROOF_BYTES};
+use sigil_witness::witness::{system_clock, Error, Witness, MAX_AUTH_BYTES, MAX_GEN, MAX_PROOF_BYTES};
 
 const FAR: i128 = 4_000_000_000;
 
@@ -68,7 +68,7 @@ fn oversized_spend_is_rejected_and_stores_nothing() {
 }
 
 #[test]
-fn a_sigil_holds_at_most_max_binds_bindings_and_proofs_are_capped() {
+fn a_sigil_is_bound_at_most_max_gen_times_and_proofs_are_capped() {
     let (keys, cid, reg) = constellation("lim-b", 4);
     let ws: Vec<Witness> = (0..4).map(|i| witness(&format!("lim-b{i}"), &reg, &cid)).collect();
     let owner = KeyPair::from_py_seed(b"lim-owner");
@@ -105,7 +105,7 @@ fn a_sigil_holds_at_most_max_binds_bindings_and_proofs_are_capped() {
         match w.spend(&req).0 {
             Ok(_) => binds += 1,
             Err(e) => {
-                assert_eq!(e, Error::Rejected("too many bindings for this sigil".into()));
+                assert_eq!(e, Error::Rejected("generation limit reached for this sigil".into()));
                 let before = w.record(&s).unwrap();
                 assert_eq!(w.spend(&req).0, Err(e), "still refused");
                 assert_eq!(w.record(&s).unwrap(), before, "a refused SPEND changes nothing");
@@ -117,9 +117,9 @@ fn a_sigil_holds_at_most_max_binds_bindings_and_proofs_are_capped() {
         assert_eq!(w.record(&s).unwrap(), before, "a refused RELEASE changes nothing");
         assert_eq!(w.release(&Json::str(&s), &proof).0, Ok(Json::Int(g + 1)));
     }
-    assert_eq!(binds, MAX_BINDS);
+    assert_eq!(binds, MAX_GEN);
     let stored = w.record(&s).unwrap().to_json().canonical().len();
-    assert!(stored < MAX_BINDS * MAX_AUTH_BYTES / 8, "{stored}");
+    assert!(stored < MAX_GEN as usize * MAX_AUTH_BYTES / 8, "{stored}");
     let _ = keys;
 }
 
@@ -155,10 +155,19 @@ fn adopt_keeps_each_evidence_entry_once() {
     // The same snapshot three times over, as honest signers hand it over.
     let mut three = snaps.clone();
     three.extend(snaps.iter().cloned());
+    // A Byzantine signer pads an honest owner's unbound sigil with junk bind entries.
+    let (fresh, fs, _) = spend_request(&owner, &cid, &"cd".repeat(16), 0, FAR, "fresh");
+    let junk: Vec<Json> =
+        (0..3 * MAX_GEN).map(|i| obj([("kind", "bind".into()), ("gen", Json::Int(i)), ("auth", Json::Null)])).collect();
+    three.push(Json::Obj([(fs.clone(), Json::Arr(junk))].into_iter().collect()));
     a.adopt(&Json::str(&cid), &Json::Int(1), &three).0.unwrap();
     // One bind entry (identical in every snapshot) and the three signers' own votes.
     let log = a.record(&s).unwrap().log;
     assert_eq!(log.len(), 4, "{}", Json::Arr(log.clone()).canonical_string());
+    // The junk never counts, and the generation cap reads the record: the owner can spend.
+    let r = a.record(&fs).unwrap();
+    assert_eq!((r.log.len() as i128, r.gen), (3 * MAX_GEN, 0));
+    assert!(a.spend(&fresh).0.is_ok());
 }
 
 fn chain_json(name: &str, n: usize, pad_name: usize) -> (String, Json) {

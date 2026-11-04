@@ -157,8 +157,8 @@ def sigil_log_growth(cycles: int = 40):
     release each binding with the same proof, padded with ~800 KiB of junk.
     Before the caps every cycle added an authorisation and the padded proof to
     the record (which is rewritten whole on every update); now RELEASE refuses
-    proofs over ``MAX_PROOF_BYTES`` and a sigil holds at most ``MAX_BINDS``
-    bindings.
+    proofs over ``MAX_PROOF_BYTES`` and a sigil is newly bound only below
+    generation ``MAX_GEN``.
     """
     from sigil import witness as W
     net = Network()
@@ -189,7 +189,7 @@ def sigil_log_growth(cycles: int = 40):
             w.release(s, proof)
     return {"cycles_tried": cycles, "binds": binds, "padded_proofs_stored": padded,
             "padded_proof_bytes": len(json.dumps(padded_proof)),
-            "record_bytes": _stored(w, s), "max_binds": getattr(W, "MAX_BINDS", None)}
+            "record_bytes": _stored(w, s), "max_gen": getattr(W, "MAX_GEN", None)}
 
 
 def rotation_log_growth(rotations: int = 6):

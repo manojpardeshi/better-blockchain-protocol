@@ -104,12 +104,12 @@ class Resources(unittest.TestCase):
     def test_per_sigil_record_is_bounded(self):
         """Before: 40 bind/release cycles with junk-padded death proofs grew one
         sigil's record to ~32 MB (rewritten whole on every update). Now proofs
-        over MAX_PROOF_BYTES are refused and a sigil holds MAX_BINDS bindings."""
-        from sigil.witness import MAX_AUTH_BYTES, MAX_BINDS
+        over MAX_PROOF_BYTES are refused and a sigil is bound only below MAX_GEN."""
+        from sigil.witness import MAX_AUTH_BYTES, MAX_GEN
         r = resources.sigil_log_growth()
-        self.assertEqual(r["binds"], MAX_BINDS)
+        self.assertEqual(r["binds"], MAX_GEN)
         self.assertEqual(r["padded_proofs_stored"], 0)
-        self.assertLess(r["record_bytes"], MAX_BINDS * (MAX_AUTH_BYTES // 8))
+        self.assertLess(r["record_bytes"], MAX_GEN * (MAX_AUTH_BYTES // 8))
 
     def test_rotation_does_not_multiply_evidence(self):
         """Before: each rotation multiplied a bound sigil's evidence log by the

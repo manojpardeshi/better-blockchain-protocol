@@ -47,7 +47,7 @@ CONTESTED = "!contested"
 # abstention, which is always safe, so these bound storage without touching safety.
 MAX_AUTH_BYTES = 32 << 10    # enc({home, lock, salt, unlock, header}) of a SPEND
 MAX_PROOF_BYTES = 128 << 10  # enc(proof) of a RELEASE (a death proof for 128 witnesses fits)
-MAX_BINDS = 16               # bind entries one sigil's log may hold; a further binding is refused
+MAX_GEN = 16                 # a sigil is newly bound only below this generation (so at most 16 times)
 
 
 def _encoding(x):
@@ -215,8 +215,13 @@ class Witness:
             # expired, an owner can safely conclude a failed spend is dead.
             if int(self.clock()) > auth["unlock"]["expires"]:
                 raise Rejected("authorisation expired")
-            if sum(1 for e in rec.log if e.get("kind") == "bind") >= MAX_BINDS:
-                raise Rejected("too many bindings for this sigil")
+            # Each new binding is at a higher generation than the last (a release
+            # moves past it), so this bounds the bindings one sigil can collect. It
+            # reads our own counter, not the log: ADOPT evidence from a Byzantine
+            # predecessor can hold junk entries, but cannot raise a generation
+            # without the owner's signature or a valid death proof.
+            if gen >= MAX_GEN:
+                raise Rejected("generation limit reached for this sigil")
             rec.tid, rec.header = tid, auth["header"]
             rec.log.append({"kind": "bind", "gen": gen, "auth": auth})
         if rec.tid != tid:

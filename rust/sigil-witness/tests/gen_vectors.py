@@ -867,7 +867,7 @@ def gossip_script():
 
 def limits_script():
     """Resource bounds (docs/AI_THREAT_MODEL.md §2.6): the authorisation, death-proof and
-    per-sigil binding caps of SPEND and RELEASE, ADOPT keeping each evidence entry once, and the
+    per-sigil generation cap of SPEND and RELEASE, ADOPT keeping each evidence entry once, and the
     charter caps in gossip. Every refusal is a clean rejection: the ``record`` steps show the
     state did not change. Old charter X v0 = l0..l3; l3 takes the size and binding steps, l0
     (with l1, l2, not replayed) freezes for v1 = m0, which adopts their snapshots twice over.
@@ -934,7 +934,7 @@ def limits_script():
     exact = dict(proof, junk="0" * (W.MAX_PROOF_BYTES - pad))
     over = dict(proof, junk="0" * (W.MAX_PROOF_BYTES - pad + 1))
     p, s = mk("cd" * 16)
-    for g in range(W.MAX_BINDS + 1):
+    for g in range(W.MAX_GEN + 1):
         h = {"inputs": [[s, g], [k, 0]], "body": "%064x" % g}
         if step("spend", req(h, s, p)).get("error"):
             step("spend", req(h, s, p))                     # still refused (the record below is unchanged)
@@ -966,9 +966,14 @@ def limits_script():
     reg1 = Registry()
     reg1.add_chain(X, chain0 + [{"body": nxt, "sigs": sigs}])
     sc.add("m0", Witness(newk[0], reg1, lambda: clock[0]), 1120, "v1", adopt=True)
-    sc.run("m0", "adopt", 1700001000, X, 1, snaps + snaps)
-    for x in (s2, k, s):
+    # A Byzantine signer pads an honest owner's unbound sigil with junk bind entries: they
+    # never count, and the generation cap reads the record, so the owner can still spend.
+    p3, s3 = mk("fe" * 16)
+    junk = [{s3: [{"kind": "bind", "gen": i, "auth": None} for i in range(2 * W.MAX_GEN)]}]
+    sc.run("m0", "adopt", 1700001000, X, 1, snaps + snaps + junk)
+    for x in (s2, k, s, s3):
         sc.run("m0", "record", 1700001001, x)
+    sc.run("m0", "spend", 1700001002, req({"inputs": [[s3, 0]], "body": "44" * 32}, s3, p3))
 
     # Gossip: charters over MAX_WITNESSES or MAX_CHARTER_BYTES are dropped.
     def genesis_chain(witnesses, name="g", sigs=None):

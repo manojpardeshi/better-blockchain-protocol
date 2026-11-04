@@ -35,8 +35,9 @@ pub const CONTESTED: &str = "!contested";
 pub const MAX_AUTH_BYTES: usize = 32 << 10;
 /// `enc(proof)` of a RELEASE (`witness.MAX_PROOF_BYTES`).
 pub const MAX_PROOF_BYTES: usize = 128 << 10;
-/// Bind entries one sigil's log may hold; a further binding is refused (`witness.MAX_BINDS`).
-pub const MAX_BINDS: usize = 16;
+/// A sigil is newly bound only below this generation, so at most this many times
+/// (`witness.MAX_GEN`).
+pub const MAX_GEN: i128 = 16;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Error {
@@ -454,8 +455,12 @@ impl Witness {
             if now > expires {
                 return rejected("authorisation expired");
             }
-            if rec.log.iter().filter(|e| e.get("kind").and_then(Json::as_str) == Some("bind")).count() >= MAX_BINDS {
-                return rejected("too many bindings for this sigil");
+            // Each new binding is at a higher generation than the last, so this bounds the
+            // bindings one sigil can collect. It reads our own counter, not the log: ADOPT
+            // evidence can hold junk entries, but cannot raise a generation without the
+            // owner's signature or a valid death proof.
+            if gen >= MAX_GEN {
+                return rejected("generation limit reached for this sigil");
             }
             rec.tid = Some(tid.clone());
             rec.header = auth.get("header").cloned();
