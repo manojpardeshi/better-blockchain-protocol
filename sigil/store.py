@@ -1,11 +1,11 @@
-"""Durable witness state: an append-only log in SQLite.
+"""Durable witness state: a log of state changes in SQLite.
 
 A witness that forgets a vote after a crash could vote again for a
 different transition at the same ``(sigil, gen)``, which is equivocation.
 The store makes every state change durable before the witness answers.
 
-The log is a single table of ``(seq, kind, key, value)`` rows that is only
-ever appended to; the current state is the last value per ``(kind, key)``.
+The log is a single table of ``(seq, kind, key, value)`` rows; the current
+state is the last value per ``(kind, key)``.
 Kinds:
 
 * ``pk``      -- the witness key this store belongs to (guards against mix-ups)
@@ -16,8 +16,10 @@ Kinds:
 
 Each ``append`` is one transaction committed in WAL mode with
 ``synchronous=FULL``, so once it returns the rows survive a crash or power
-loss, and a batch is applied entirely or not at all. Compaction is left
-out: logs only grow, which is fine for a prototype.
+loss, and a batch is applied entirely or not at all. The same transaction
+deletes the rows a batch supersedes, so the table keeps one row per
+``(kind, key)`` (a store written before that may hold more; ``load`` still
+takes the last).
 """
 
 import json
@@ -37,12 +39,19 @@ class WitnessStore:
             "CREATE TABLE IF NOT EXISTS log ("
             "seq INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL)"
         )
+        self.db.execute("CREATE INDEX IF NOT EXISTS log_kind_key ON log (kind, key)")
 
     def append(self, entries: list[tuple[str, str, object]]) -> None:
-        """Durably append ``(kind, key, value)`` entries as one atomic batch."""
+        """Durably append ``(kind, key, value)`` entries as one atomic batch.
+
+        Older rows for the same ``(kind, key)`` are deleted in the same
+        transaction: only the last value counts, and keeping every earlier
+        one made a sigil's record cost the sum of all its past sizes.
+        """
         rows = [(kind, key, canonical(value).decode()) for kind, key, value in entries]
         self.db.execute("BEGIN IMMEDIATE")
         try:
+            self.db.executemany("DELETE FROM log WHERE kind = ? AND key = ?", [r[:2] for r in rows])
             self.db.executemany("INSERT INTO log (kind, key, value) VALUES (?, ?, ?)", rows)
         except BaseException:
             self.db.execute("ROLLBACK")

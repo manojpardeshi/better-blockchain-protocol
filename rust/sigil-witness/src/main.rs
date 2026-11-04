@@ -20,7 +20,7 @@ use std::io::Write;
 use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
-use sigil_witness::charter::{constellation_id, short};
+use sigil_witness::charter::{constellation_id, short, MAX_WITNESSES};
 use sigil_witness::json::{obj, parse, Json};
 use sigil_witness::stamps::load_mint;
 use sigil_witness::store::Store;
@@ -164,6 +164,9 @@ fn genesis(name: &str, keys: &[String], out: &str) -> Result<(), String> {
     uniq.dedup();
     if pks.is_empty() || uniq.len() != pks.len() {
         return Err("witness list must be non-empty and unique".into());
+    }
+    if pks.len() > MAX_WITNESSES {
+        return Err(format!("a charter names at most {MAX_WITNESSES} witnesses"));
     }
     let body = obj([
         ("name", Json::str(name)),

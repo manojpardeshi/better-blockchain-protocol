@@ -6,7 +6,13 @@ holder can verify the whole membership history from the id alone.
 """
 
 from .crypto import KeyPair, verify
-from .encoding import digest
+from .encoding import canonical, digest
+
+# Size of one charter version (SPEC §3.7). Genesis charters need no signatures and
+# anyone may gossip one, so without these one 1 MiB message could register a
+# constellation of ~14,000 witnesses (or a 1 MiB name, or 1 MiB of junk signatures).
+MAX_WITNESSES = 128            # members of one charter version
+MAX_CHARTER_BYTES = 64 << 10   # enc(charter): its body and signatures
 
 
 def faults(n: int) -> int:
@@ -22,6 +28,8 @@ def quorum(n: int) -> int:
 def charter_body(name: str, version: int, witnesses: list, prev: str | None) -> dict:
     if len(set(witnesses)) != len(witnesses) or not witnesses:
         raise ValueError("witness list must be non-empty and unique")
+    if len(witnesses) > MAX_WITNESSES:
+        raise ValueError(f"a charter names at most {MAX_WITNESSES} witnesses")
     return {"name": name, "version": version, "witnesses": list(witnesses), "prev": prev}
 
 
@@ -47,6 +55,8 @@ def verify_chain(cid: str, chain: list) -> bool:
     for c in chain:
         ws = c["body"]["witnesses"]
         if not ws or len(set(ws)) != len(ws):  # an empty charter would accept unsigned evidence
+            return False
+        if len(ws) > MAX_WITNESSES or len(canonical(c)) > MAX_CHARTER_BYTES:
             return False
     for prev, cur in zip(chain, chain[1:]):
         pb, cb = prev["body"], cur["body"]
