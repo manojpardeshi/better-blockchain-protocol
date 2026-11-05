@@ -42,7 +42,7 @@ TLA_URL="https://github.com/tlaplus/tlaplus/releases/download/v${TLA_VERSION}/tl
 # silently skips the proofs). Re-check both proofs with the new build, then
 # update the hash here and the cache key in .github/workflows/test.yml.
 TLAPM_VERSION="1.6.0-pre"
-TLAPM_SHA256="39620b869ed939d991f5e2c4d604d84d16c05c5dd95787a1e5f47da296746b7b"
+TLAPM_SHA256="6fc2162a8f02f6e7e2d8d71dbe0fb0ee4a547018d6e44bc158e26496ecf1a015"
 TLAPM_URL="https://github.com/tlaplus/tlapm/releases/download/${TLAPM_VERSION}/tlapm-${TLAPM_VERSION}-x86_64-linux-gnu.tar.gz"
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
