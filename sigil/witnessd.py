@@ -33,11 +33,12 @@ import time
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
-from .charter import Registry, charter_body, constellation_id
+from .charter import Registry, charter_body, constellation_id, successor_clause
 from .crypto import KeyPair
-from .server import WitnessServer
+from .server import StandbyServer, WitnessServer
 from .stamps import StampMint
 from .store import WitnessStore
+from .succession import Standby, StandbyStore
 from .witness import Witness
 
 
@@ -91,9 +92,14 @@ def read_pk(arg: str) -> str:
     return json.loads(text)["pk"] if text.startswith("{") else text
 
 
-def genesis(name: str, pks: list) -> tuple[str, dict]:
-    """Charter version 0 of a new constellation: returns ``(cid, registry entry)``."""
-    body = charter_body(name, 0, pks, None)
+def genesis(name: str, pks: list, committee: list | None = None, dead_man: int | None = None) -> tuple[str, dict]:
+    """Charter version 0 of a new constellation: returns ``(cid, registry entry)``.
+
+    ``committee`` (public keys) and ``dead_man`` (seconds) give it a successor
+    committee (SPEC §5.5).
+    """
+    succ = successor_clause(committee, dead_man) if committee else None
+    body = charter_body(name, 0, pks, None, succ)
     return constellation_id(body), [{"body": body, "sigs": {}}]
 
 
@@ -159,6 +165,48 @@ def build_witness(key: str, registry: str, cid: str, store: str, stamps: bool = 
     return w
 
 
+def build_standby(key: str, registry: str, cid: str, store: str, wait: bool = False) -> Standby:
+    """A successor-committee member (SPEC §5.5), restored from its store.
+
+    A fresh store stands by for version 0 at once if the key is in version 0's
+    committee and the constellation has not rotated; otherwise (or with ``wait``)
+    it waits for ``/v0/standby`` with the handover of a later version.
+    """
+    kp = load_key(key)
+    reg = load_registry(registry)
+    if cid not in reg:
+        raise SystemExit(f"constellation {cid} is not in {registry}")
+    m = Standby(kp, reg, lambda: int(time.time()), store=StandbyStore(store))
+    if m.cid is None and not wait:
+        chain = reg.chain(cid)
+        succ = chain[0]["body"].get("successor")
+        if succ is None or kp.pk not in succ["committee"]:
+            raise SystemExit(f"{kp.pk[:12]} is not in the successor committee of {cid[:12]} version 0")
+        if len(chain) > 1:
+            raise SystemExit(f"{cid[:12]} has rotated past version 0: start with --wait for /v0/standby")
+        m.enter(cid, 0, [])
+    elif m.cid is not None and m.cid != cid:
+        raise SystemExit(f"store {store} belongs to constellation {m.cid}, not {cid}")
+    return m
+
+
+def standby(args) -> None:
+    token = load_admin_token(args.admin_token)
+    m = build_standby(args.key, args.registry, args.constellation, args.store, args.wait)
+    server = StandbyServer(m, args.host, args.port, admin_token=token, members=args.members,
+                           probe_every=args.probe_every).start()
+    stop = threading.Event()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(sig, lambda *_: stop.set())
+    where = f"{m.cid[:12]} v{m.version}" if m.cid else f"(awaiting STANDBY into {args.constellation[:12]})"
+    print(f"standby {m.pk[:12]} for {where} listening on {server.url}", flush=True)
+    stop.wait()
+    server.stop()
+    with server._lock:
+        m.store.close()
+    print("stopped", flush=True)
+
+
 def run(args) -> None:
     token = load_admin_token(args.admin_token)
     w = build_witness(args.key, args.registry, args.constellation, args.store, args.stamps, args.adopt)
@@ -191,6 +239,22 @@ def main(argv=None) -> None:
     g.add_argument("--name", required=True)
     g.add_argument("--keys", nargs="+", required=True, help="public keys: .pub files, key files or hex")
     g.add_argument("--out", required=True, help="registry file (merged into if it exists)")
+    g.add_argument("--committee", nargs="+", help="successor committee public keys (SPEC 5.5)")
+    g.add_argument("--dead-man", type=int, help="dead-man period in seconds (with --committee)")
+
+    sb = sub.add_parser("standby", help="serve a successor-committee member (SPEC 5.5)")
+    sb.add_argument("--key", required=True)
+    sb.add_argument("--registry", required=True)
+    sb.add_argument("--constellation", required=True)
+    sb.add_argument("--store", required=True)
+    sb.add_argument("--host", default="127.0.0.1")
+    sb.add_argument("--port", type=int, default=7100)
+    sb.add_argument("--admin-token", metavar="FILE",
+                    help="file holding the operator token that authorises /v0/standby, /v0/succeed, /v0/probe")
+    sb.add_argument("--wait", action="store_true",
+                    help="on a fresh store, wait for /v0/standby into a later charter version")
+    sb.add_argument("--members", nargs="*", default=[], help="member URLs to probe for heartbeats")
+    sb.add_argument("--probe-every", type=float, help="probe the members every this many seconds")
 
     r = sub.add_parser("run", help="serve a witness")
     r.add_argument("--key", required=True)
@@ -209,7 +273,10 @@ def main(argv=None) -> None:
     if args.cmd == "keygen":
         print(generate_key(args.out).pk)
     elif args.cmd == "genesis":
-        cid, chain = genesis(args.name, [read_pk(a) for a in args.keys])
+        if bool(args.committee) != (args.dead_man is not None):
+            raise SystemExit("--committee and --dead-man go together")
+        cid, chain = genesis(args.name, [read_pk(a) for a in args.keys],
+                             [read_pk(a) for a in args.committee] if args.committee else None, args.dead_man)
         reg = {}
         if os.path.exists(args.out):
             with open(args.out) as f:
@@ -217,6 +284,8 @@ def main(argv=None) -> None:
         reg[cid] = chain
         _write_json(args.out, reg)
         print(cid)
+    elif args.cmd == "standby":
+        standby(args)
     else:
         run(args)
 
