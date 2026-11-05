@@ -8,7 +8,10 @@
 //! the canonical JSON of the current value. Kinds are those of `sigil/store.py`: `pk`,
 //! `member` (`[cid, version]`), `frozen` (the hash of the one successor charter the witness
 //! froze for), `record` (key = sigil, value = the record as the reference's `asdict(Record)`)
-//! and `stamp` (key = a redeemed stamp serial). Each commit uses `Durability::Immediate`, i.e. redb's
+//! and `stamp` (key = a redeemed stamp serial). A standby member (`crate::succession`) uses the
+//! kinds of the reference's `StandbyStore`: `pk`, `standby` (`{constellation, version, since}`),
+//! `fenced` (`{constellation, version, charter}`) and `mirror` (key `"<version>|<sigil>"`, value
+//! that sigil's mirror log). Each commit uses `Durability::Immediate`, i.e. redb's
 //! checksummed commit followed by `fdatasync`, so a commit that returned survives a crash or
 //! power loss and a batch lands entirely or not at all.
 //!
@@ -47,6 +50,12 @@ pub struct Loaded {
     pub records: HashMap<String, Json>,
     /// Redeemed stamp serials.
     pub stamps: HashSet<String>,
+    /// A standby member's `{constellation, version, since}` (the latest STANDBY).
+    pub standby: Option<Json>,
+    /// A standby member's `{constellation, version, charter}`: the successor it signed.
+    pub fenced: Option<Json>,
+    /// A standby member's mirror logs, keyed `"<version>|<sigil>"`.
+    pub mirror: HashMap<String, Json>,
 }
 
 struct Progress {
@@ -266,6 +275,11 @@ fn load(db: &Database) -> Result<Loaded, String> {
             }
             "record" => {
                 out.records.insert(key.to_string(), value);
+            }
+            "standby" => out.standby = Some(value),
+            "fenced" => out.fenced = Some(value),
+            "mirror" => {
+                out.mirror.insert(key.to_string(), value);
             }
             _ => return Err(format!("unknown store entry kind {kind:?}")),
         }

@@ -12,6 +12,13 @@
 //! | POST   | `/v0/gossip`    | `{charters?, proofs?, forks?}` | `{charters, proofs, forks}` (counts accepted) |
 //! | POST   | `/v0/freeze`    | `{charter}` (admin) | `{sig, snapshot}`      |
 //! | POST   | `/v0/adopt`     | `{constellation, version, snapshots}` (admin) | `{constellation, version}` |
+//! | POST   | `/v0/heartbeat` | `{challenge}`       | signed heartbeat (SPEC §5.5) |
+//!
+//! A standby member (SPEC §5.5, [`standby_router`]) serves `/v0/info`, `/v0/charters`,
+//! `/v0/proofs`, `/v0/gossip`, `/v0/mirror` (`{request}` → mirror ack), `/v0/note_release`
+//! (`{sigil, entry}` → whether it was new) and the operator calls `/v0/standby`
+//! (`{constellation, version, snapshots}`), `/v0/succeed` (`{charter, sigs?}` → `{sig, snapshot}`)
+//! and `/v0/probe` (`{urls?}` → `{answered}`).
 //!
 //! Replies are `{"ok": result}` or `{"error": kind, "message": str, "vote": vote|null}` with
 //! HTTP 409 (`conflict`), 403 (`rejected`), 400 (`bad_request`) or 500 (`internal`). Unlike
@@ -47,12 +54,15 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use crate::json::{obj, parse, parse_with_depth, Json, MAX_DEPTH};
 use crate::ratelimit::{client_key, ConnectionLimiter, RateLimiter, IDLE_TIMEOUT, MAX_CONNECTIONS};
+use crate::succession::Standby;
 use crate::witness::{Error, Outcome, Witness};
 
 pub const MAX_BODY: usize = 1 << 20;
 /// ADOPT carries every predecessor's evidence.
 pub const MAX_ADMIN_BODY: usize = 256 << 20;
 pub const ADMIN_METHODS: [&str; 2] = ["freeze", "adopt"];
+/// A standby member's operator calls (SPEC §5.5).
+pub const STANDBY_ADMIN_METHODS: [&str; 3] = ["standby", "succeed", "probe"];
 
 pub fn reply(code: StatusCode, v: &Json) -> Response {
     (code, [(header::CONTENT_TYPE, "application/json")], v.canonical()).into_response()
@@ -109,17 +119,22 @@ pub fn router_with_limits(w: Arc<Witness>, admin_token: Option<String>, limiter:
         .route("/v0/:method", post(call))
         .fallback(|| async { error(StatusCode::NOT_FOUND, "bad_request", "unknown path", None) })
         .with_state(App { w, admin_token: admin_token.map(Arc::from) });
+    limited(r, limiter, &ADMIN_METHODS)
+}
+
+/// `r` with every call but the operator calls `admin` charged to its client's token bucket.
+fn limited(r: Router, limiter: Option<Arc<RateLimiter>>, admin: &'static [&'static str]) -> Router {
     match limiter {
-        Some(l) => r.layer(middleware::from_fn_with_state(l, admit)),
+        Some(l) => r.layer(middleware::from_fn_with_state((l, admin), admit)),
         None => r,
     }
 }
 
 /// Charge the client one token; answer 429 `rejected` (with `Retry-After`) if it has none left.
 /// The body of a refused request is read and dropped, so the client reliably gets the answer.
-async fn admit(State(limiter): State<Arc<RateLimiter>>, req: Request, next: Next) -> Response {
+async fn admit(State((limiter, admin)): State<(Arc<RateLimiter>, &'static [&'static str])>, req: Request, next: Next) -> Response {
     let path = req.uri().path();
-    if ADMIN_METHODS.contains(&path.strip_prefix("/v0/").unwrap_or(path)) {
+    if admin.contains(&path.strip_prefix("/v0/").unwrap_or(path)) {
         return next.run(req).await; // refused before their body is read, unless authorised
     }
     let key = req.extensions().get::<ConnectInfo<SocketAddr>>().map(|c| client_key(c.0.ip())).unwrap_or_default();
@@ -169,12 +184,11 @@ async fn blocking(f: impl FnOnce() -> Outcome + Send + 'static) -> Result<Outcom
     tokio::task::spawn_blocking(f).await.map_err(|_| internal())
 }
 
-async fn call(State(app): State<App>, Path(method): Path<String>, headers: HeaderMap, body: Body) -> Response {
-    let admin = ADMIN_METHODS.contains(&method.as_str());
+/// Check the token of an operator call (before its body is read), then read and parse the body:
+/// a JSON object of at most [`MAX_BODY`] bytes ([`MAX_ADMIN_BODY`] for an operator call).
+async fn read_body(admin: bool, token: Option<&str>, headers: &HeaderMap, body: Body) -> Result<Json, Response> {
     if admin {
-        if let Err(r) = check_admin(app.admin_token.as_deref(), &headers) {
-            return r;
-        }
+        check_admin(token, headers)?;
     }
     // A client that stops sending is dropped, never waited on forever (an authorised operator
     // sending ADOPT evidence is given all the time it needs).
@@ -182,8 +196,8 @@ async fn call(State(app): State<App>, Path(method): Path<String>, headers: Heade
     let patience = if admin { Duration::MAX } else { IDLE_TIMEOUT };
     let bytes = match tokio::time::timeout(patience, to_bytes(body, limit)).await {
         Ok(Ok(b)) => b,
-        Ok(Err(_)) => return bad_request("body too large"),
-        Err(_) => return bad_request("body not received in time"),
+        Ok(Err(_)) => return Err(bad_request("body too large")),
+        Err(_) => return Err(bad_request("body not received in time")),
     };
     let body = if bytes.is_empty() {
         Json::Obj(Default::default())
@@ -191,12 +205,21 @@ async fn call(State(app): State<App>, Path(method): Path<String>, headers: Heade
         // Evidence nests what requests carried a few levels deeper (as in the store).
         match if admin { parse_with_depth(&bytes, MAX_DEPTH + 16) } else { parse(&bytes) } {
             Ok(v) => v,
-            Err(e) => return bad_request(&e.to_string()),
+            Err(e) => return Err(bad_request(&e.to_string())),
         }
     };
     if body.as_obj().is_none() {
-        return bad_request("body must be an object");
+        return Err(bad_request("body must be an object"));
     }
+    Ok(body)
+}
+
+async fn call(State(app): State<App>, Path(method): Path<String>, headers: HeaderMap, body: Body) -> Response {
+    let admin = ADMIN_METHODS.contains(&method.as_str());
+    let body = match read_body(admin, app.admin_token.as_deref(), &headers, body).await {
+        Ok(b) => b,
+        Err(r) => return r,
+    };
     let w = app.w.clone();
     let outcome: Result<Outcome, Response> = match method.as_str() {
         "spend" => match field(&body, "request") {
@@ -215,6 +238,7 @@ async fn call(State(app): State<App>, Path(method): Path<String>, headers: Heade
             (Err(r), _) | (_, Err(r)) => Err(r),
         },
         "status" => field(&body, "sigil").map(|s| w.status(s)),
+        "heartbeat" => field(&body, "challenge").map(|c| w.heartbeat(c)),
         "sell_stamp" => field(&body, "blinded").map(|b| w.sell_stamp(b)),
         "gossip" => blocking(move || w.gossip(&body)).await,
         "freeze" => match field(&body, "charter") {
@@ -249,6 +273,117 @@ async fn call(State(app): State<App>, Path(method): Path<String>, headers: Heade
         Err(r) => return r,
     };
     app.w.store.wait_async(seq).await; // persist before answering (SPEC §5)
+    result_response(result)
+}
+
+// --------------------------------------------------------------------------- standby
+
+#[derive(Clone)]
+struct StandbyApp {
+    s: Arc<Standby>,
+    admin_token: Option<Arc<str>>,
+    /// Member URLs `/v0/probe` challenges when its body names none.
+    members: Arc<Vec<String>>,
+}
+
+/// The router of a standby member (SPEC §5.5), as the reference's `StandbyServer`: `admin_token`
+/// enables the operator calls (`standby`, `succeed`, `probe`), every other call is charged to
+/// `limiter`, and `members` are the witness URLs `/v0/probe` challenges by default.
+pub fn standby_router(s: Arc<Standby>, admin_token: Option<String>, limiter: Option<Arc<RateLimiter>>, members: Vec<String>) -> Router {
+    let r = Router::new()
+        .route("/v0/info", get(sb_info))
+        .route("/v0/charters", get(sb_charters))
+        .route("/v0/proofs", get(sb_proofs))
+        .route("/v0/:method", post(sb_call))
+        .fallback(|| async { error(StatusCode::NOT_FOUND, "bad_request", "unknown path", None) })
+        .with_state(StandbyApp { s, admin_token: admin_token.map(Arc::from), members: Arc::new(members) });
+    limited(r, limiter, &STANDBY_ADMIN_METHODS)
+}
+
+async fn sb_info(State(app): State<StandbyApp>) -> Response {
+    reply(StatusCode::OK, &obj([("ok", app.s.info())]))
+}
+
+async fn sb_charters(State(app): State<StandbyApp>) -> Response {
+    reply(StatusCode::OK, &obj([("ok", app.s.registry().to_json())]))
+}
+
+async fn sb_proofs(State(app): State<StandbyApp>) -> Response {
+    reply(StatusCode::OK, &obj([("ok", app.s.proofs())]))
+}
+
+async fn sb_call(State(app): State<StandbyApp>, Path(method): Path<String>, headers: HeaderMap, body: Body) -> Response {
+    let admin = STANDBY_ADMIN_METHODS.contains(&method.as_str());
+    let body = match read_body(admin, app.admin_token.as_deref(), &headers, body).await {
+        Ok(b) => b,
+        Err(r) => return r,
+    };
+    let s = app.s.clone();
+    let outcome: Result<Outcome, Response> = match method.as_str() {
+        "mirror" => match field(&body, "request") {
+            Ok(req) => {
+                let req = req.clone();
+                blocking(move || s.mirror_bind(&req)).await
+            }
+            Err(r) => Err(r),
+        },
+        "note_release" => match (field(&body, "sigil"), field(&body, "entry")) {
+            (Ok(x), Ok(e)) => {
+                let (sigil, entry) = (x.clone(), e.clone());
+                blocking(move || s.note_release(&sigil, &entry)).await
+            }
+            (Err(r), _) | (_, Err(r)) => Err(r),
+        },
+        "gossip" => blocking(move || s.gossip(&body)).await,
+        "standby" => {
+            let checked = field(&body, "constellation")
+                .and_then(|_| field(&body, "version"))
+                .and_then(|_| field(&body, "snapshots"))
+                .and_then(|x| if x.as_arr().is_some() { Ok(()) } else { Err(bad_request("snapshots must be a list")) });
+            match checked {
+                Ok(()) => {
+                    blocking(move || {
+                        let null = Json::Null;
+                        let (c, v) = (body.get("constellation").unwrap_or(&null), body.get("version").unwrap_or(&null));
+                        let snaps = body.get("snapshots").and_then(Json::as_arr).map(Vec::as_slice).unwrap_or(&[]);
+                        s.enter(c, v, snaps)
+                    })
+                    .await
+                }
+                Err(r) => Err(r),
+            }
+        }
+        "succeed" => match field(&body, "charter") {
+            Ok(c) => {
+                let (c, sigs) = (c.clone(), body.get("sigs").cloned());
+                blocking(move || s.succeed(&c, sigs.as_ref())).await
+            }
+            Err(r) => Err(r),
+        },
+        "probe" => {
+            let urls: Option<Vec<String>> = match body.get("urls") {
+                None => Some(app.members.as_ref().clone()),
+                Some(Json::Arr(a)) => a.iter().map(|u| u.as_str().map(str::to_string)).collect(),
+                Some(_) => None,
+            };
+            match urls {
+                None => Err(bad_request("urls must be a list of strings")),
+                Some(urls) => {
+                    blocking(move || {
+                        let n = s.probe(&urls);
+                        (Ok(obj([("answered", Json::Int(n as i128))])), 0)
+                    })
+                    .await
+                }
+            }
+        }
+        other => Err(bad_request(&format!("unknown method '{other}'"))),
+    };
+    let (result, seq) = match outcome {
+        Ok(o) => o,
+        Err(r) => return r,
+    };
+    app.s.store.wait_async(seq).await; // persist before answering (SPEC §5)
     result_response(result)
 }
 

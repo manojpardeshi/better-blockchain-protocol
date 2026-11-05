@@ -45,7 +45,7 @@ pub struct Successor {
 impl Successor {
     /// `charter.valid_successor`: exactly `{committee, dead_man}`, a list of 1..=`MAX_WITNESSES`
     /// distinct strings and a positive integer (booleans are not integers).
-    fn parse(v: &Json) -> Result<Successor, String> {
+    pub fn parse(v: &Json) -> Result<Successor, String> {
         let bad = || "malformed successor clause".to_string();
         let m = v.as_obj().ok_or_else(bad)?;
         if m.len() != 2 {

@@ -154,6 +154,16 @@ pub fn verify_ack(a: &Json) -> bool {
     crate::crypto::verify(member, "mirror", &payload, sig)
 }
 
+/// `verify_heartbeat`: a heartbeat's signature by its own `witness` key (SPEC §5.5).
+pub fn verify_heartbeat(h: &Json) -> bool {
+    let (Some(payload), Some(witness), Some(sig)) =
+        (crate::model::heartbeat_payload(h), h.get("witness").and_then(Json::as_str), h.get("sig").and_then(Json::as_str))
+    else {
+        return false;
+    };
+    crate::crypto::verify(witness, "heartbeat", &payload, sig)
+}
+
 /// `acked_by`: the distinct members of `committee` with a valid mirror ack for exactly
 /// `(cid, version, sigil, gen, tid)`. Like the reference, `acks` must be a list, at most
 /// `4 * |committee| + 4` entries are looked at, only a member's first ack for this binding is
