@@ -1,4 +1,5 @@
-//! The witness (SPEC §5): SPEND, RELEASE, STATUS, FREEZE and ADOPT, with durable state.
+//! The witness (SPEC §5): SPEND, RELEASE, STATUS, FREEZE, ADOPT and HEARTBEAT, with durable
+//! state.
 //!
 //! Mirrors `sigil/witness.py`. Per sigil an honest witness keeps a generation counter and at
 //! most one binding per generation, and votes at most once per `(sigil, generation)`, also
@@ -17,13 +18,13 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, RwLock};
 
-use crate::charter::{charter_hash, short, Registry};
+use crate::charter::{charter_hash, quorum, short, Registry};
 use crate::crypto::KeyPair;
 use crate::gossip::{check_message, CowRegistry, GossipStore};
 use crate::json::{obj, Json};
 use crate::locks::evaluate;
-use crate::model::{sigil_of, transition_id, vote_payload};
-use crate::proofs::{proves_dead, verify_seal, verify_vote};
+use crate::model::{heartbeat_payload, sigil_of, transition_id, vote_payload};
+use crate::proofs::{acked_by, proves_dead, verify_seal, verify_vote};
 use crate::stamps::StampKey;
 use crate::store::{Entry, Loaded, Store};
 
@@ -377,7 +378,9 @@ impl Witness {
         self.redeemed.lock().expect("stamp lock").insert(serial.to_string()).then(|| serial.to_string())
     }
 
-    /// SPEND (SPEC §5.1). `req` carries sigil, header, home, lock, salt, unlock, [stamp].
+    /// SPEND (SPEC §5.1). `req` carries sigil, header, home, lock, salt, unlock, [stamp],
+    /// [mirror]: in a version with a successor committee, a vote is created only with mirror
+    /// acks from a quorum of the committee (SPEC §5.5).
     pub fn spend(&self, req: &Json) -> Outcome {
         let r = self.spend_inner(req);
         (r, self.store.last_submitted())
@@ -421,6 +424,17 @@ impl Witness {
         };
         let sigil = sigil_v.as_str().expect("authorised sigil is a string");
         let expires = auth.get("unlock").and_then(|u| u.get("expires")).and_then(Json::as_int).expect("checked");
+        // Mirror before vote (SPEC §5.5): with a successor committee, a vote is only created with
+        // acks from a quorum of it, so any succession inherits the binding. The acks are checked
+        // here, outside the lock (at most one signature per member); the verdict is used below
+        // only if a vote must be created. Our version's charter never changes, so neither does
+        // its committee. Without our own charter (a registry older than our store) we cannot
+        // tell whether acks are needed: `None`, and no vote is created at all.
+        let gate: Option<Option<bool>> = self.registry().charter(&cid, version).map(|c| {
+            c.successor.as_ref().map(|k| {
+                acked_by(req.get("mirror"), &k.committee, &cid, version, sigil, gen, &tid).len() >= quorum(k.committee.len())
+            })
+        });
 
         // The vote is fully determined by (membership, sigil, gen, tid, now), so sign it before
         // taking the lock; it is only used (and only ever leaves) if the record logic says so.
@@ -473,6 +487,12 @@ impl Witness {
             return rejected("this key already voted for another transition at this generation");
         }
         if rec.vote.is_none() {
+            // Nothing is persisted on refusal.
+            match gate {
+                None => return rejected("own charter version unknown"),
+                Some(Some(false)) => return rejected("needs mirror acks from a quorum of the successor committee"),
+                _ => {}
+            }
             rec.vote = Some(fresh.clone());
             rec.votes.push(fresh);
         }
@@ -601,6 +621,30 @@ impl Witness {
         let seq = self.store.last_submitted();
         drop(st);
         (Ok(out), seq)
+    }
+
+    /// HEARTBEAT (SPEC §5.5): show a standby member that this witness is alive and voting.
+    /// Only an active, unfrozen witness answers (a frozen one will never vote again). The
+    /// challenge is the standby member's own fresh string, so an answer cannot be replayed later
+    /// to fake liveness.
+    pub fn heartbeat(&self, challenge: &Json) -> Outcome {
+        let Some((cid, version)) = self.state.lock().expect("state lock").active() else {
+            return (rejected("witness not active"), 0);
+        };
+        let Some(challenge) = challenge.as_str().filter(|c| (1..=128).contains(&c.chars().count())) else {
+            return (rejected("challenge must be a string of 1 to 128 characters"), 0);
+        };
+        let mut h = obj([
+            ("constellation", Json::str(&cid)),
+            ("version", Json::Int(version)),
+            ("witness", Json::str(&self.pk)),
+            ("challenge", Json::str(challenge)),
+        ]);
+        let sig = self.kp.sign("heartbeat", &heartbeat_payload(&h).expect("complete heartbeat"));
+        if let Json::Obj(m) = &mut h {
+            m.insert("sig".into(), Json::Str(sig));
+        }
+        (Ok(h), 0)
     }
 
     /// The full record of a sigil, for tests and tools (`None` if the witness has none).

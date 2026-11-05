@@ -29,3 +29,28 @@ pub fn vote_payload(v: &Json) -> Option<Json> {
     }
     Some(Json::Obj(out))
 }
+
+pub const ACK_FIELDS: [&str; 6] = ["constellation", "version", "member", "sigil", "gen", "tid"];
+pub const HEARTBEAT_FIELDS: [&str; 4] = ["constellation", "version", "witness", "challenge"];
+
+/// What an active witness signs (tag "heartbeat") to show a standby member it is alive: its
+/// four fields, or `None` if any is missing.
+pub fn heartbeat_payload(h: &Json) -> Option<Json> {
+    let m = h.as_obj()?;
+    let mut out = crate::json::Map::new();
+    for k in HEARTBEAT_FIELDS {
+        out.insert(k.to_string(), m.get(k)?.clone());
+    }
+    Some(Json::Obj(out))
+}
+
+/// What a standby member signs (tag "mirror", SPEC §5.5): its six fields, or `None` if any
+/// is missing.
+pub fn ack_payload(a: &Json) -> Option<Json> {
+    let m = a.as_obj()?;
+    let mut out = crate::json::Map::new();
+    for k in ACK_FIELDS {
+        out.insert(k.to_string(), m.get(k)?.clone());
+    }
+    Some(Json::Obj(out))
+}

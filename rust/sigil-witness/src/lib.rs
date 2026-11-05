@@ -3,14 +3,17 @@
 //! * [`json`]: JSON values and the canonical encoding (byte-identical to the reference);
 //! * [`crypto`]: domain-separated BLAKE2b-256 and Ed25519, with batch verification;
 //! * [`model`], [`locks`], [`proofs`], [`charter`]: SPEC §3;
-//! * [`witness`]: SPEC §5 (SPEND, RELEASE, STATUS, FREEZE, ADOPT);
+//! * [`witness`]: SPEC §5 (SPEND, RELEASE, STATUS, FREEZE, ADOPT, HEARTBEAT);
+//! * [`succession`]: SPEC §5.5 standby members (MIRROR, STANDBY, SUCCEED, the dead man);
 //! * [`stamps`]: blind RSA-FDH stamps (SPEC §3.10);
 //! * [`gossip`]: storage of gossiped charter chains, equivocation proofs and fork evidence;
 //! * [`store`]: durable state with group commit;
-//! * [`server`]: the v0 HTTP JSON wire protocol (docs/WIRE.md);
+//! * [`server`]: the v0 HTTP JSON wire protocol (docs/WIRE.md), and [`client`] the little of it a
+//!   standby member calls (heartbeats);
 //! * [`ratelimit`]: admission control (per-client token buckets, connection caps).
 
 pub mod charter;
+pub mod client;
 pub mod crypto;
 pub mod gossip;
 pub mod json;
@@ -21,12 +24,14 @@ pub mod ratelimit;
 pub mod server;
 pub mod stamps;
 pub mod store;
+pub mod succession;
 pub mod testkit;
 pub mod witness;
 
 pub use charter::Registry;
 pub use crypto::KeyPair;
 pub use json::Json;
+pub use succession::Standby;
 pub use witness::Witness;
 
 /// Load a key file written by `python -m sigil.witnessd keygen`: `{"seed": hex, "pk": hex}`.

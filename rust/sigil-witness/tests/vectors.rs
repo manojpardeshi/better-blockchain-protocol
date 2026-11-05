@@ -12,6 +12,7 @@ use sigil_witness::model::{sigil_of, transition_id, unlock_message};
 use sigil_witness::proofs::{proves_dead, verify_equivocation, verify_seal};
 use sigil_witness::stamps::{full_domain_hash, StampKey};
 use sigil_witness::store::Store;
+use sigil_witness::succession::Standby;
 use sigil_witness::witness::{Error, Witness};
 
 fn vectors() -> Json {
@@ -136,18 +137,26 @@ fn check_outcome(i: usize, step: &Json, got: Result<Json, Error>) {
     }
 }
 
-/// Replay a multi-witness script (`Script` in gen_vectors.py): every witness is built as the
-/// reference built it, every call must give the reference's answer, byte for byte.
+/// Replay a multi-witness script (`Script` in gen_vectors.py): every witness and standby member
+/// is built as the reference built it, every call must give the reference's answer, byte for byte.
 fn replay_script(script: &Json, stamp_key: Option<&Json>) -> usize {
     let regs = script.get("registries").unwrap();
     let cid = s(script, "cid");
     let now = Arc::new(AtomicI64::new(0));
     let mut ws: HashMap<String, Witness> = HashMap::new();
+    let mut sbs: HashMap<String, Standby> = HashMap::new();
     for (who, spec) in script.get("witnesses").and_then(Json::as_obj).unwrap() {
         let kp = KeyPair::from_py_seed(&hex::decode(s(spec, "py_seed")).unwrap());
         let reg = Registry::from_json(regs.get(s(spec, "registry")).unwrap()).unwrap();
         let n2 = now.clone();
         let clock = Box::new(move || n2.load(Ordering::SeqCst) as i128);
+        if spec.get("standby") == Some(&Json::Bool(true)) {
+            // Built (and standing by for version 0, unless it waits) when the reference built it.
+            now.store(spec.get("now").and_then(Json::as_int).unwrap() as i64, Ordering::SeqCst);
+            let wait = spec.get("wait") == Some(&Json::Bool(true));
+            sbs.insert(who.clone(), Standby::open(kp, reg, cid, Store::memory(), Default::default(), clock, wait).unwrap());
+            continue;
+        }
         let adopt = spec.get("adopt") == Some(&Json::Bool(true));
         let mut w = Witness::open_with(kp, reg, cid, Store::memory(), Default::default(), clock, adopt).unwrap();
         if spec.get("stamps") == Some(&Json::Bool(true)) {
@@ -158,12 +167,29 @@ fn replay_script(script: &Json, stamp_key: Option<&Json>) -> usize {
     let steps = arr(script, "steps");
     for (i, step) in steps.iter().enumerate() {
         now.store(step.get("now").and_then(Json::as_int).unwrap() as i64, Ordering::SeqCst);
-        let w = &ws[s(step, "who")];
         let a = arr(step, "args");
+        if let Some(m) = sbs.get(s(step, "who")) {
+            let got = match s(step, "op") {
+                "enter" => m.enter(&a[0], &a[1], a[2].as_arr().unwrap()).0,
+                "mirror" => m.mirror_bind(&a[0]).0,
+                "note_release" => m.note_release(&a[0], &a[1]).0,
+                "observe" => Ok(Json::Bool(m.observe(&a[0], a[1].as_str().unwrap()))),
+                "dead" => Ok(Json::Bool(m.dead())),
+                "succeed" => m.succeed(&a[0], a.get(1)).0,
+                "snapshot" => Ok(m.snapshot()),
+                "gossip" => m.gossip(&a[0]).0,
+                "charters" => Ok(m.registry().to_json()),
+                op => panic!("unknown standby op {op}"),
+            };
+            check_outcome(i, step, got);
+            continue;
+        }
+        let w = &ws[s(step, "who")];
         let got = match s(step, "op") {
             "spend" => w.spend(&a[0]).0,
             "release" => w.release(&a[0], &a[1]).0,
             "status" => w.status(&a[0]).0,
+            "heartbeat" => w.heartbeat(&a[0]).0,
             "freeze" => w.freeze(&a[0]).0,
             "adopt" => w.adopt(&a[0], &a[1], a[2].as_arr().unwrap()).0,
             "record" => Ok(a[0].as_str().and_then(|x| w.record(x)).map(|r| r.to_json()).unwrap_or(Json::Null)),
@@ -272,6 +298,17 @@ fn limits_script_matches_reference() {
     let v = vectors();
     let n = replay_script(v.get("limits").unwrap(), None);
     assert!(n > 40, "{n} steps");
+}
+
+/// Succession (SPEC §5.5): the mirror-ack gate, MIRROR and its bounds, release entries,
+/// heartbeats and the dead man, cooperative and dead-man SUCCEED with the fence, the STANDBY
+/// handover of the next version (kept as a set), ADOPT from the committee's mirror logs, the gate
+/// under the next committee, and gossip of a committee-signed chain (a forged one is dropped).
+#[test]
+fn succession_script_matches_reference() {
+    let v = vectors();
+    let n = replay_script(v.get("succession").unwrap(), None);
+    assert!(n > 100, "{n} steps");
 }
 
 #[test]

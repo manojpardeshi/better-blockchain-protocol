@@ -39,7 +39,7 @@ Status legend: ⬜ not started · 🟨 in progress · ✅ done
 ## Phase 4: Missing features (#11)
 | | Item |
 |---|---|
-| ⬜ | Constellation succession (dead-man takeover) |
+| ✅ | Constellation succession (dead-man takeover): successor committees, mirror before vote, fenced standby members (SPEC §5.5), Python and Rust, TLAPS-proved safety (`formal/SigilSuccProofs.tla`) |
 | ⬜ | Arbiter objects for shared state (AMMs, auctions) |
 | ⬜ | Issuer redemption: re-mint coins with short histories |
 | ⬜ | Stamp pricing and bond sizing |

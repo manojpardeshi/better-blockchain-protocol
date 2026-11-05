@@ -20,13 +20,15 @@ import sys
 from dataclasses import asdict
 
 from sigil import locks, model
-from sigil.charter import Registry, charter_body, charter_hash, constellation_id, sign_charter
+from sigil.charter import (MAX_CHARTER_BYTES, Registry, charter_body, charter_hash, constellation_id, sign_charter,
+                           successor_clause)
 from sigil.gossip import GossipStore
 from sigil.crypto import KeyPair, verify
 from sigil.encoding import canonical, digest
 from sigil.locks import evaluate, well_formed
 from sigil.proofs import proves_dead, verify_equivocation, verify_seal
-from sigil.witness import Conflict, Rejected, Witness
+from sigil.succession import MAX_MIRROR_TIDS, Standby
+from sigil.witness import MAX_AUTH_BYTES, MAX_GEN, MAX_PROOF_BYTES, Conflict, Rejected, Witness
 
 rng = random.Random(20261023)
 
@@ -392,6 +394,14 @@ class Script:
                           "adopt": adopt, "stamps": stamps}
         return w
 
+    def add_standby(self, who: str, m: Standby, seed: int, registry: str, wait: bool = False):
+        """A standby member (SPEC §5.5). Without ``wait`` it stood by for version 0 when it
+        was built, at ``now``: the Rust side builds it at that time, so their windows agree."""
+        self.ws[who] = m
+        self.spec[who] = {"py_seed": f"sigil-vector-{seed}".encode().hex(), "registry": registry,
+                          "standby": True, "wait": wait, "now": self.clock[0]}
+        return m
+
     def run(self, who: str, op: str, now: int, *args):
         self.clock[0] = now
         w = self.ws[who]
@@ -415,6 +425,14 @@ class Script:
                 res = {"proofs": list(g.proofs.values()), "forks": list(g.forks.values())}
             elif op == "charters":
                 res = {cid: w.registry.chain(cid) for cid in w.registry.ids()}
+            elif op == "enter":
+                w.enter(*args)
+                res = {"constellation": w.cid, "version": w.version}  # what /v0/standby answers
+            elif op == "mirror":
+                res = w.mirror_bind(*args)
+            elif op == "succeed":
+                sig, snap = w.succeed(*args)
+                res = {"sig": sig, "snapshot": snap}
             else:
                 res = getattr(w, op)(*args)
             out = {"ok": res}
@@ -993,6 +1011,206 @@ def limits_script():
     return sc.done(registries={"v0": {X: chain0}, "v1": {X: reg1.chain(X)}}, cid=X)
 
 
+def succession_script():
+    """Constellation succession (SPEC §5.5) on a witness and standby members.
+
+    X v0 = w0..w3 with committee k0..k3 (dead_man 100). Replayed by the Rust test: w0 (the
+    mirror-ack gate, HEARTBEAT, an old member after the takeover), k0 (MIRROR and its bounds,
+    observing heartbeats, release entries, cooperative SUCCEED, the fence), k1 (dead-man
+    SUCCEED), c0 (a member of v1's committee: the STANDBY handover, kept as a set) and n0 (a
+    member of v1: ADOPT from the committee's mirror logs, and the gate under v1's committee).
+    """
+    D = 100
+    ws = [kp(1300 + i) for i in range(4)]
+    ks = [kp(1310 + i) for i in range(4)]
+    body0 = charter_body("succ", 0, [k.pk for k in ws], None, successor_clause([k.pk for k in ks], D))
+    X = constellation_id(body0)
+    chain0 = [{"body": body0, "sigs": {}}]
+    reg0 = Registry()
+    reg0.add_chain(X, chain0)
+    clock = [1700000000]
+    sc = Script(clock)
+    w = [Witness(k, reg0, lambda: clock[0]) for k in ws]
+    for x in w:
+        x.join(X, 0)
+    sc.add("w0", w[0], 1300, "v0")
+    m = [Standby(k, reg0, lambda: clock[0]) for k in ks]
+    for x in m:
+        x.enter(X, 0, [])
+    sc.add_standby("k0", m[0], 1310, "v0")
+    sc.add_standby("k1", m[1], 1311, "v0")
+    owner = kp(1350)
+    exp = clock[0] + 10 ** 6
+    t = [clock[0]]
+
+    def mk(salt):
+        p = {"home": X, "lock": locks.sig(owner.pk), "salt": salt}
+        return p, model.sigil_of(p)
+
+    def hdr(inputs, tag, **extra):
+        return {"inputs": [list(i) for i in inputs], "body": tag * 32, **extra}
+
+    def req(h, sigil, p):
+        u = locks.empty_unlock(exp)
+        u["sigs"][owner.pk] = locks.sign_unlock(owner, sigil, model.transition_id(h), exp)
+        return {"sigil": sigil, "header": h, "home": X, "lock": p["lock"], "salt": p["salt"], "unlock": u}
+
+    def tgt(p):
+        return {"home": p["home"], "lock": p["lock"], "salt": p["salt"]}
+
+    def step(who, op, *args):
+        t[0] += 1
+        return sc.run(who, op, t[0], *args)
+
+    def quiet(fn, *args):
+        """A call on a helper the Rust side does not replay, at the script's time."""
+        t[0] += 1
+        clock[0] = t[0]
+        return fn(*args)
+
+    def acks(r, members, version=0):
+        """Mirror acks; a member the Rust side replays answers in a recorded step."""
+        out = []
+        for x in members:
+            who = next((n for n, y in sc.ws.items() if y is x), None)
+            a = dict(r, version=version)
+            out.append(step(who, "mirror", a)["ok"] if who else quiet(x.mirror_bind, a))
+        return out
+
+    # ---- the gate and MIRROR
+    pA, sA = mk("a1")
+    TA, TB = hdr([(sA, 0)], "a1"), hdr([(sA, 0)], "b1")
+    rA, rB = req(TA, sA, pA), req(TB, sA, pA)
+    step("w0", "spend", rA)                                         # no acks: refused, nothing stored
+    step("w0", "record", sA)
+    for bad in ("not a request", dict(rA), dict(rA, version=True), dict(rA, version=1),
+                dict(rA, home="elsewhere", version=0), dict(rA, unlock=locks.empty_unlock(exp), version=0)):
+        step("k0", "mirror", bad)
+    ack0 = step("k0", "mirror", dict(rA, version=0))["ok"]
+    step("k0", "mirror", dict(rA, version=0))                       # stored once, the same ack
+    a12 = acks(rA, m[1:3])
+    forged = dict(ack0, member=ks[3].pk)                            # another member's key, k0's signature
+    outsider = dict(ack0, member=kp(1399).pk)
+    for bad in ([ack0], [ack0, ack0, ack0], [ack0, forged, outsider],
+                [dict(a, tid=model.transition_id(TB)) for a in [ack0] + a12],
+                [dict(a, version=1) for a in [ack0] + a12], "not a list",
+                [dict(a, sig=ack0["sig"]) for a in a12] * 3 + [ack0] + a12):   # first acks forged
+        step("w0", "spend", dict(rA, mirror=bad))
+    step("w0", "spend", dict(rA, mirror=[5, {}, ack0] + a12))       # junk is skipped: a quorum of 3
+    step("w0", "spend", rA)                                         # a vote it holds needs no acks
+    step("w0", "spend", rB)                                         # conflict, carrying the vote
+    pC, sC = mk("c1")
+    step("k0", "mirror", dict(req(hdr([(sC, 0)], "c1", pad="x" * MAX_AUTH_BYTES), sC, pC), version=0))
+    step("k0", "mirror", dict(req(hdr([(sC, MAX_GEN)], "c2"), sC, pC), version=0))
+    step("k0", "mirror", dict(req(hdr([(sC, MAX_GEN - 1)], "c3"), sC, pC), version=0))
+    for i in range(MAX_MIRROR_TIDS + 1):
+        step("k0", "mirror", dict(req(hdr([(sC, 0)], "d%d" % i), sC, pC), version=0))
+    step("k0", "mirror", dict(req(hdr([(sC, 0)], "d0"), sC, pC), version=0))   # stored: acked again
+
+    # ---- release entries (k0 holds the binding of T2 only after mirroring it)
+    pS, sS = mk("e1")
+    pY, sY = mk("e2")
+    T2, T3, Ty = hdr([(sS, 0), (sY, 0)], "e3"), hdr([(sS, 0), (sY, 0)], "e4"), hdr([(sY, 0)], "e5")
+    rY = req(Ty, sY, pY)
+    seal_y = model.seal_from_votes([quiet(x.spend, dict(rY, mirror=acks(rY, m[1:]))) for x in w[1:]])
+    dp = {"kind": "seal", "sigil": sY, "gen": 0, "parcel": tgt(pY), "seal": seal_y}
+
+    def entry(h, **kw):
+        return {"kind": "release", "gen": 0, "tid": model.transition_id(h), "header": h, "proof": dp} | kw
+
+    step("k0", "note_release", sS, entry(T2))                        # not mirrored here
+    step("k0", "mirror", dict(req(T2, sS, pS), version=0))
+    for bad in (entry(T2, gen=False), entry(T2, kind="bind"), entry(T2, tid="00" * 32), entry(T3), "x",
+                entry(T2, proof={"kind": "seal"}), {"kind": "release"}):
+        step("k0", "note_release", sS, bad)
+    step("k0", "note_release", 5, entry(T2))
+    step("k0", "note_release", sS, entry(T2, proof=dict(dp, pad="x" * MAX_PROOF_BYTES)))
+    step("k0", "note_release", sS, entry(T2))
+    step("k0", "note_release", sS, entry(T2))                        # stored once
+
+    # ---- heartbeats and the dead man
+    hb = step("w0", "heartbeat", "c1")["ok"]
+    for bad in ("", "x" * 129, 5, None):
+        step("w0", "heartbeat", bad)
+    step("w0", "heartbeat", "é" * 128)
+    step("k0", "observe", hb, "c1")
+    for bad, ch in ((hb, "c2"), (dict(hb, witness=ws[1].pk), "c1"), (dict(hb, version=True), "c1"),
+                    (dict(hb, constellation="x"), "c1"), ("hb", "c1"), ({}, "c1"),
+                    (dict(hb, sig="00" * 64), "c1")):
+        step("k0", "observe", bad, ch)
+    step("k0", "dead")                                              # just started standing by
+    t[0] += D
+    for x in w[1:3]:
+        h = quiet(x.heartbeat, "c3")
+        step("k0", "observe", h, "c3")
+        step("k1", "observe", h, "c3")
+    hb4 = step("w0", "heartbeat", "c4")["ok"]
+    step("k0", "observe", hb4, "c4")
+    step("k1", "observe", hb4, "c4")
+    step("k0", "dead")                                              # three members answered: alive
+
+    new = [kp(1320 + i) for i in range(4)]
+    k1s = [kp(1330 + i) for i in range(4)]
+    nxt = charter_body("succ", 1, [k.pk for k in new], charter_hash(body0), successor_clause([k.pk for k in k1s], D))
+    other = charter_body("succ", 1, [kp(1340).pk], charter_hash(body0))
+    step("k0", "succeed", nxt, {})                                  # alive, and not asked: refused
+    step("k0", "succeed", nxt, {k.pk: sign_charter(k, nxt) for k in ws[:2]})   # 2 of 4: not a request
+    for bad in (dict(nxt, extra=1), dict(nxt, witnesses=[]), dict(nxt, witnesses=[5]),
+                dict(nxt, successor=None), "x", {k: v for k, v in nxt.items() if k != "prev"},
+                dict(nxt, witnesses=[new[0].pk, new[0].pk])):
+        step("k0", "succeed", bad, {})
+    step("k0", "succeed", dict(nxt, prev="00" * 32), {k.pk: sign_charter(k, nxt) for k in ws})
+    step("k0", "succeed", dict(nxt, version=2), {k.pk: sign_charter(k, dict(nxt, version=2)) for k in ws})
+    step("k0", "succeed", dict(nxt, name="n" * MAX_CHARTER_BYTES), {})
+    coop = {k.pk: sign_charter(k, nxt) for k in ws[:3]} | {"junk": 5, ks[0].pk: "00"}
+    snap_k0 = step("k0", "succeed", nxt, coop)["ok"]["snapshot"]   # cooperative: signs and fences
+    step("k0", "succeed", nxt, {})                                  # the same successor: answered again
+    step("k0", "succeed", other, {k.pk: sign_charter(k, other) for k in ws})   # a different one: refused
+    step("k0", "mirror", dict(req(hdr([(sC, 1)], "f1"), sC, pC), version=0))   # fenced
+    step("k0", "note_release", sS, entry(T2))
+    step("k0", "snapshot")
+    step("k1", "succeed", nxt, {})                                  # k1 heard three members recently
+    t[0] += D + 1                                                   # silence for longer than dead_man
+    step("k1", "dead")
+    snap_k1 = step("k1", "succeed", nxt, {})["ok"]["snapshot"]      # the dead man
+    clock[0] = t[0]
+    sig_k2, snap_k2 = m[2].succeed(nxt)
+    sigs1 = {ks[0].pk: sign_charter(ks[0], nxt), ks[1].pk: sign_charter(ks[1], nxt), ks[2].pk: sig_k2}
+    chain1 = chain0 + [{"body": nxt, "sigs": sigs1}]
+    reg1 = Registry()
+    reg1.add_chain(X, chain1)
+
+    # ---- the handover: v1's committee stands by, v1's members adopt
+    c = [Standby(k, reg1, lambda: clock[0]) for k in k1s]
+    sc.add_standby("c0", c[0], 1330, "v1", wait=True)
+    snaps = [snap_k0, snap_k1, snap_k2]
+    step("c0", "mirror", dict(rA, version=1))                       # not standing by yet
+    step("c0", "enter", X, 0, [])                                   # not in v0's committee
+    step("c0", "enter", X, True, snaps)
+    step("c0", "enter", X, 1, snaps + snaps + [5, {sA: "x"}])       # each distinct entry once
+    step("c0", "enter", X, 1, [])                                   # a retry: unchanged
+    step("c0", "snapshot")
+    for x in c[1:]:
+        quiet(x.enter, X, 1, snaps)
+    sc.add("n0", Witness(new[0], reg1, lambda: clock[0]), 1320, "v1", adopt=True)
+    step("n0", "adopt", X, 1, snaps)
+    for x in (sA, sC, sS, sY):
+        step("n0", "record", x)
+    step("n0", "spend", dict(rB, mirror=acks(rB, c[1:], 1)))       # inherited TA: conflict
+    step("n0", "spend", dict(rA, mirror=[ack0] + a12))               # v0's committee's acks: not ours any more
+    c0_ack = step("c0", "mirror", dict(rA, version=1))["ok"]
+    step("n0", "spend", dict(rA, mirror=[c0_ack] + acks(rA, c[1:2], 1)))     # 2 of 4: q = 3
+    step("n0", "spend", dict(rA, mirror=[c0_ack] + acks(rA, c[1:3], 1)))     # votes TA under v1
+    step("n0", "status", sA)
+    pD, sD = mk("g1")
+    rD = req(hdr([(sD, 0)], "g1"), sD, pD)
+    step("w0", "spend", dict(rD, mirror=acks(rD, m[3:])))          # the old quorum is back: no ack quorum
+    step("w0", "gossip", {"charters": {X: chain0 + [{"body": nxt, "sigs": {k.pk: sign_charter(k, nxt) for k in ws}}]}})
+    step("w0", "gossip", {"charters": {X: chain1}})
+    step("w0", "charters")
+    return sc.done(registries={"v0": {X: chain0}, "v1": {X: chain1}}, cid=X)
+
+
 def ratelimit_cases():
     """``sigil.ratelimit``: token-bucket verdicts for a fixed clock script, client keys, loopback."""
     from sigil import ratelimit as RL
@@ -1027,6 +1245,7 @@ def main():
     # Last, so the seeded RNG gives every earlier section the same values as before.
     vectors["limits"] = limits_script()
     vectors["ratelimit"] = ratelimit_cases()
+    vectors["succession"] = succession_script()
     json.dump(vectors, sys.stdout, sort_keys=True, indent=None, separators=(",", ":"))
     sys.stdout.write("\n")
 

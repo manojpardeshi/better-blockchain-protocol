@@ -10,15 +10,16 @@ The reference implementation in [`sigil/`](../sigil) is authoritative where this
 | **Holder** (wallet) | keys, parcels, dossiers, trust policy | builds and authorises transitions, gathers seals, validates received parcels |
 | **Witness** | a signing key, a per-sigil record table | votes on spend requests, processes releases, hands over evidence on rotation |
 | **Constellation** | a charter chain | groups *n* witnesses; tolerates *f* = ⌊(*n*−1)/3⌋ faults; quorum *q* = *n* − *f* |
+| **Standby member** | a signing key, a mirror log per charter version it stands by for | member of a charter's *successor committee* (§5.5): acknowledges mirrored bindings, and signs the next charter version when the current one dies |
 
-There are no other roles. Witnesses never communicate with each other.
+There are no other roles. Witnesses never communicate with each other: a standby member's acknowledgements reach witnesses only inside the clients' requests (§5.5).
 
 ## 2. Conventions
 
 * **Values** are JSON-native: objects, arrays, strings, integers, booleans, null. Byte strings are lowercase hex.
 * **Canonical encoding** `enc(x)`: JSON, keys sorted, separators `,` and `:`, ASCII only, no NaN.
 * **Hash** `H(tag, x)` = BLAKE2b-256(`"sigil/v0/" ‖ tag ‖ 0x00 ‖ enc(x)`), hex. Tags in use: `sigil`, `parcel`, `body`, `transition`, `charter`, `constellation`.
-* **Signature** `Sig(sk, tag, x)` = Ed25519 over `"sigil/v0/sig/" ‖ tag ‖ 0x00 ‖ enc(x)`. Tags in use: `unlock`, `vote`, `charter`.
+* **Signature** `Sig(sk, tag, x)` = Ed25519 over `"sigil/v0/sig/" ‖ tag ‖ 0x00 ‖ enc(x)`. Tags in use: `unlock`, `vote`, `charter`, `mirror`, `heartbeat`.
 * **Amounts** are positive integers (booleans are not integers).
 
 ## 3. Objects
@@ -76,13 +77,14 @@ A seal is **valid** for a registry *R* and convicted set *X* if, for charter `R[
 
 ### 3.7 Charter
 ```
-charter_body = {name, version, witnesses: [pk], prev: H("charter", previous body) | null}
+charter_body = {name, version, witnesses: [pk], prev: H("charter", previous body) | null
+                [, successor: {committee: [pk], dead_man: int>0}]}
 charter      = {body, sigs: {pk: Sig(sk, "charter", body)}}
 cid          = H("constellation", body of version 0)
 ```
-Version 0 needs no signatures. Version *v*+1 MUST be signed by a quorum of version *v*'s witnesses.
+Version 0 needs no signatures. Version *v*+1 MUST be signed by a quorum of version *v*'s **authority**: its successor committee if version *v* has a `successor` clause (§5.5), otherwise its witnesses. A `committee` is a list of 1 to 128 distinct keys with its own fault bound *f*ₖ = ⌊(*n*ₖ−1)/3⌋ and quorum *q*ₖ = *n*ₖ − *f*ₖ, and `dead_man` is a period in seconds; a body without `successor` is hashed exactly as before the clause existed. `sigs` may carry other signatures (a cooperative rotation of a version with a committee also carries its members' FREEZE signatures, §5.5); only the authority's count.
 
-A charter names at most 128 witnesses, and its encoding `enc(charter)` (body and signatures) is at most 64 KiB; a chain holding a larger one is invalid. Version 0 needs no signatures, so anyone can mint one: without these caps one gossip message could register a constellation of ~14,000 witnesses, or a name or junk signature map of nearly 1 MiB.
+A charter names at most 128 witnesses and at most 128 committee members, and its encoding `enc(charter)` (body and signatures) is at most 64 KiB; a chain holding a larger one is invalid. Version 0 needs no signatures, so anyone can mint one: without these caps one gossip message could register a constellation of ~14,000 witnesses, or a name or junk signature map of nearly 1 MiB.
 
 ### 3.8 Equivocation proof
 `{a: vote, b: vote}` where both votes are valid, `a.witness = b.witness`, `a.constellation = b.constellation`, `a.sigil = b.sigil`, `a.gen = b.gen`, and `a.tid ≠ b.tid`.
@@ -125,10 +127,10 @@ Per sigil, a witness stores `Record{gen=0, tid=null, header=null, vote=null, log
 
 A witness MUST make its records (and its frozen flag) durable before it releases a SPEND vote, a RELEASE result or a FREEZE response, so that a crash and restart can never lead it to vote twice at one `(sigil, gen)`.
 
-**Refusing is safe.** A witness MAY refuse any SPEND or RELEASE outright, changing nothing: refusing to vote is abstention and refusing to release only delays a holder, so no refusal can produce a second vote at a `(sigil, gen)` or a seal. The resource bounds below (§5.1 steps 2a and 4, §5.2 step 1a) and admission control (§5.5) rely on this. None of them applies to ADOPT, which keeps every verifiable entry whatever its size: dropping evidence could lose a sealed binding.
+**Refusing is safe.** A witness MAY refuse any SPEND or RELEASE outright, changing nothing: refusing to vote is abstention and refusing to release only delays a holder, so no refusal can produce a second vote at a `(sigil, gen)` or a seal. The resource bounds below (§5.1 steps 2a and 4, §5.2 step 1a, §5.5) and admission control (§5.6) rely on this. None of them applies to ADOPT or to a standby member's STANDBY (§5.5), which keep every verifiable entry whatever its size: dropping evidence could lose a sealed binding.
 
 ### 5.1 SPEND(req)
-`req = {sigil, header, home, lock, salt, unlock, stamp?}`
+`req = {sigil, header, home, lock, salt, unlock, stamp?, mirror?}`
 
 1. If inactive or frozen → reject. If stamps are required and `stamp` is missing, invalid or already redeemed → reject; otherwise redeem it.
 2. `home` MUST equal this constellation's id.
@@ -139,7 +141,7 @@ A witness MUST make its records (and its frozen flag) durable before it releases
    * `g > r.gen`: if `r.tid ≠ null` → reject (release first). Otherwise set `r.gen = g`. Skipping generations without voting is abstention and is safe.
    * If `r.tid = null`: if `now > unlock.expires` by the witness's clock → reject (authorisation expired); a witness MUST NOT newly bind a sigil on an expired authorisation. If `g ≥ 16` → reject (generation limit reached for this sigil). Each new binding is at a higher generation than the last, so a sigil collects at most 16 bindings and their releases; only the owner can bind its sigil, and an honest owner moves to a new generation only after a death proof released its pledge. The cap reads the record's generation, not the log, which ADOPT evidence from a Byzantine predecessor may pad with junk entries but can never raise. Otherwise bind `r.tid = tid`, `r.header = header`, append `{kind:"bind", gen:g, auth:{home, lock, salt, unlock, header}}` to `r.log`.
    * If `r.tid ≠ tid` → reply **Conflict** carrying the existing vote.
-   * Otherwise return `r.vote`, creating and recording it on first use. (Re-voting an existing binding is allowed after expiry.)
+   * Otherwise return `r.vote`, creating and recording it on first use. (Re-voting an existing binding is allowed after expiry.) If the witness's charter version has a successor committee, it MUST NOT create the vote unless `req.mirror` holds valid mirror acks (§5.5) for exactly `(constellation, version, sigil, g, tid)` from at least *q*ₖ distinct committee members; otherwise it rejects the request and changes nothing. Returning a vote it already holds needs no acks. A witness that does not know its own charter version (a registry older than its store) cannot tell whether acks are needed, so it creates no vote.
 
 A witness MUST NOT sign two votes with the same `(constellation, sigil, gen)` and different `tid`.
 
@@ -168,7 +170,56 @@ Return `{gen, tid, votes}`. `votes` is every vote this witness ever cast on the 
 
   A witness therefore never signs two tids for one `(constellation, sigil, gen)`, even across charter versions, so §3.8 equivocation proofs cannot be manufactured against an honest key.
 
-### 5.5 Admission control
+### 5.5 Succession (dead-man takeover)
+
+Rotation needs a quorum of the current version to FREEZE. If that version dies (its members are gone, or fewer than *q* of them will ever answer again), no FREEZE can be had and every parcel homed there is stranded. A charter MAY therefore name a **successor committee** (§3.7): standby members who mirror the version's evidence while it lives and, once it is dead, sign the next version themselves. That is a **succession**. Its safety rests on no timing assumption at all:
+
+* a version with a committee never votes on a binding that a quorum of its committee has not first stored (**mirror before vote**);
+* a standby member that has signed a successor never stores anything for that version again (**fence**).
+
+A vote's mirror quorum and a succession's signing quorum share an honest standby member, whose handed-over log therefore holds the binding behind the vote. The successor's members ADOPT from those logs with the §5.4 rule, so they inherit every binding a seal of the dead version could rest on, whether that version was dead, merely partitioned or Byzantine.
+
+**Standby record**, per standby member and `(cid, version)`: `{mirror: {sigil: [entry]}, fenced: H(successor body) | null, heard: {pk: time}, since: time}`, made durable like witness records (§5) before any answer.
+
+* **STANDBY(snapshots).** A member of version *v*'s committee enters standby for `(cid, v)` with the snapshots that version *v*'s members ADOPT (§5.4): for a rotation the freezing members' (and the previous committee's), for a succession the signing standby members', for version 0 none. Their entries become its initial mirror log, and `since` is set to its clock. It MUST NOT acknowledge, sign or fence for `(cid, v)` before. (The handover must reach the committee while the predecessors' snapshots can still be fetched; a committee that never entered standby can never sign, which costs liveness, not safety.)
+* **MIRROR(req)**, `req = {sigil, header, home, lock, salt, unlock, version}`: require `home = cid`, `version = v`, not fenced, and that the authorisation passes §5.1 step 3 with `now = null`; let `(g, tid)` be what it binds. Append `{kind:"bind", gen:g, auth:{home, lock, salt, unlock, header}}` to `mirror[sigil]` (once per `(g, tid)`), make it durable, and answer the **mirror ack** `{constellation, version, member, sigil, gen, tid, sig}` with `sig = Sig(member_sk, "mirror", ack without sig)`. A standby member also stores `release` entries whose death proof verifies (§5.2); they need no ack and only help the successor see bindings that died.
+* **SPEND** at a witness of a version with a committee needs *q*ₖ mirror acks before it creates a vote (§5.1). Clients collect them: the acks for one `(sigil, g, tid)` serve every witness of the version.
+* **HEARTBEAT(challenge).** An active, unfrozen witness answers `Sig(sk, "heartbeat", {constellation, version, witness, challenge})`. Standby members probe the members of their version with fresh challenges and record in `heard` when each last answered.
+* **SUCCEED(next, sigs)** to a standby member of `(cid, v)`: require `next.prev = H(charter v)`, `next.version = v + 1`, that the member is in standby for `(cid, v)`, and that it has not fenced for a different successor. Then require one of:
+  * *cooperative:* `sigs` holds valid signatures on `next` from a quorum of version *v*'s witnesses (their FREEZE, §5.4);
+  * *dead man:* fewer than *q*ᵥ distinct members of *v* answered a heartbeat during the last `dead_man` seconds of the member's clock, and it has been in standby for at least `dead_man` seconds.
+
+  Persist `fenced = H(next)` (the member never acknowledges or stores for `(cid, v)` again, also after a restart), then answer `Sig(sk, "charter", next)` and its snapshot, its whole mirror log in §5.4 snapshot format. Asked again for the same `next` it answers the same; for another one it rejects.
+* **The new version.** Its members ADOPT (§5.4) from the snapshots of the standby members that signed; for a cooperative rotation also from the freezing members' snapshots. A key that served in an earlier version MUST bring its own votes, as in §5.4. If the new charter names a committee, that committee enters STANDBY with the same snapshots.
+
+**Resource bounds.** Like a witness (§5.1, §5.2), a standby member bounds what one request can make it store, and a refusal changes nothing; it only withholds an ack, and without acks no vote is created, which costs liveness, never safety:
+* MIRROR refuses an authorisation `enc({home, lock, salt, unlock, header})` longer than 32 KiB, a binding at a generation ≥ 16 that it does not hold yet, and a fifth distinct transition of one `(sigil, g)` (an honest owner binds one transition per generation and authorises another only after the first expired unbound, §4 rule 3; only the owner can authorise its sigil). A binding it holds is acknowledged again regardless.
+* A release entry is stored only for a binding the member holds, with a death proof of at most 128 KiB, and once per tid: anyone can build headers that name a consumed input, so releases of other tids would be unbounded junk.
+* STANDBY keeps every entry of the snapshots it is given, each distinct entry (by `enc`) once, as ADOPT does (§5.4).
+* SUCCEED refuses a successor body whose charter could never be valid (`enc({body, sigs: {}})` over 64 KiB, §3.7) instead of fencing for it.
+* A witness checks at most one ack per committee member (the first one for the binding), so a request stuffed with forged acks costs no more signature checks than an honest one. Admission control (§5.6) applies to standby members as to witnesses; the operator calls are never limited.
+
+A version with a committee is rotated as in §5.4 (its members FREEZE and sign), but the new charter is valid only with the committee's signatures (§3.7), so whoever drives the rotation passes the members' signatures to SUCCEED. The committee is thus the one authority over a version's successor: two different successors would need two committee quorums, and an honest standby member signs one, as FREEZE binds a witness to one successor. Charter chains therefore never fork.
+
+**Holders** verify a succession like any rotation (§3.7). Seals of every version, the dead one included, stay valid: the dead version's honest members can no longer create votes for unmirrored bindings (no honest standby member acknowledges after fencing), and every binding behind an honest vote they ever cast, before or after the succession, is in the successor's evidence. Old-version seals therefore cannot conflict with the successor's.
+
+**Assumptions.** Safety (§8) needs, besides the §8 fault bound on every version, at most *f*ₖ Byzantine members in each committee, and nothing about time. Liveness needs:
+
+* **(L1) progress.** A version with a committee makes progress only while a quorum of its committee answers MIRROR, and is rotated only while one answers SUCCEED.
+* **(L2) no premature succession.** If at least *q*ᵥ members of version *v* stay active, every honest standby member reaches each of them within Δ, probes at least every *P* seconds, and clocks drift by at most σ over `dead_man`, then `dead_man` > *P* + Δ + σ keeps every honest standby member from signing a succession of *v*.
+* **(L3) recovery.** If fewer than *q*ᵥ members of *v* are active from some time on, and at least *q*ₖ honest standby members are up, in standby and reachable by the operator who drives the succession, a succession of *v* can be signed `dead_man` seconds after the last heartbeat that counted.
+
+**What is impossible without synchrony.** A standby member cannot tell a dead version from a partitioned one: both are silent. Suppose a witness released a vote before a committee quorum held its binding. The adversary delays the binding past any `dead_man`, the version then dies, and a holder keeps the seal; the successor never learns of it and can seal another transition of the same sigil, a double spend. So any succession that is safe under arbitrary delays must store every voted binding at an honest member of every possible signing quorum before the vote leaves, which is mirror before vote. A dead-man timer over asynchronous mirroring (gossip or pull) without that gate is safe only if no live version is cut off from its committee for longer than `dead_man`, a synchrony assumption this design does not make. Here Δ, *P* and σ bound only liveness.
+
+**Accepted failure modes.**
+
+* The committee is part of the home's availability: no MIRROR quorum, no new votes (L1). A committee that loses its quorum forever halts its version for good (no votes, no rotation, no succession). Size committees for availability and rotate the home to a new committee while the old one is healthy.
+* A partition longer than `dead_man` between a live version and its committee lets the committee succeed it. That is safe; it retires the version's members, whose existing seals stay valid.
+* Releases that were never mirrored make the successor's records contested (§5.4) until someone presents a death proof or seal (`deep_confirm` and `abort` do).
+* Once succeeded, a version's keys are retired keys whose operators may be gone; long-range forgery with them (§9) is likelier, so holders SHOULD deep-confirm history sealed by a succeeded version (the reference wallet does).
+* A committee with more than *f*ₖ Byzantine members can sign a successor at will, exactly as a corrupt quorum of a version can rotate; holders who trust a home trust every committee its chain names. Like a corrupt quorum, it cannot steal (§8).
+
+### 5.6 Admission control
 A witness reachable from the open network MUST limit what anonymous clients can make it do, and MUST refuse a request it does not admit before processing it (no state change; see "Refusing is safe" above). Two mechanisms exist:
 * **Rate limits** (WIRE.md "Admission control"): a token bucket per client address. This is the default for a witness listening on a non-loopback address. It needs no payment system, so it is the only mechanism that works out of the box.
 * **Stamps** (§3.10): SPEND requires a prepaid blind stamp. Stamps price attention without letting the witness discriminate, but the protocol does not say how a stamp is paid for: a witness that sells stamps to anyone who asks (`sell_stamp` is a blind RSA signature) limits nothing. A deployment that gates `sell_stamp` behind payment SHOULD require stamps in addition to the rate limit.
@@ -203,9 +254,14 @@ To accept a received parcel, the holder MUST also trust its `home`.
 | Charter limits | 128 witnesses, `enc(charter)` ≤ 64 KiB |
 | SPEND authorisation (§5.1) | `enc({home, lock, salt, unlock, header})` ≤ 32 KiB; new bindings only at generations < 16 |
 | RELEASE death proof (§5.2) | `enc(proof)` ≤ 128 KiB |
-| Admission control (§5.5, WIRE.md defaults) | 20 requests/s per client, bursts of 100, off loopback |
+| Admission control (§5.6, WIRE.md defaults) | 20 requests/s per client, bursts of 100, off loopback |
 | Authorisation lifetime (wallet default) | `expires` = now + 600 s |
 | Clock-skew margin for pledge release (wallet default) | 120 s |
+| Committee fault bound | *f*ₖ = ⌊(*n*ₖ−1)/3⌋, *q*ₖ = *n*ₖ − *f*ₖ (§5.5); at most 128 members |
+| MIRROR (§5.5) | authorisation ≤ 32 KiB; new bindings only at generations < 16; at most 4 transitions per `(sigil, g)` |
+| Standby release entries (§5.5) | only for held bindings; `enc(proof)` ≤ 128 KiB |
+| Dead-man period (recommended) | `dead_man` ≥ 86 400 s, and well above probe period + delay + clock drift (§5.5 L2) |
+| Heartbeat probe period (reference standby) | 60 s; heartbeats with a challenge the standby member chose |
 
 ## 8. Safety argument
 
@@ -221,6 +277,8 @@ To accept a received parcel, the holder MUST also trust its `home`.
 
 **Rotation.** Every seal of version *v* shares at least one honest witness with the quorum *F* that froze and signed version *v*+1, and that witness's log contains the binding (with the owner's authorisation, which successors can verify). After freezing, at most *f* honest members of *v* are unfrozen, which is fewer than the *q* − *f* honest votes a new seal needs, so no new seal of version *v* can form. ADOPT therefore keeps every sealed binding as alive (or dead with proof). If a sealed binding `(g, u)` is alive, the new version either binds `u` at `g` or is contested with `u` as a candidate, and leaves `g` only once `u` is proven dead. If `u` is dead, `(g, u)` is still in the evidence, so an alive sibling at `g` makes the record contested and otherwise the record is unbound past `g`. Either way the new version never votes a second tid at `g`. This rule is model-checked in `formal/MC_rot_sibling*.cfg`. The **contested** state only arises when an owner authorised two transitions at one generation. The resource bounds do not touch this argument: a refused SPEND or RELEASE is a step the witness does not take (abstention), and ADOPT keeps every verifiable entry, dropping only exact repeats, so the evidence is the same set (the TLAPS rotation proof, `formal/SigilRotProofs.tla`, models the log as a set of bind and release entries, and SPEND and RELEASE as actions a witness may always decline).
 
+**Succession.** Let version *v* have committee *K*. Every honest vote of *v* was created with mirror acks from a quorum *A* of *K* (§5.1), so every honest member of *A* had stored its binding first; a succession of *v* is signed by a quorum *T* of *K*, whose honest members never store anything for *v* after signing (§5.5). With at most *f*ₖ Byzantine members, *A* and *T* share an honest member, and its snapshot, handed to the successor, holds the binding. This holds for votes cast after the succession too: such a vote's acks were collected from members of *A*, and the honest one in *A* ∩ *T* acknowledged before it fenced. Every seal of *v* has at least *f*+1 honest voters, so the successor's evidence holds every binding a seal of *v* rests on. The committee entered standby with the snapshots of the quorum that created *v*, so by induction the successor's evidence also holds, for every earlier version, the snapshots of a freezing quorum or the logs of a signing committee quorum, exactly what the Rotation argument needs. ADOPT is the §5.4 rule, so that argument applies unchanged: the successor never votes a second tid at a sealed `(s, g)`, and a dead, partitioned or Byzantine predecessor cannot produce a seal that conflicts with it. Two successors of one version would need two committee quorums of signatures, and an honest standby member signs one, so charter chains do not fork. `formal/SigilSuccProofs.tla` proves this for unbounded numbers of versions, witnesses, committee members, sigils, transitions and generations (4,208 obligations, docs/VERIFICATION.md §1c), with no timing assumption. The resource bounds of §5.5 leave the argument unchanged: each is a MIRROR a standby member declines, and STANDBY keeps the evidence as a set.
+
 **Holders cannot be robbed by witnesses.** Rule 6.4 re-checks the owner's unlock, so even a seal produced by a fully corrupt quorum can't spend a parcel without its lock's signatures. Witnesses enforce time locks; holders accept time conditions on the quorum's word.
 
 **Mechanised check.** `tests/test_model_check.py` explores adversarial schedules against the real witness code. The adversary controls the owner and a Byzantine witness that signs anything and joins every seal and death proof. As a mutation test, it confirms that a witness accepting any death proof is caught. `tests/test_model_check_extended.py` extends the exploration to charter rotations (adversarial signing quorums, unfrozen ex-members, forged snapshots from a Byzantine signer, a Byzantine member in every version, seals counted from any version) and to transitions spanning two constellations, each with its own mutation tests. [`formal/Sigil.tla`](../formal) is a TLA+ model of §5.1–5.2 and §3.9 over several constellations, including an all-Byzantine one controlled by the attacker, and TLC checks the theorem and both lemmas against it exhaustively on small instances (see `formal/README.md`). Its mutation tests include accepting death proofs from any constellation rather than the named sigil's home, which TLC catches as a double spend.
@@ -234,10 +292,11 @@ To accept a received parcel, the holder MUST also trust its `home`.
 * **Bond locks.** A bond's slashing branch MUST require, besides the equivocation proof, signatures of *k* of *n* auditors independent of the operator: `any(all(sig(op), after(T)), all(equivocation(w), multi(k, auditors)))`. A bare `equivocation(w)` branch lets the equivocator, who holds its own proof first, claim its own bond.
 * **Multi-party transitions.** Each party SHOULD add a kill-switch input of its own and withhold its unlock until every other party's inputs are bound. If a counter-party stalls, the party spends its kill switch elsewhere at the generation the transition names; that seal is a death proof (§3.9) that releases its other inputs (§5.2).
 * **Payment size.** Accept large payments only into homes with larger *n* and stronger bonds.
+* **Deep confirmation after a succession.** A version that was succeeded (its successor carries no quorum of its members' signatures, §5.5) has retired keys whose operators may have vanished with their disks. Holders SHOULD deep-confirm, against the successor's current charter, every input in a received ancestry that a succeeded version sealed, whatever the amount. The reference wallet does so by default.
+* **Committees.** A successor committee should be operated independently of the version it stands by for (other operators, hosting and jurisdictions), and be at least as available: its quorum gates every vote (§5.5 L1). Rotate a home onto a new committee while the old one is healthy; a committee that lost its quorum cannot be replaced.
 
 ## 10. Extensions under design
 
-* **Succession:** a charter names a successor that mirrors evidence logs and adopts after a dead-man period.
 * **Recursive proofs:** replace dossiers with constant-size proofs of ancestry validity.
 * **Arbiter objects:** conventions for shared state as sequentially re-created parcels.
 * **Transport:** a request/response wire protocol (this draft defines messages, not transport).

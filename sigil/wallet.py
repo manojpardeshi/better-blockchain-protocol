@@ -10,11 +10,11 @@ import time
 from collections import defaultdict
 
 from . import locks, model
-from .charter import faults
+from .charter import faults, taken_over
 from .crypto import KeyPair
 from .locks import keys_in, sign_unlock
 from .network import Network
-from .proofs import proves_dead, verify_seal, verify_vote
+from .proofs import proves_dead, verify_ack, verify_seal, verify_vote
 from .stamps import buy_stamp
 from .validate import Dossier, InvalidDossier, TrustPolicy, Verifier
 from .witness import CONTESTED, Conflict, Rejected
@@ -26,10 +26,40 @@ class SealFailed(Exception):
         self.sigil, self.votes, self.conflicts = sigil, votes, conflicts
 
 
+def mirror_acks(network: Network, req: dict) -> list:
+    """Mirror acks for a SPEND request from its home's successor committee (SPEC §5.5).
+
+    A witness of a version with a committee votes only with acks from a quorum of
+    it, so the client first has the committee store the binding. The acks for one
+    request serve every witness of the version. Empty if the home has no committee.
+    """
+    body = network.registry.latest(req["home"])
+    if body is None or body.get("successor") is None or not hasattr(network, "committee"):
+        return []
+    mreq = {k: req[k] for k in ("sigil", "header", "home", "lock", "salt", "unlock")}
+    mreq["version"] = body["version"]
+    acks = []
+    for m in network.committee(req["home"]):
+        try:
+            a = m.mirror_bind(mreq)
+        except Rejected:  # includes Unreachable
+            continue
+        if verify_ack(a) and a.get("member") == m.pk:
+            acks.append(a)
+    return acks
+
+
 def request_seal(network: Network, req: dict, stamp_for=None) -> dict:
-    """Ask every witness of the sigil's home to vote; assemble a seal."""
+    """Ask every witness of the sigil's home to vote; assemble a seal.
+
+    For a home with a successor committee, the committee's mirror acks are
+    collected first and carried in the request (SPEC §5.5).
+    """
     tid = model.transition_id(req["header"])
     gen = next(g for s, g in req["header"]["inputs"] if s == req["sigil"])
+    acks = mirror_acks(network, req)
+    if acks:
+        req = dict(req, mirror=acks)
     by_version: dict[int, list] = defaultdict(list)
     conflicts = []
     for w in network.witnesses(req["home"]):
@@ -100,7 +130,7 @@ def _status(w, sigil: str) -> dict | None:
 class Wallet:
     def __init__(self, name: str, network: Network, home: str | None = None, *, trusted=None,
                  deep_threshold: int | None = None, clock=None, pledge_ttl: int = 600,
-                 max_skew: int = 120, on_pledge=None):
+                 max_skew: int = 120, on_pledge=None, deep_after_succession: bool = True):
         self.name = name
         # Our clock bounds every authorisation we sign: a witness never newly
         # binds a sigil after ``expires`` by its own clock (SPEC §5.1), so
@@ -110,6 +140,9 @@ class Wallet:
         self.pledge_ttl = pledge_ttl
         self.max_skew = max_skew
         self.deep_threshold = deep_threshold  # receipts this large get deep confirmation (None: never)
+        # History sealed by a version that was taken over (SPEC §5.5) comes from
+        # retired keys whose operators may be gone: deep-confirm it at any amount.
+        self.deep_after_succession = deep_after_succession
         self._confirmed: set[tuple] = set()   # (sigil, gen, tid) already deep-confirmed
         self.network = network
         self.home = home
@@ -177,8 +210,9 @@ class Wallet:
         for p in parcels:
             totals[p["asset"]] += p["amount"]
         for r, p in zip(refs, parcels):
-            if deep or (deep is None and self.deep_threshold is not None
-                        and totals[p["asset"]] >= self.deep_threshold):
+            if deep or (deep is None and (
+                    (self.deep_threshold is not None and totals[p["asset"]] >= self.deep_threshold)
+                    or (self.deep_after_succession and self.sealed_by_succeeded_version(dossier, [r["tx"]])))):
                 self.deep_confirm(dossier, [r["tx"]])
             if not self.policy.trusts(p["home"]):
                 raise InvalidDossier("parcel lives in a constellation we do not trust")
@@ -198,6 +232,19 @@ class Wallet:
             self.holdings[model.parcel_id(r)] = {"ref": r, "parcel": p, "sigil": s, "gen": 0}
             received.append(p)
         return received
+
+    def sealed_by_succeeded_version(self, dossier: Dossier, tids) -> bool:
+        """Does the ancestry of ``tids`` hold a seal by a version that was taken over?
+
+        Such a version was succeeded without its members' cooperation (SPEC §5.5):
+        its keys are retired and may have fallen into anyone's hands, so its seals
+        are only as good as a deep confirmation against the successor (SPEC §9).
+        """
+        for seal in dossier.ancestry(tids).seals.values():
+            chain = self.network.registry.chain(seal["constellation"])
+            if taken_over(chain, seal["version"]):
+                return True
+        return False
 
     def deep_confirm(self, dossier: Dossier, tids) -> None:
         """Check a dossier's history against the *current* witnesses (SPEC §9).
@@ -534,6 +581,14 @@ class Wallet:
                     w.release(s, proof)
                 except Rejected:
                     pass  # not bound to tid (or unreachable): it accepts g + 1 anyway
+            # Best effort: tell the home's successor committee too, so a successor
+            # sees the binding died instead of finding the sigil contested (SPEC §5.5).
+            for m in (self.network.committee(h["parcel"]["home"]) if hasattr(self.network, "committee") else []):
+                try:
+                    m.note_release(s, {"kind": "release", "gen": pledge[0], "tid": tid, "header": header,
+                                       "proof": proof})
+                except Rejected:
+                    pass
             h["gen"] = pledge[0] + 1
             del self.pledged[s]
             released.append(s)

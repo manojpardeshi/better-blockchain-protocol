@@ -65,6 +65,7 @@ def save(wallet: Wallet, wallet_dir: str) -> None:
         "name": wallet.name,
         "home": wallet.home,
         "deep_threshold": wallet.deep_threshold,
+        "deep_after_succession": wallet.deep_after_succession,
         "pledge_ttl": wallet.pledge_ttl,
         "max_skew": wallet.max_skew,
         # The trust policy is a security decision: losing it on reload would
@@ -99,7 +100,8 @@ def load(wallet_dir: str, network) -> Wallet:
     else:
         trusted = set(state["trusted"])
     w = Wallet(state["name"], network, state["home"], deep_threshold=state["deep_threshold"],
-               trusted=trusted, pledge_ttl=state.get("pledge_ttl", 600), max_skew=state.get("max_skew", 120))
+               trusted=trusted, pledge_ttl=state.get("pledge_ttl", 600), max_skew=state.get("max_skew", 120),
+               deep_after_succession=state.get("deep_after_succession", True))
     w.policy.convicted = set(state.get("convicted", []))
     for pk, seed in seeds.items():
         kp = KeyPair.from_seed(bytes.fromhex(seed))
