@@ -8,19 +8,25 @@ a partition mistaken for death, Byzantine standby members within and beyond the
 committee's fault bound, and forged succession certificates.
 """
 
+import json
 import os
 import tempfile
 import unittest
+import urllib.error
+import urllib.request
+from unittest import mock
 
+import sigil.proofs
 from sigil import KeyPair, Network, Wallet, locks, model
-from sigil.charter import (charter_body, charter_hash, constellation_id, quorum, sign_charter,
-                           successor_clause, taken_over, verify_chain)
+from sigil.charter import (MAX_CHARTER_BYTES, MAX_WITNESSES, charter_body, charter_hash, constellation_id,
+                           quorum, sign_charter, successor_clause, taken_over, valid_successor, verify_chain)
 from sigil.gossip import GossipStore, fork_signers
 from sigil.proofs import acked_by, verify_ack, verify_seal
-from sigil.succession import Standby, StandbyStore
+from sigil.server import StandbyServer
+from sigil.succession import MAX_MIRROR_TIDS, Standby, StandbyStore
 from sigil.validate import Dossier, InvalidDossier
 from sigil.wallet import SealFailed, request_seal
-from sigil.witness import Conflict, Rejected, Witness
+from sigil.witness import MAX_AUTH_BYTES, MAX_GEN, MAX_PROOF_BYTES, Conflict, Rejected, Witness
 
 DEAD = 3600
 
@@ -602,6 +608,251 @@ class AdversarialTests(unittest.TestCase):
             w0b.spend(dict(h.req(Tb, s, p), mirror=[]))
         votes = w0b.status(s)["votes"]
         self.assertEqual({v["tid"] for v in votes if v["gen"] == 0}, {model.transition_id(Ta)})
+
+
+class MoreAdversarialTests(unittest.TestCase):
+    """Byzantine members of the successor version and of the committee, forged acks
+    and forged requests."""
+
+    assert_no_double_seal = AdversarialTests.assert_no_double_seal
+
+    def test_byzantine_member_of_the_successor_version(self):
+        h = Home()
+        p, s = h.parcel("aa")
+        px, x = h.parcel("bb")
+        Ta, Tb = h.hdr([(s, 0)], "1"), h.hdr([(s, 0)], "2")
+        self.assertIsNotNone(h.seal(h.req(Ta, s, p)))
+        h.kill_home()
+        h.take_over()
+        byz = h.net.witnesses(h.X)[0]                # one of the four new members turns Byzantine (f = 1)
+        honest = h.net.witnesses(h.X)[1:]
+        tb = model.transition_id(Tb)
+        forged = {"constellation": h.X, "version": 1, "witness": byz.pk, "sigil": s, "gen": 0, "tid": tb,
+                  "time": int(h.net.clock())}
+        forged["sig"] = byz.kp.sign("vote", model.vote_payload(forged))
+        votes = [forged] + h.votes(h.req(Tb, s, p), witnesses=honest)
+        self.assertEqual(len(votes), 1, "the honest members inherited Ta and refuse Tb")
+        self.assertFalse(verify_seal(model.seal_from_votes(votes), h.net.registry))
+        # Nor can it kill Ta: one version's votes against Ta need a quorum.
+        dp = {"kind": "votes", "sigil": s, "gen": 0, "parcel": {k: p[k] for k in ("home", "lock", "salt")},
+              "votes": [forged]}
+        for w in honest:
+            with self.assertRaises(Rejected):
+                w.release(s, dp)
+        # Everything else keeps working through the honest members: x is spent once.
+        self.assertIsNotNone(h.seal(h.req(h.hdr([(x, 0)], "3"), x, px), witnesses=honest))
+        self.assert_no_double_seal(h, [s, x])
+
+    def test_byzantine_committee_member_forges_its_handover_and_signs_twice(self):
+        """A Byzantine standby member hands over junk, unverifiable bindings, releases
+        without a valid death proof and the owner's second (unsealed) transition, and
+        signs a second successor. ADOPT ignores what does not verify, the equivocation
+        only makes the record contested, and the second successor never gets a quorum."""
+        class Forger(Standby):
+            junk = None
+
+            def succeed(self, next_charter, sigs=None):
+                return sign_charter(self.kp, next_charter), self.junk
+
+        h = Home(standby_cls=Forger)
+        byz = h.net.committees[h.X][0]
+        p, s = h.parcel("aa")
+        Ta, Tb, Tc = h.hdr([(s, 0)], "1"), h.hdr([(s, 0)], "2"), h.hdr([(s, 0)], "3")
+        ra = h.req(Ta, s, p)
+        self.assertIsNotNone(h.seal(ra))
+        rb = h.req(Tb, s, p)                         # the owner also authorised Tb (never sealed)
+        auth_b = {k: rb[k] for k in ("home", "lock", "salt", "unlock", "header")}
+        bad_auth = dict(auth_b, header=Tc)           # Tc: no owner signature for it
+        dead_claim = {"kind": "release", "gen": 0, "tid": model.transition_id(Ta), "header": Ta,
+                      "proof": {"kind": "votes", "sigil": s, "gen": 0, "parcel": {}, "votes": []}}
+        byz.junk = {s: [{"kind": "bind", "gen": 0, "auth": bad_auth}, dead_claim, {"kind": "bind", "gen": 0, "auth": auth_b},
+                        "not an entry", {"kind": "seal", "seal": {"tid": "x"}}] + [{"kind": "noise", "i": i} for i in range(50)],
+                    "elsewhere": "not a log"}
+        h.kill_home()
+        h.take_over()
+        tids = {model.transition_id(Ta), model.transition_id(Tb)}
+        for w in h.net.witnesses(h.X):
+            r = w.records[s]
+            self.assertEqual(r.tid, "!contested", "Ta is alive and Tb is the owner's own sibling")
+            self.assertEqual({c[1] for c in r.candidates}, tids)
+        self.assertIsNone(h.seal(h.req(Tb, s, p)))
+        self.assertIsNone(h.seal(h.req(Tc, s, p)))
+        # A second successor of version 0: the Byzantine member signs it, no honest one does.
+        cur = h.net.registry.chain(h.X)[0]["body"]
+        other = charter_body(cur["name"], 1, [KeyPair.generate().pk for _ in range(4)], charter_hash(cur))
+        sigs = {byz.pk: byz.succeed(other)[0]}
+        for m in h.net.retired_committees[h.X][1:]:
+            with self.assertRaises(Rejected):
+                m.succeed(other)
+        self.assertFalse(verify_chain(h.X, h.net.registry.chain(h.X)[:1] + [{"body": other, "sigs": sigs}]))
+        self.assert_no_double_seal(h, [s])
+
+    def test_forged_and_replayed_acks_do_not_open_the_gate(self):
+        h = Home()
+        p, s = h.parcel("aa")
+        Ta, Tb = h.hdr([(s, 0)], "1"), h.hdr([(s, 0)], "2")
+        ra, rb = h.req(Ta, s, p), h.req(Tb, s, p)
+        good_a = h.acks(ra)
+        outsiders = [KeyPair.generate() for _ in range(4)]
+
+        def ack(kp, **kw):
+            a = {"constellation": h.X, "version": 0, "member": kp.pk, "sigil": s, "gen": 0,
+                 "tid": model.transition_id(Tb)} | kw
+            a["sig"] = kp.sign("mirror", model.ack_payload(a))
+            return a
+
+        cases = {
+            "keys outside the committee": [ack(k) for k in outsiders],
+            "acks for another transition": good_a,
+            "acks for another version": [ack(m.kp, version=1) for m in h.net.committee(h.X)],
+            "a version that is not an integer": [ack(m.kp, version=True) for m in h.net.committee(h.X)],
+            "bad signatures": [dict(a, tid=model.transition_id(Tb)) for a in good_a],
+            "one member many times": [h.acks(rb)[0]] * 4,
+        }
+        w = h.net.witnesses(h.X)[0]
+        for name, acks in cases.items():
+            with self.assertRaises(Rejected, msg=name):
+                w.spend(dict(rb, mirror=acks))
+            self.assertNotIn(s, w.records, name)        # nothing is persisted on refusal
+        self.assertTrue(w.spend(dict(rb, mirror=h.acks(rb))))
+
+    def test_forged_cooperative_request_is_not_a_request(self):
+        h = Home()
+        m = h.net.committees[h.X][0]
+        cur = h.net.registry.latest(h.X)
+        nxt = charter_body(cur["name"], 1, [KeyPair.generate().pk for _ in range(4)], charter_hash(cur))
+        ws = h.net.witnesses(h.X)
+        fakes = [KeyPair.generate() for _ in range(4)]
+        for sigs in ({k.pk: sign_charter(k, nxt) for k in fakes},                       # not members
+                     {w.pk: sign_charter(fakes[0], nxt) for w in ws},                     # members' keys, forged
+                     {w.pk: sign_charter(w.kp, dict(nxt, name="other")) for w in ws}):    # signed another body
+            with self.assertRaises(Rejected):
+                m.succeed(nxt, sigs)
+        self.assertIsNone(m.fenced_for)
+
+
+class SuccessionLimitTests(unittest.TestCase):
+    """The resource bounds of the main line, applied to succession (SPEC §5.5): what one
+    request can make a standby member store, the handover kept as a set, one signature
+    check per committee member for acks, and the committee cap."""
+
+    def setUp(self):
+        self.h = Home()
+        self.m = self.h.net.committees[self.h.X][0]
+        self.p, self.s = self.h.parcel("aa")
+
+    def mreq(self, hdr):
+        return dict(self.h.req(hdr, self.s, self.p), version=0)
+
+    def test_mirror_bounds_what_one_request_stores(self):
+        big = self.h.hdr([(self.s, 0)], "1") | {"pad": "x" * MAX_AUTH_BYTES}
+        with self.assertRaisesRegex(Rejected, "authorisation too large"):
+            self.m.mirror_bind(self.mreq(big))
+        with self.assertRaisesRegex(Rejected, "generation limit"):
+            self.m.mirror_bind(self.mreq(self.h.hdr([(self.s, MAX_GEN)], "1")))
+        self.assertEqual(self.m.mirror, {}, "nothing stored")
+        self.assertTrue(verify_ack(self.m.mirror_bind(self.mreq(self.h.hdr([(self.s, MAX_GEN - 1)], "1")))))
+        first = self.m.mirror_bind(self.mreq(self.h.hdr([(self.s, 0)], "0")))
+        for i in range(1, MAX_MIRROR_TIDS):
+            self.m.mirror_bind(self.mreq(self.h.hdr([(self.s, 0)], str(i))))
+        with self.assertRaisesRegex(Rejected, "too many transitions"):
+            self.m.mirror_bind(self.mreq(self.h.hdr([(self.s, 0)], "9")))
+        self.assertEqual(self.m.mirror_bind(self.mreq(self.h.hdr([(self.s, 0)], "0"))), first,
+                         "a stored binding is acknowledged again")
+        self.m.mirror_bind(self.mreq(self.h.hdr([(self.s, 1)], "9")))   # another generation is fine
+        self.assertEqual(len(self.m.mirror[self.s]), MAX_MIRROR_TIDS + 2)
+
+    def test_release_entries_only_for_mirrored_bindings_and_bounded_proofs(self):
+        h, m = self.h, self.m
+        px, x = h.parcel("bb")
+        T, T2, Ty = h.hdr([(self.s, 0), (x, 0)], "1"), h.hdr([(self.s, 0), (x, 0)], "2"), h.hdr([(x, 0)], "3")
+        seal_y = h.seal(h.req(Ty, x, px))
+        dp = {"kind": "seal", "sigil": x, "gen": 0, "parcel": {k: px[k] for k in ("home", "lock", "salt")},
+              "seal": seal_y}
+
+        def entry(hdr, proof=dp):
+            return {"kind": "release", "gen": 0, "tid": model.transition_id(hdr), "header": hdr, "proof": proof}
+
+        with self.assertRaises(Rejected):
+            m.note_release(self.s, entry(T))          # T was never mirrored here
+        m.mirror_bind(self.mreq(T))
+        with self.assertRaisesRegex(Rejected, "death proof too large"):
+            m.note_release(self.s, entry(T, dict(dp, pad="x" * MAX_PROOF_BYTES)))
+        self.assertTrue(m.note_release(self.s, entry(T)))
+        self.assertFalse(m.note_release(self.s, entry(T)), "stored once")
+        with self.assertRaises(Rejected):
+            m.note_release(self.s, entry(T2))         # anyone can build T2; it was never bound here
+        self.assertEqual([e["kind"] for e in m.mirror[self.s]], ["bind", "release"])
+
+    def test_handover_keeps_each_entry_once_and_every_distinct_one(self):
+        h = self.h
+        r = h.req(h.hdr([(self.s, 0)], "1"), self.s, self.p)
+        bind = {"kind": "bind", "gen": 0, "auth": {k: r[k] for k in ("home", "lock", "salt", "unlock", "header")}}
+        junk = [{"kind": "bind", "gen": i, "auth": None} for i in range(3)]
+        snap = {self.s: [bind] + junk, "x": "not a log"}
+        fresh = Standby(h.ckeys[1], h.net.registry, h.net.clock)
+        fresh.enter(h.X, 0, [snap, snap, snap, "not a snapshot"])
+        self.assertEqual(fresh.mirror[self.s], [bind] + junk)
+        self.assertEqual(fresh.mirrored, {(self.s, 0, model.transition_id(r["header"]))})
+        self.assertNotIn("x", fresh.mirror)
+
+    def test_one_signature_check_per_committee_member(self):
+        h = self.h
+        r = h.req(h.hdr([(self.s, 0)], "1"), self.s, self.p)
+        good = h.acks(r)
+        forged = [dict(a, sig=good[(i + 1) % len(good)]["sig"]) for i, a in enumerate(good)]
+        acks = [f for f in forged for _ in range(3)] + good    # 3 forgeries per member, then the real ack
+        committee = [m.pk for m in h.net.committee(h.X)]
+        tid = model.transition_id(r["header"])
+        real = sigil.proofs.verify_ack
+        with mock.patch.object(sigil.proofs, "verify_ack", side_effect=real) as spy:
+            got = acked_by(acks, committee, h.X, 0, self.s, 0, tid)
+        self.assertEqual(spy.call_count, len(committee))
+        self.assertEqual(got, set(), "each member's first ack is the one that counts")
+        self.assertEqual(acked_by(good + forged, committee, h.X, 0, self.s, 0, tid), set(committee))
+        with self.assertRaises(Rejected):
+            h.net.witnesses(h.X)[0].spend(dict(r, mirror=acks))
+
+    def test_committee_cap_and_oversized_successor(self):
+        keys = ["%064x" % i for i in range(MAX_WITNESSES + 1)]
+        self.assertTrue(valid_successor({"committee": keys[:MAX_WITNESSES], "dead_man": 1}))
+        self.assertFalse(valid_successor({"committee": keys, "dead_man": 1}))
+        with self.assertRaises(ValueError):
+            successor_clause(keys, 1)
+        ws = [KeyPair.generate() for _ in range(4)]
+        body = charter_body("c", 0, [w.pk for w in ws], None)
+        body["successor"] = {"committee": keys, "dead_man": 1}
+        self.assertFalse(verify_chain(constellation_id(body), [{"body": body, "sigs": {}}]))
+        cur = self.h.net.registry.latest(self.h.X)
+        huge = charter_body("n" * MAX_CHARTER_BYTES, 1, [KeyPair.generate().pk], charter_hash(cur))
+        self.h.net.clock.advance(DEAD + 1)
+        self.h.kill_home()
+        self.h.net.probe(self.h.X)
+        with self.assertRaisesRegex(Rejected, "charter too large"):
+            self.m.succeed(huge)
+        self.assertIsNone(self.m.fenced_for, "never fenced for a charter that can never be valid")
+
+    def test_standby_server_admission_control(self):
+        srv = StandbyServer(self.m, "127.0.0.1", 0, admin_token="tok", rate_limit=0.001, rate_burst=1).start()
+        try:
+            def post(method, body, token=None):
+                headers = {"Content-Type": "application/json"}
+                if token:
+                    headers["Authorization"] = f"Bearer {token}"
+                req = urllib.request.Request(f"{srv.url}/v0/{method}", data=json.dumps(body).encode(),
+                                             headers=headers, method="POST")
+                try:
+                    with urllib.request.urlopen(req, timeout=5) as resp:
+                        return resp.status
+                except urllib.error.HTTPError as e:
+                    return e.code
+            req = self.mreq(self.h.hdr([(self.s, 0)], "1"))
+            self.assertEqual(post("mirror", {"request": req}), 200)
+            self.assertEqual(post("mirror", {"request": req}), 429)
+            for _ in range(3):                        # operator calls are never limited
+                self.assertEqual(post("probe", {"urls": []}, token="tok"), 200)
+        finally:
+            srv.stop()
 
 
 if __name__ == "__main__":

@@ -5,6 +5,10 @@
     python -m sigil.witnessd run     --key key.json --registry registry.json --constellation <cid> \\
                                      --store data.db [--host 127.0.0.1] [--port 7000] [--stamps] \\
                                      [--admin-token FILE] [--adopt] [--rate-limit R] [--rate-burst B]
+    python -m sigil.witnessd standby --key key.json --registry registry.json --constellation <cid> \\
+                                     --store standby.db [--host 127.0.0.1] [--port 7100] [--wait] \\
+                                     [--admin-token FILE] [--members URL ...] [--probe-every S] \\
+                                     [--rate-limit R] [--rate-burst B]
 
 ``keygen`` writes the private key (mode 0600) and its public key next to it
 (``key.pub``). ``genesis`` builds charter version 0 from public keys and
@@ -200,7 +204,8 @@ def standby(args) -> None:
     token = load_admin_token(args.admin_token)
     m = build_standby(args.key, args.registry, args.constellation, args.store, args.wait)
     server = StandbyServer(m, args.host, args.port, admin_token=token, members=args.members,
-                           probe_every=args.probe_every).start()
+                           probe_every=args.probe_every, rate_limit=args.rate_limit,
+                           rate_burst=args.rate_burst).start()
     stop = threading.Event()
     for sig in (signal.SIGTERM, signal.SIGINT):
         signal.signal(sig, lambda *_: stop.set())
@@ -262,6 +267,11 @@ def main(argv=None) -> None:
                     help="on a fresh store, wait for /v0/standby into a later charter version")
     sb.add_argument("--members", nargs="*", default=[], help="member URLs to probe for heartbeats")
     sb.add_argument("--probe-every", type=float, help="probe the members every this many seconds")
+    sb.add_argument("--rate-limit", type=float, metavar="R", default=None,
+                    help=f"requests per second per client (0: no limit; default {DEFAULT_RATE:g} on a "
+                         "non-loopback host, none on loopback)")
+    sb.add_argument("--rate-burst", type=int, metavar="B", default=DEFAULT_BURST,
+                    help=f"requests a client may burst above the rate (default {DEFAULT_BURST})")
 
     r = sub.add_parser("run", help="serve a witness")
     r.add_argument("--key", required=True)

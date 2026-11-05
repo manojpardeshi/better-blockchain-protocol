@@ -71,18 +71,21 @@ def acked_by(acks, committee, cid: str, version: int, sigil: str, gen: int, tid:
     """Distinct ``committee`` members with a valid mirror ack for exactly ``(cid, version, sigil, gen, tid)``.
 
     Anything else in ``acks`` (malformed entries, other bindings, other versions,
-    keys outside the committee) is ignored.
+    keys outside the committee) is ignored. Only a member's first ack for this
+    binding is verified: one signature check per member at most, so a request
+    stuffed with forged acks costs no more than an honest one.
     """
     if not isinstance(acks, list):
         return set()
-    members, out = set(committee), set()
+    members, tried, out = set(committee), set(), set()
     want = {"constellation": cid, "version": version, "sigil": sigil, "gen": gen, "tid": tid}
     for a in acks[: 4 * len(members) + 4]:  # more acks than members can only be junk
         try:
-            if (isinstance(a, dict) and a["member"] in members and a["member"] not in out
-                    and all(a[k] == v and type(a[k]) is type(v) for k, v in want.items())
-                    and verify_ack(a)):
-                out.add(a["member"])
+            if (isinstance(a, dict) and a["member"] in members and a["member"] not in tried
+                    and all(a[k] == v and type(a[k]) is type(v) for k, v in want.items())):
+                tried.add(a["member"])
+                if verify_ack(a):
+                    out.add(a["member"])
         except (KeyError, TypeError):
             continue
     return out

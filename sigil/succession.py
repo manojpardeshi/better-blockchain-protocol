@@ -18,17 +18,32 @@ member is willing to sign without the version's cooperation.
 With a ``store`` every state change is durable before the member answers, and a
 restarted member reloads it. A restart also starts a new observation window, so a
 member never declares a version dead because of heartbeats it missed while down.
+
+What one client can make a member store is bounded like a witness's records
+(SPEC §5.1, §5.2, §5.5): MIRROR takes an authorisation of at most 32 KiB, only
+below generation 16, and at most ``MAX_MIRROR_TIDS`` transitions per sigil and
+generation; a release entry needs a death proof of at most 128 KiB for a binding
+the member holds. Each refusal only withholds an ack (no ack, no vote), which
+costs liveness and never safety. The handover of STANDBY, like ADOPT, keeps every
+entry it is given, each distinct one once.
 """
 
 import json
 import secrets
 
-from .charter import Registry, charter_body, charter_hash, quorum, sign_charter, signers
+from .charter import MAX_CHARTER_BYTES, Registry, charter_body, charter_hash, quorum, sign_charter, signers
 from .crypto import KeyPair
+from .encoding import canonical
 from .model import ack_payload, transition_id
 from .proofs import proves_dead, verify_heartbeat
 from .store import WitnessStore
-from .witness import Rejected, authorises
+from .witness import MAX_AUTH_BYTES, MAX_GEN, MAX_PROOF_BYTES, Rejected, _encoding, _too_big, authorises
+
+# Distinct transitions a member mirrors per (sigil, generation). An honest owner binds
+# one transition per generation, and re-pledges another only after the first expired
+# unbound (SPEC §4 rule 3); only the owner can authorise its sigil, so the cap only
+# ever limits an owner flooding its own sigil.
+MAX_MIRROR_TIDS = 4
 
 
 class StandbyStore(WitnessStore):
@@ -51,14 +66,37 @@ class StandbyStore(WitnessStore):
 
 
 def _members_snapshot_union(snapshots) -> dict:
-    """The union of snapshot logs, skipping malformed parts (as ADOPT does)."""
+    """The union of snapshot logs, as ADOPT reads it: malformed parts are skipped, and
+    each distinct entry (by ``enc``) is kept once, in the order first seen. Honest
+    predecessors hand over the same entries, so keeping repeats would multiply a
+    sigil's log by the number of signers at every handover."""
     out: dict[str, list] = {}
+    seen: dict[str, set] = {}
     for snap in snapshots:
         if not isinstance(snap, dict):
             continue
         for sigil, log in snap.items():
-            if isinstance(sigil, str) and isinstance(log, list):
-                out.setdefault(sigil, []).extend(e for e in log if isinstance(e, dict))
+            if not (isinstance(sigil, str) and isinstance(log, list)):
+                continue
+            kept, have = out.setdefault(sigil, []), seen.setdefault(sigil, set())
+            for e in log:
+                if isinstance(e, dict):
+                    k = _encoding(e)
+                    if k not in have:
+                        have.add(k)
+                        kept.append(e)
+    return out
+
+
+def _bindings(mirror: dict) -> set:
+    """The ``(sigil, gen, tid)`` of every bind entry of a mirror log that verifies."""
+    out = set()
+    for sigil, log in mirror.items():
+        for e in log:
+            if isinstance(e, dict) and e.get("kind") == "bind":
+                b = authorises(sigil, e.get("auth", {}))
+                if b is not None:
+                    out.add((sigil, *b))
     return out
 
 
@@ -77,7 +115,8 @@ class Standby:
         self.cid: str | None = None
         self.version: int | None = None
         self.mirror: dict[str, list] = {}      # sigil -> log entries (handover evidence + mirrored)
-        self.mirrored: set[tuple] = set()      # (sigil, gen, tid) stored and acknowledged
+        self.mirrored: set[tuple] = set()      # (sigil, gen, tid) of every verified binding stored
+        self._tids: dict[tuple, int] = {}      # (sigil, gen) -> how many of them
         self.fenced_for: str | None = None     # hash of the one successor we signed
         self.heard: dict[str, int] = {}        # member pk -> when it last answered our challenge
         self.since: int | None = None          # start of our observation window
@@ -101,12 +140,7 @@ class Standby:
         self.since = max(sb["since"], int(self.clock()))
         prefix = f"{self.version}|"
         self.mirror = {k[len(prefix):]: v for k, v in state["mirror"].items() if k.startswith(prefix)}
-        for sigil, log in self.mirror.items():
-            for e in log:
-                if e.get("kind") == "bind":
-                    b = authorises(sigil, e.get("auth", {}))
-                    if b is not None:
-                        self.mirrored.add((sigil, *b))
+        self._set_mirrored(_bindings(self.mirror))
         f = state["fenced"]
         if isinstance(f, dict) and (f.get("constellation"), f.get("version")) == (self.cid, self.version):
             self.fenced_for = f["charter"]
@@ -114,6 +148,16 @@ class Standby:
     def _persist(self, *entries) -> None:
         if self.store is not None:
             self.store.append(list(entries))
+
+    def _set_mirrored(self, binds: set) -> None:
+        self.mirrored, self._tids = set(), {}
+        for b in binds:
+            self._add_mirrored(*b)
+
+    def _add_mirrored(self, sigil: str, gen: int, tid: str) -> None:
+        if (sigil, gen, tid) not in self.mirrored:
+            self.mirrored.add((sigil, gen, tid))
+            self._tids[(sigil, gen)] = self._tids.get((sigil, gen), 0) + 1
 
     # ------------------------------------------------------------ standing by
 
@@ -140,12 +184,15 @@ class Standby:
                 return  # a retried STANDBY
             if self.cid != cid or not _is_int(version) or version <= self.version:
                 raise Rejected("already standing by for another version")
+        # Like ADOPT, the handover keeps every entry it is given whatever its size:
+        # dropping evidence could lose a sealed binding.
         mirror = _members_snapshot_union(snapshots)
         since = int(self.clock())
         self._persist(("standby", "", {"constellation": cid, "version": version, "since": since}),
                       *(("mirror", f"{version}|{s}", log) for s, log in mirror.items()))
         self.cid, self.version, self.since = cid, version, since
-        self.mirror, self.mirrored, self.fenced_for, self.heard = mirror, set(), None, {}
+        self.mirror, self.fenced_for, self.heard = mirror, None, {}
+        self._set_mirrored(_bindings(mirror))
 
     def _active(self) -> None:
         if self.cid is None:
@@ -167,31 +214,45 @@ class Standby:
             raise Rejected("not standing by for this constellation version")
         sigil = req.get("sigil")
         auth = {k: req.get(k) for k in ("home", "lock", "salt", "unlock", "header")}
-        bound = authorises(sigil, auth)
+        big = _too_big(auth, MAX_AUTH_BYTES)
+        if big:
+            raise Rejected("authorisation too large")
+        bound = authorises(sigil, auth) if big is not None else None
         if bound is None:
             raise Rejected("malformed request or lock not satisfied")
         gen, tid = bound
         if (sigil, gen, tid) not in self.mirrored:
+            # A binding already stored is acknowledged again whatever these say: it costs nothing.
+            if gen >= MAX_GEN:
+                raise Rejected("generation limit reached for this sigil")
+            if self._tids.get((sigil, gen), 0) >= MAX_MIRROR_TIDS:
+                raise Rejected("too many transitions mirrored at this generation")
             log = self.mirror.get(sigil, []) + [{"kind": "bind", "gen": gen, "auth": auth}]
             self._persist(("mirror", f"{self.version}|{sigil}", log))  # durable before the ack leaves
             self.mirror[sigil] = log
-            self.mirrored.add((sigil, gen, tid))
+            self._add_mirrored(sigil, gen, tid)
         a = {"constellation": self.cid, "version": self.version, "member": self.pk,
              "sigil": sigil, "gen": gen, "tid": tid}
         a["sig"] = self.kp.sign("mirror", ack_payload(a))
         return a
 
     def note_release(self, sigil: str, entry: dict) -> bool:
-        """Store a release entry whose death proof verifies.
+        """Store a release entry whose death proof verifies, for a binding we hold.
 
         Releases need no ack (they are not needed for safety); they let a successor
-        see that a binding died instead of finding the record contested.
+        see that a binding died instead of finding the record contested. Only a
+        binding in our mirror log can die there: anyone can build headers that name
+        a consumed input, so releases of other tids would be unbounded junk.
         """
         self._active()
         try:
             h, t, proof = entry["header"], entry["tid"], entry["proof"]
             ok = (isinstance(sigil, str) and entry.get("kind") == "release" and transition_id(h) == t
-                  and [sigil, entry.get("gen")] in h["inputs"] and proves_dead(h, t, proof, self.registry))
+                  and [sigil, entry.get("gen")] in h["inputs"] and (sigil, entry["gen"], t) in self.mirrored)
+            big = _too_big(proof, MAX_PROOF_BYTES) if ok else None
+            if big:
+                raise Rejected("death proof too large")
+            ok = ok and big is False and proves_dead(h, t, proof, self.registry)
         except (KeyError, TypeError, AttributeError, ValueError):
             ok = False
         if not ok:
@@ -263,6 +324,9 @@ class Standby:
             well_formed = False
         if not well_formed:
             raise ValueError("malformed charter body")
+        if len(canonical({"body": next_charter, "sigs": {}})) > MAX_CHARTER_BYTES:
+            # Never valid (SPEC §3.7): fencing for it would leave us unable to sign any successor.
+            raise Rejected("charter too large")
         if (next_charter["prev"] != charter_hash(cur) or not _is_int(next_charter["version"])
                 or next_charter["version"] != self.version + 1):
             raise Rejected("charter does not extend the version we stand by for")

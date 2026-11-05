@@ -104,7 +104,7 @@ class WitnessServer:
 
             def _admitted(self, method: str, body: bool) -> bool:
                 """Charge the client one token; answer 429 if it has none left."""
-                if server.limiter is None or method in ADMIN_METHODS:
+                if server.limiter is None or method in server.admin_methods:
                     return True
                 wait = server.limiter.admit(client_key(self.client_address[0]))
                 if not wait:
@@ -256,13 +256,17 @@ class StandbyServer(WitnessServer):
     calls ``standby`` (enter standby with a handover), ``succeed`` (sign a successor
     and fence) and ``probe`` (challenge members for heartbeats now). ``members``
     are witness URLs probed every ``probe_every`` seconds in the background.
+    Admission control is the witness server's (``rate_limit``, ``rate_burst``);
+    the operator calls are never limited.
     """
 
     admin_methods = STANDBY_ADMIN_METHODS
 
     def __init__(self, standby, host: str = "127.0.0.1", port: int = 0, *, admin_token: str | None = None,
-                 members: list | None = None, probe_every: float | None = None):
-        super().__init__(standby, host, port, admin_token=admin_token)
+                 members: list | None = None, probe_every: float | None = None,
+                 rate_limit: float | None = None, rate_burst: int = DEFAULT_BURST):
+        super().__init__(standby, host, port, admin_token=admin_token, rate_limit=rate_limit,
+                         rate_burst=rate_burst)
         self.standby = standby
         self.members = list(members or [])
         self.probe_every = probe_every
