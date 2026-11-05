@@ -144,6 +144,57 @@ pub fn verify_equivocation(proof: &Json, batch: bool) -> bool {
     }
 }
 
+/// `verify_ack`: a mirror ack's signature by its own `member` key (SPEC §5.5).
+pub fn verify_ack(a: &Json) -> bool {
+    let (Some(payload), Some(member), Some(sig)) =
+        (crate::model::ack_payload(a), a.get("member").and_then(Json::as_str), a.get("sig").and_then(Json::as_str))
+    else {
+        return false;
+    };
+    crate::crypto::verify(member, "mirror", &payload, sig)
+}
+
+/// `verify_heartbeat`: a heartbeat's signature by its own `witness` key (SPEC §5.5).
+pub fn verify_heartbeat(h: &Json) -> bool {
+    let (Some(payload), Some(witness), Some(sig)) =
+        (crate::model::heartbeat_payload(h), h.get("witness").and_then(Json::as_str), h.get("sig").and_then(Json::as_str))
+    else {
+        return false;
+    };
+    crate::crypto::verify(witness, "heartbeat", &payload, sig)
+}
+
+/// `acked_by`: the distinct members of `committee` with a valid mirror ack for exactly
+/// `(cid, version, sigil, gen, tid)`. Like the reference, `acks` must be a list, at most
+/// `4 * |committee| + 4` entries are looked at, only a member's first ack for this binding is
+/// verified (one signature check per member), and anything else (malformed entries, other
+/// bindings, keys outside the committee) is ignored.
+pub fn acked_by(acks: Option<&Json>, committee: &[String], cid: &str, version: i128, sigil: &str, gen: i128, tid: &str) -> HashSet<String> {
+    let mut out = HashSet::new();
+    let Some(Json::Arr(acks)) = acks else { return out };
+    let members: HashSet<&str> = committee.iter().map(String::as_str).collect();
+    let mut tried: HashSet<&str> = HashSet::new();
+    let str_is = |a: &Json, k: &str, want: &str| matches!(a.get(k), Some(Json::Str(x)) if x == want);
+    let int_is = |a: &Json, k: &str, want: i128| matches!(a.get(k), Some(Json::Int(x)) if *x == want);
+    for a in acks.iter().take(4 * members.len() + 4) {
+        let Some(member) = a.get("member").and_then(Json::as_str) else { continue };
+        if members.contains(member)
+            && !tried.contains(member)
+            && str_is(a, "constellation", cid)
+            && int_is(a, "version", version)
+            && str_is(a, "sigil", sigil)
+            && int_is(a, "gen", gen)
+            && str_is(a, "tid", tid)
+        {
+            tried.insert(member);
+            if verify_ack(a) {
+                out.insert(member.to_string());
+            }
+        }
+    }
+    out
+}
+
 /// `proves_dead`: does `proof` show that transition `tid` (with `header`) can never be sealed?
 /// The evidence must come from the target sigil's home (SPEC §3.9).
 pub fn proves_dead(header: &Json, tid: &str, proof: &Json, registry: &Registry, batch: bool) -> bool {

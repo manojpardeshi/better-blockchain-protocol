@@ -84,20 +84,23 @@ Payments are handed from holder to holder as files; no server stores them. Recei
 | `sigil/model.py` | Wire objects: parcels, sigils, transitions, votes, seals |
 | `sigil/locks.py` | The lock predicate language (sig, multisig, time, hash, equivocation, and/or) |
 | `sigil/witness.py` | The witness: spend, release, status, freeze/adopt |
-| `sigil/store.py` | Crash-safe, append-only SQLite log of witness state |
+| `sigil/store.py` | Crash-safe SQLite log of witness state (one row per key) |
 | `sigil/proofs.py` | Seal, equivocation and death-proof verification |
 | `sigil/validate.py` | Dossiers, trust policies and holder-side validation |
 | `sigil/wallet.py` | Building, authorising and sealing transitions; receiving; recovery |
 | `sigil/swap.py` | Atomic multi-party transitions across constellations |
-| `sigil/charter.py` | Constellation charters and membership rotation |
+| `sigil/charter.py` | Constellation charters, membership rotation and successor committees |
+| `sigil/succession.py` | Successor committees (SPEC §5.5): standby members, mirror acks, heartbeats, dead-man takeover |
 | `sigil/stamps.py` | Blind RSA stamps for paying witnesses |
 | `sigil/network.py` | In-process simulated network with fault injection |
-| `sigil/server.py`, `sigil/witnessd.py` | Wire protocol v0 (JSON over HTTP, including operator-only rotation calls) and the witness daemon |
-| `rust/sigil-witness` | The Rust witness: wire-compatible drop-in for the Python daemon (spend, release, status, rotation, stamps, gossip storage) |
-| `tests/` | Payments, security, recovery, rotation, durability, deep confirmation, fuzzing, adversarial model checking |
+| `sigil/server.py`, `sigil/witnessd.py` | Wire protocol v0 (JSON over HTTP, including operator-only rotation and succession calls) and the witness and standby daemons |
+| `sigil/ratelimit.py` | Admission control: per-client rate limit (on by default off loopback), connection caps |
+| `rust/sigil-witness` | The Rust witness: wire-compatible drop-in for the Python daemon (spend, release, status, rotation, succession with standby members, stamps, gossip storage) |
+| `tests/` | Payments, security, recovery, rotation, succession, durability, deep confirmation, fuzzing, adversarial model checking |
 
 ## Status
 
-This is a **research prototype**: a complete reference implementation of the v0 draft, with an in-process network simulation. It hasn't been audited and has no network transport yet. The whitepaper's [limits and open problems](docs/WHITEPAPER.md#10-limits-and-open-problems) section lists what is still unsolved: dossier growth (recursive proofs), shared-state applications, constellation succession, and formal verification.
+This is a **research prototype**: a complete reference implementation of the v0 draft, with an in-process network simulation.
+A witness daemon listening on a non-loopback address limits each client to 20 requests per second (bursts of 100; `--rate-limit 0` disables it) and bounds what one request can make it store ([WIRE.md "Admission control"](docs/WIRE.md#admission-control), [AI_THREAT_MODEL §2.6](docs/AI_THREAT_MODEL.md#26-resource-exhaustion-t5)). It hasn't been audited and has no network transport yet. The whitepaper's [limits and open problems](docs/WHITEPAPER.md#10-limits-and-open-problems) section lists what is still unsolved: dossier growth (recursive proofs), shared-state applications, the limits of constellation succession, and verification of the code itself (the protocol's safety theorem is machine-checked for unbounded sizes, also under rotation and succession: [VERIFICATION.md](docs/VERIFICATION.md)).
 
 MIT licensed.

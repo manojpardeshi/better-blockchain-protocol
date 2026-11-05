@@ -115,3 +115,19 @@ def votes_of_seal(seal: dict) -> list:
 
 def seal_key(sigil: str, tid: str) -> str:
     return f"{sigil}:{tid}"
+
+
+# ------------------------------------------------------------- succession
+
+ACK_FIELDS = ("constellation", "version", "member", "sigil", "gen", "tid")
+HEARTBEAT_FIELDS = ("constellation", "version", "witness", "challenge")
+
+
+def ack_payload(a: dict) -> dict:
+    """What a standby member signs (tag "mirror"): it stored this binding for this version (SPEC §5.5)."""
+    return {k: a[k] for k in ACK_FIELDS}
+
+
+def heartbeat_payload(h: dict) -> dict:
+    """What an active witness signs (tag "heartbeat") to show a standby member it is alive."""
+    return {k: h[k] for k in HEARTBEAT_FIELDS}

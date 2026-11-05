@@ -1,4 +1,5 @@
-//! The witness (SPEC §5): SPEND, RELEASE, STATUS, FREEZE and ADOPT, with durable state.
+//! The witness (SPEC §5): SPEND, RELEASE, STATUS, FREEZE, ADOPT and HEARTBEAT, with durable
+//! state.
 //!
 //! Mirrors `sigil/witness.py`. Per sigil an honest witness keeps a generation counter and at
 //! most one binding per generation, and votes at most once per `(sigil, generation)`, also
@@ -17,17 +18,27 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, RwLock};
 
-use crate::charter::{charter_hash, short, Registry};
+use crate::charter::{charter_hash, quorum, short, Registry};
 use crate::crypto::KeyPair;
 use crate::gossip::{check_message, CowRegistry, GossipStore};
 use crate::json::{obj, Json};
 use crate::locks::evaluate;
-use crate::model::{sigil_of, transition_id, vote_payload};
-use crate::proofs::{proves_dead, verify_seal, verify_vote};
+use crate::model::{heartbeat_payload, sigil_of, transition_id, vote_payload};
+use crate::proofs::{acked_by, proves_dead, verify_seal, verify_vote};
 use crate::stamps::StampKey;
 use crate::store::{Entry, Loaded, Store};
 
 pub const CONTESTED: &str = "!contested";
+
+/// `enc({home, lock, salt, unlock, header})` of a SPEND (`witness.MAX_AUTH_BYTES`). Each of these
+/// bounds what one request can make a witness store; a refusal is a clean rejection that changes
+/// nothing (abstention), so they cannot affect safety.
+pub const MAX_AUTH_BYTES: usize = 32 << 10;
+/// `enc(proof)` of a RELEASE (`witness.MAX_PROOF_BYTES`).
+pub const MAX_PROOF_BYTES: usize = 128 << 10;
+/// A sigil is newly bound only below this generation, so at most this many times
+/// (`witness.MAX_GEN`).
+pub const MAX_GEN: i128 = 16;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Error {
@@ -367,7 +378,9 @@ impl Witness {
         self.redeemed.lock().expect("stamp lock").insert(serial.to_string()).then(|| serial.to_string())
     }
 
-    /// SPEND (SPEC §5.1). `req` carries sigil, header, home, lock, salt, unlock, [stamp].
+    /// SPEND (SPEC §5.1). `req` carries sigil, header, home, lock, salt, unlock, [stamp],
+    /// [mirror]: in a version with a successor committee, a vote is created only with mirror
+    /// acks from a quorum of the committee (SPEC §5.5).
     pub fn spend(&self, req: &Json) -> Outcome {
         let r = self.spend_inner(req);
         (r, self.store.last_submitted())
@@ -394,6 +407,9 @@ impl Witness {
             return rejected("sigil does not live here");
         }
         let auth = obj(["home", "lock", "salt", "unlock", "header"].map(|k| (k, req.get(k).cloned().unwrap_or(Json::Null))));
+        if auth.canonical().len() > MAX_AUTH_BYTES {
+            return rejected("authorisation too large");
+        }
         let now = self.now();
         // One evaluation against our clock suffices: the lock language is monotone, so a lock
         // satisfied at `now` is satisfied with time conditions ignored (the reference checks both).
@@ -408,6 +424,17 @@ impl Witness {
         };
         let sigil = sigil_v.as_str().expect("authorised sigil is a string");
         let expires = auth.get("unlock").and_then(|u| u.get("expires")).and_then(Json::as_int).expect("checked");
+        // Mirror before vote (SPEC §5.5): with a successor committee, a vote is only created with
+        // acks from a quorum of it, so any succession inherits the binding. The acks are checked
+        // here, outside the lock (at most one signature per member); the verdict is used below
+        // only if a vote must be created. Our version's charter never changes, so neither does
+        // its committee. Without our own charter (a registry older than our store) we cannot
+        // tell whether acks are needed: `None`, and no vote is created at all.
+        let gate: Option<Option<bool>> = self.registry().charter(&cid, version).map(|c| {
+            c.successor.as_ref().map(|k| {
+                acked_by(req.get("mirror"), &k.committee, &cid, version, sigil, gen, &tid).len() >= quorum(k.committee.len())
+            })
+        });
 
         // The vote is fully determined by (membership, sigil, gen, tid, now), so sign it before
         // taking the lock; it is only used (and only ever leaves) if the record logic says so.
@@ -442,6 +469,13 @@ impl Witness {
             if now > expires {
                 return rejected("authorisation expired");
             }
+            // Each new binding is at a higher generation than the last, so this bounds the
+            // bindings one sigil can collect. It reads our own counter, not the log: ADOPT
+            // evidence can hold junk entries, but cannot raise a generation without the
+            // owner's signature or a valid death proof.
+            if gen >= MAX_GEN {
+                return rejected("generation limit reached for this sigil");
+            }
             rec.tid = Some(tid.clone());
             rec.header = auth.get("header").cloned();
             rec.log.push(obj([("kind", "bind".into()), ("gen", Json::Int(gen)), ("auth", auth)]));
@@ -453,6 +487,12 @@ impl Witness {
             return rejected("this key already voted for another transition at this generation");
         }
         if rec.vote.is_none() {
+            // Nothing is persisted on refusal.
+            match gate {
+                None => return rejected("own charter version unknown"),
+                Some(Some(false)) => return rejected("needs mirror acks from a quorum of the successor committee"),
+                _ => {}
+            }
             rec.vote = Some(fresh.clone());
             rec.votes.push(fresh);
         }
@@ -486,6 +526,9 @@ impl Witness {
                 _ => return rejected("nothing to release"),
             }
         };
+        if proof.canonical().len() > MAX_PROOF_BYTES {
+            return rejected("death proof too large");
+        }
         let sigil = sigil.as_str().expect("checked");
         let registry = self.registry();
         let home = self.state.lock().expect("state lock").active().map(|(c, _)| c);
@@ -578,6 +621,30 @@ impl Witness {
         let seq = self.store.last_submitted();
         drop(st);
         (Ok(out), seq)
+    }
+
+    /// HEARTBEAT (SPEC §5.5): show a standby member that this witness is alive and voting.
+    /// Only an active, unfrozen witness answers (a frozen one will never vote again). The
+    /// challenge is the standby member's own fresh string, so an answer cannot be replayed later
+    /// to fake liveness.
+    pub fn heartbeat(&self, challenge: &Json) -> Outcome {
+        let Some((cid, version)) = self.state.lock().expect("state lock").active() else {
+            return (rejected("witness not active"), 0);
+        };
+        let Some(challenge) = challenge.as_str().filter(|c| (1..=128).contains(&c.chars().count())) else {
+            return (rejected("challenge must be a string of 1 to 128 characters"), 0);
+        };
+        let mut h = obj([
+            ("constellation", Json::str(&cid)),
+            ("version", Json::Int(version)),
+            ("witness", Json::str(&self.pk)),
+            ("challenge", Json::str(challenge)),
+        ]);
+        let sig = self.kp.sign("heartbeat", &heartbeat_payload(&h).expect("complete heartbeat"));
+        if let Json::Obj(m) = &mut h {
+            m.insert("sig".into(), Json::Str(sig));
+        }
+        (Ok(h), 0)
     }
 
     /// The full record of a sigil, for tests and tools (`None` if the witness has none).
@@ -686,19 +753,25 @@ impl Witness {
             _ => return Err(not_member()),
         }
         let batch = self.batch_verify;
-        let mut evidence: OrderedMap<String, Vec<Json>> = OrderedMap::new();
+        // Per sigil, the entries kept and the encodings seen. The evidence is a set: honest
+        // predecessors hand over the same entries, and without dropping repeats each rotation
+        // would multiply a sigil's log by the number of signers.
+        let mut evidence: OrderedMap<String, (Vec<Json>, HashSet<Vec<u8>>)> = OrderedMap::new();
         for snap in snapshots {
             let Some(m) = snap.as_obj() else { continue };
             for (sigil, log) in m {
                 if let Some(log) = log.as_arr() {
-                    evidence
-                        .get_mut_or_insert_with(sigil.clone(), Vec::new)
-                        .extend(log.iter().filter(|e| e.as_obj().is_some()).cloned());
+                    let (kept, seen) = evidence.get_mut_or_insert_with(sigil.clone(), Default::default);
+                    for e in log.iter().filter(|e| e.as_obj().is_some()) {
+                        if seen.insert(e.canonical()) {
+                            kept.push(e.clone());
+                        }
+                    }
                 }
             }
         }
         let mut records: Vec<(String, Record)> = Vec::with_capacity(evidence.items.len());
-        for (sigil, log) in evidence.items {
+        for (sigil, (log, _)) in evidence.items {
             let sigil_j = Json::str(&sigil);
             let mut binds: OrderedMap<(i128, String), Json> = OrderedMap::new(); // (gen, tid) -> header
             let mut dead: HashSet<String> = HashSet::new(); // tids proven unsealable

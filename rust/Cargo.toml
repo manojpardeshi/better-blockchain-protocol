@@ -20,6 +20,10 @@ clap = { version = "4", features = ["derive"] }
 num-bigint-dig = { version = "0.8", default-features = false, features = ["std", "u64_digit", "prime", "rand"] }
 num-traits = "0.2"
 num-integer = "0.1"
+# Already in the graph through axum (same features): the server loop sets connection caps and timeouts.
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio", "server", "service", "http1"] }
+tower-service = "0.3"
 
 [profile.release]
 debug = false

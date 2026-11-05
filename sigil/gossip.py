@@ -22,7 +22,7 @@ verify. Gossip is idempotent and order-independent apart from which branch
 of a fork is seen first; see docs/WIRE.md "Gossip" for the threat notes.
 """
 
-from .charter import Registry, verify_chain
+from .charter import Registry, authority, verify_chain
 from .crypto import verify
 from .model import vote_payload
 from .proofs import verify_equivocation, verify_vote
@@ -62,8 +62,9 @@ def verify_fork(f: dict) -> bool:
 
 
 def fork_signers(f: dict) -> set:
-    """Members of the forked-from version who validly signed both branches."""
-    members = set(f["prefix"][-1]["body"]["witnesses"])
+    """Keys of the forked-from version's authority (its witnesses, or its successor
+    committee if it names one, SPEC §3.7) that validly signed both branches."""
+    members = set(authority(f["prefix"][-1]["body"]))
     a, b = f["a"], f["b"]
     return {pk for pk in members
             if pk in a["sigs"] and pk in b["sigs"]

@@ -12,6 +12,13 @@
 //! | POST   | `/v0/gossip`    | `{charters?, proofs?, forks?}` | `{charters, proofs, forks}` (counts accepted) |
 //! | POST   | `/v0/freeze`    | `{charter}` (admin) | `{sig, snapshot}`      |
 //! | POST   | `/v0/adopt`     | `{constellation, version, snapshots}` (admin) | `{constellation, version}` |
+//! | POST   | `/v0/heartbeat` | `{challenge}`       | signed heartbeat (SPEC §5.5) |
+//!
+//! A standby member (SPEC §5.5, [`standby_router`]) serves `/v0/info`, `/v0/charters`,
+//! `/v0/proofs`, `/v0/gossip`, `/v0/mirror` (`{request}` → mirror ack), `/v0/note_release`
+//! (`{sigil, entry}` → whether it was new) and the operator calls `/v0/standby`
+//! (`{constellation, version, snapshots}`), `/v0/succeed` (`{charter, sigs?}` → `{sig, snapshot}`)
+//! and `/v0/probe` (`{urls?}` → `{answered}`).
 //!
 //! Replies are `{"ok": result}` or `{"error": kind, "message": str, "vote": vote|null}` with
 //! HTTP 409 (`conflict`), 403 (`rejected`), 400 (`bad_request`) or 500 (`internal`). Unlike
@@ -23,23 +30,39 @@
 //! The rotation calls (`freeze`, `adopt`) need `Authorization: Bearer <admin token>`; without
 //! a configured token they are refused. Their bodies may be up to [`MAX_ADMIN_BODY`], read
 //! only after the token was checked.
+//!
+//! Admission control (docs/WIRE.md, [`crate::ratelimit`]): [`router_with_limits`] answers a
+//! client over its token bucket with HTTP 429 `rejected` before the call runs, and [`serve`]
+//! caps open connections and closes those that wait on their client too long.
 
+use std::future::Future;
+use std::io;
+use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
+use std::time::Duration;
 
 use axum::body::{to_bytes, Body};
-use axum::extract::{Path, State};
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::extract::{ConnectInfo, Path, Request, State};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use crate::json::{obj, parse, parse_with_depth, Json, MAX_DEPTH};
+use crate::ratelimit::{client_key, ConnectionLimiter, RateLimiter, IDLE_TIMEOUT, MAX_CONNECTIONS};
+use crate::succession::Standby;
 use crate::witness::{Error, Outcome, Witness};
 
 pub const MAX_BODY: usize = 1 << 20;
 /// ADOPT carries every predecessor's evidence.
 pub const MAX_ADMIN_BODY: usize = 256 << 20;
 pub const ADMIN_METHODS: [&str; 2] = ["freeze", "adopt"];
+/// A standby member's operator calls (SPEC §5.5).
+pub const STANDBY_ADMIN_METHODS: [&str; 3] = ["standby", "succeed", "probe"];
 
 pub fn reply(code: StatusCode, v: &Json) -> Response {
     (code, [(header::CONTENT_TYPE, "application/json")], v.canonical()).into_response()
@@ -82,13 +105,47 @@ pub fn router(w: Arc<Witness>) -> Router {
 
 /// The router; `admin_token` enables `/v0/freeze` and `/v0/adopt` for requests carrying it.
 pub fn router_with_admin(w: Arc<Witness>, admin_token: Option<String>) -> Router {
-    Router::new()
+    router_with_limits(w, admin_token, None)
+}
+
+/// [`router_with_admin`], with every call but the rotation calls charged to its client's token
+/// bucket in `limiter` (the client is the peer address [`serve`] records; without one, all
+/// requests share one bucket).
+pub fn router_with_limits(w: Arc<Witness>, admin_token: Option<String>, limiter: Option<Arc<RateLimiter>>) -> Router {
+    let r = Router::new()
         .route("/v0/info", get(info))
         .route("/v0/charters", get(charters))
         .route("/v0/proofs", get(proofs))
         .route("/v0/:method", post(call))
         .fallback(|| async { error(StatusCode::NOT_FOUND, "bad_request", "unknown path", None) })
-        .with_state(App { w, admin_token: admin_token.map(Arc::from) })
+        .with_state(App { w, admin_token: admin_token.map(Arc::from) });
+    limited(r, limiter, &ADMIN_METHODS)
+}
+
+/// `r` with every call but the operator calls `admin` charged to its client's token bucket.
+fn limited(r: Router, limiter: Option<Arc<RateLimiter>>, admin: &'static [&'static str]) -> Router {
+    match limiter {
+        Some(l) => r.layer(middleware::from_fn_with_state((l, admin), admit)),
+        None => r,
+    }
+}
+
+/// Charge the client one token; answer 429 `rejected` (with `Retry-After`) if it has none left.
+/// The body of a refused request is read and dropped, so the client reliably gets the answer.
+async fn admit(State((limiter, admin)): State<(Arc<RateLimiter>, &'static [&'static str])>, req: Request, next: Next) -> Response {
+    let path = req.uri().path();
+    if admin.contains(&path.strip_prefix("/v0/").unwrap_or(path)) {
+        return next.run(req).await; // refused before their body is read, unless authorised
+    }
+    let key = req.extensions().get::<ConnectInfo<SocketAddr>>().map(|c| client_key(c.0.ip())).unwrap_or_default();
+    let wait = limiter.admit(&key);
+    if wait == 0 {
+        return next.run(req).await;
+    }
+    let _ = tokio::time::timeout(IDLE_TIMEOUT, to_bytes(req.into_body(), MAX_BODY)).await;
+    let mut r = error(StatusCode::TOO_MANY_REQUESTS, "rejected", "rate limited", None);
+    r.headers_mut().insert(header::RETRY_AFTER, HeaderValue::from(wait));
+    r
 }
 
 async fn info(State(app): State<App>) -> Response {
@@ -127,16 +184,20 @@ async fn blocking(f: impl FnOnce() -> Outcome + Send + 'static) -> Result<Outcom
     tokio::task::spawn_blocking(f).await.map_err(|_| internal())
 }
 
-async fn call(State(app): State<App>, Path(method): Path<String>, headers: HeaderMap, body: Body) -> Response {
-    let admin = ADMIN_METHODS.contains(&method.as_str());
+/// Check the token of an operator call (before its body is read), then read and parse the body:
+/// a JSON object of at most [`MAX_BODY`] bytes ([`MAX_ADMIN_BODY`] for an operator call).
+async fn read_body(admin: bool, token: Option<&str>, headers: &HeaderMap, body: Body) -> Result<Json, Response> {
     if admin {
-        if let Err(r) = check_admin(app.admin_token.as_deref(), &headers) {
-            return r;
-        }
+        check_admin(token, headers)?;
     }
-    let bytes = match to_bytes(body, if admin { MAX_ADMIN_BODY } else { MAX_BODY }).await {
-        Ok(b) => b,
-        Err(_) => return bad_request("body too large"),
+    // A client that stops sending is dropped, never waited on forever (an authorised operator
+    // sending ADOPT evidence is given all the time it needs).
+    let limit = if admin { MAX_ADMIN_BODY } else { MAX_BODY };
+    let patience = if admin { Duration::MAX } else { IDLE_TIMEOUT };
+    let bytes = match tokio::time::timeout(patience, to_bytes(body, limit)).await {
+        Ok(Ok(b)) => b,
+        Ok(Err(_)) => return Err(bad_request("body too large")),
+        Err(_) => return Err(bad_request("body not received in time")),
     };
     let body = if bytes.is_empty() {
         Json::Obj(Default::default())
@@ -144,12 +205,21 @@ async fn call(State(app): State<App>, Path(method): Path<String>, headers: Heade
         // Evidence nests what requests carried a few levels deeper (as in the store).
         match if admin { parse_with_depth(&bytes, MAX_DEPTH + 16) } else { parse(&bytes) } {
             Ok(v) => v,
-            Err(e) => return bad_request(&e.to_string()),
+            Err(e) => return Err(bad_request(&e.to_string())),
         }
     };
     if body.as_obj().is_none() {
-        return bad_request("body must be an object");
+        return Err(bad_request("body must be an object"));
     }
+    Ok(body)
+}
+
+async fn call(State(app): State<App>, Path(method): Path<String>, headers: HeaderMap, body: Body) -> Response {
+    let admin = ADMIN_METHODS.contains(&method.as_str());
+    let body = match read_body(admin, app.admin_token.as_deref(), &headers, body).await {
+        Ok(b) => b,
+        Err(r) => return r,
+    };
     let w = app.w.clone();
     let outcome: Result<Outcome, Response> = match method.as_str() {
         "spend" => match field(&body, "request") {
@@ -168,6 +238,7 @@ async fn call(State(app): State<App>, Path(method): Path<String>, headers: Heade
             (Err(r), _) | (_, Err(r)) => Err(r),
         },
         "status" => field(&body, "sigil").map(|s| w.status(s)),
+        "heartbeat" => field(&body, "challenge").map(|c| w.heartbeat(c)),
         "sell_stamp" => field(&body, "blinded").map(|b| w.sell_stamp(b)),
         "gossip" => blocking(move || w.gossip(&body)).await,
         "freeze" => match field(&body, "charter") {
@@ -203,4 +274,251 @@ async fn call(State(app): State<App>, Path(method): Path<String>, headers: Heade
     };
     app.w.store.wait_async(seq).await; // persist before answering (SPEC §5)
     result_response(result)
+}
+
+// --------------------------------------------------------------------------- standby
+
+#[derive(Clone)]
+struct StandbyApp {
+    s: Arc<Standby>,
+    admin_token: Option<Arc<str>>,
+    /// Member URLs `/v0/probe` challenges when its body names none.
+    members: Arc<Vec<String>>,
+}
+
+/// The router of a standby member (SPEC §5.5), as the reference's `StandbyServer`: `admin_token`
+/// enables the operator calls (`standby`, `succeed`, `probe`), every other call is charged to
+/// `limiter`, and `members` are the witness URLs `/v0/probe` challenges by default.
+pub fn standby_router(s: Arc<Standby>, admin_token: Option<String>, limiter: Option<Arc<RateLimiter>>, members: Vec<String>) -> Router {
+    let r = Router::new()
+        .route("/v0/info", get(sb_info))
+        .route("/v0/charters", get(sb_charters))
+        .route("/v0/proofs", get(sb_proofs))
+        .route("/v0/:method", post(sb_call))
+        .fallback(|| async { error(StatusCode::NOT_FOUND, "bad_request", "unknown path", None) })
+        .with_state(StandbyApp { s, admin_token: admin_token.map(Arc::from), members: Arc::new(members) });
+    limited(r, limiter, &STANDBY_ADMIN_METHODS)
+}
+
+async fn sb_info(State(app): State<StandbyApp>) -> Response {
+    reply(StatusCode::OK, &obj([("ok", app.s.info())]))
+}
+
+async fn sb_charters(State(app): State<StandbyApp>) -> Response {
+    reply(StatusCode::OK, &obj([("ok", app.s.registry().to_json())]))
+}
+
+async fn sb_proofs(State(app): State<StandbyApp>) -> Response {
+    reply(StatusCode::OK, &obj([("ok", app.s.proofs())]))
+}
+
+async fn sb_call(State(app): State<StandbyApp>, Path(method): Path<String>, headers: HeaderMap, body: Body) -> Response {
+    let admin = STANDBY_ADMIN_METHODS.contains(&method.as_str());
+    let body = match read_body(admin, app.admin_token.as_deref(), &headers, body).await {
+        Ok(b) => b,
+        Err(r) => return r,
+    };
+    let s = app.s.clone();
+    let outcome: Result<Outcome, Response> = match method.as_str() {
+        "mirror" => match field(&body, "request") {
+            Ok(req) => {
+                let req = req.clone();
+                blocking(move || s.mirror_bind(&req)).await
+            }
+            Err(r) => Err(r),
+        },
+        "note_release" => match (field(&body, "sigil"), field(&body, "entry")) {
+            (Ok(x), Ok(e)) => {
+                let (sigil, entry) = (x.clone(), e.clone());
+                blocking(move || s.note_release(&sigil, &entry)).await
+            }
+            (Err(r), _) | (_, Err(r)) => Err(r),
+        },
+        "gossip" => blocking(move || s.gossip(&body)).await,
+        "standby" => {
+            let checked = field(&body, "constellation")
+                .and_then(|_| field(&body, "version"))
+                .and_then(|_| field(&body, "snapshots"))
+                .and_then(|x| if x.as_arr().is_some() { Ok(()) } else { Err(bad_request("snapshots must be a list")) });
+            match checked {
+                Ok(()) => {
+                    blocking(move || {
+                        let null = Json::Null;
+                        let (c, v) = (body.get("constellation").unwrap_or(&null), body.get("version").unwrap_or(&null));
+                        let snaps = body.get("snapshots").and_then(Json::as_arr).map(Vec::as_slice).unwrap_or(&[]);
+                        s.enter(c, v, snaps)
+                    })
+                    .await
+                }
+                Err(r) => Err(r),
+            }
+        }
+        "succeed" => match field(&body, "charter") {
+            Ok(c) => {
+                let (c, sigs) = (c.clone(), body.get("sigs").cloned());
+                blocking(move || s.succeed(&c, sigs.as_ref())).await
+            }
+            Err(r) => Err(r),
+        },
+        "probe" => {
+            let urls: Option<Vec<String>> = match body.get("urls") {
+                None => Some(app.members.as_ref().clone()),
+                Some(Json::Arr(a)) => a.iter().map(|u| u.as_str().map(str::to_string)).collect(),
+                Some(_) => None,
+            };
+            match urls {
+                None => Err(bad_request("urls must be a list of strings")),
+                Some(urls) => {
+                    blocking(move || {
+                        let n = s.probe(&urls);
+                        (Ok(obj([("answered", Json::Int(n as i128))])), 0)
+                    })
+                    .await
+                }
+            }
+        }
+        other => Err(bad_request(&format!("unknown method '{other}'"))),
+    };
+    let (result, seq) = match outcome {
+        Ok(o) => o,
+        Err(r) => return r,
+    };
+    app.s.store.wait_async(seq).await; // persist before answering (SPEC §5)
+    result_response(result)
+}
+
+// --------------------------------------------------------------------------- serving
+
+/// Serve `app` on `listener` until `shutdown` resolves, then finish the open connections.
+///
+/// At most [`MAX_CONNECTIONS`] connections are open at once, and at most `per_client` from one
+/// client ([`client_key`]); a connection over a cap is closed unread. A connection is closed if
+/// its client takes longer than [`IDLE_TIMEOUT`] to send a request's headers (also between
+/// requests), to send its body (see `call`), or to accept the reply. Each request carries the
+/// peer address as `ConnectInfo<SocketAddr>`, which the rate limit uses.
+pub async fn serve<F>(listener: tokio::net::TcpListener, app: Router, per_client: Option<usize>, shutdown: F) -> io::Result<()>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    serve_with(listener, app, ConnectionLimiter::new(MAX_CONNECTIONS, per_client), IDLE_TIMEOUT, shutdown).await
+}
+
+/// [`serve`] with explicit connection caps and idle timeout (for tests).
+pub async fn serve_with<F>(
+    listener: tokio::net::TcpListener,
+    app: Router,
+    conns: Arc<ConnectionLimiter>,
+    idle: Duration,
+    shutdown: F,
+) -> io::Result<()>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    let mut tasks = tokio::task::JoinSet::new();
+    tokio::pin!(shutdown);
+    loop {
+        let (stream, addr) = tokio::select! {
+            r = listener.accept() => match r {
+                Ok(x) => x,
+                Err(e) => {
+                    // Out of descriptors and the like: back off instead of spinning.
+                    if !matches!(e.kind(), io::ErrorKind::ConnectionAborted | io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionRefused) {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                    continue;
+                }
+            },
+            _ = &mut shutdown => break,
+        };
+        while tasks.try_join_next().is_some() {}
+        let Some(slot) = conns.acquire(&client_key(addr.ip())) else {
+            drop(stream); // over a cap: closed unread
+            continue;
+        };
+        let _ = stream.set_nodelay(true);
+        let app = app.clone();
+        let mut stop = stop_rx.clone();
+        tasks.spawn(async move {
+            let _slot = slot;
+            let svc = hyper::service::service_fn(move |mut req: hyper::Request<hyper::body::Incoming>| {
+                req.extensions_mut().insert(ConnectInfo(addr));
+                let mut app = app.clone();
+                async move { tower_service::Service::call(&mut app, req.map(Body::new)).await }
+            });
+            let mut builder = hyper::server::conn::http1::Builder::new();
+            builder.timer(hyper_util::rt::TokioTimer::new()).header_read_timeout(idle);
+            let io = hyper_util::rt::TokioIo::new(WriteTimeout::new(stream, idle));
+            let conn = builder.serve_connection(io, svc);
+            tokio::pin!(conn);
+            tokio::select! {
+                _ = conn.as_mut() => {}
+                _ = stop.changed() => {
+                    conn.as_mut().graceful_shutdown();
+                    let _ = conn.await;
+                }
+            }
+        });
+    }
+    drop(listener);
+    let _ = stop_tx.send(true);
+    while tasks.join_next().await.is_some() {}
+    Ok(())
+}
+
+/// A stream whose writes fail once the peer has accepted nothing for `timeout` (a client that
+/// never reads its reply would otherwise hold its connection forever). Reads are untouched:
+/// hyper times out reading headers, and `call` times out reading bodies.
+struct WriteTimeout<S> {
+    io: S,
+    timeout: Duration,
+    deadline: Option<Pin<Box<tokio::time::Sleep>>>,
+}
+
+impl<S> WriteTimeout<S> {
+    fn new(io: S, timeout: Duration) -> WriteTimeout<S> {
+        WriteTimeout { io, timeout, deadline: None }
+    }
+
+    /// After a write returned `Pending`: fail if the deadline has passed, else keep waiting.
+    fn stalled(&mut self, cx: &mut Context<'_>) -> Poll<io::Error> {
+        let timeout = self.timeout;
+        let d = self.deadline.get_or_insert_with(|| Box::pin(tokio::time::sleep(timeout)));
+        match d.as_mut().poll(cx) {
+            Poll::Ready(()) => Poll::Ready(io::Error::new(io::ErrorKind::TimedOut, "client stopped reading")),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for WriteTimeout<S> {
+    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.io).poll_read(cx, buf)
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for WriteTimeout<S> {
+    fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+        match Pin::new(&mut self.io).poll_write(cx, buf) {
+            Poll::Pending => self.stalled(cx).map(Err),
+            done => {
+                self.deadline = None;
+                done
+            }
+        }
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match Pin::new(&mut self.io).poll_flush(cx) {
+            Poll::Pending => self.stalled(cx).map(Err),
+            done => {
+                self.deadline = None;
+                done
+            }
+        }
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.io).poll_shutdown(cx)
+    }
 }

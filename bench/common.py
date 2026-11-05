@@ -3,7 +3,8 @@
 * ``Cluster`` creates witness keys and genesis charters with the *Python* daemon
   (``python -m sigil.witnessd keygen/genesis``), so the Rust witness is always started from
   files in the reference's formats, then runs each witness as a Rust (``sigil-witness run``)
-  or Python (``python -m sigil.witnessd run``) process.
+  or Python (``python -m sigil.witnessd run``) process, and each standby member of a
+  successor committee (SPEC §5.5) as ``sigil-witness standby`` or ``witnessd standby``.
 * ``manual_spend`` signs a transition without the wallet's anti-equivocation guard.
 """
 
@@ -70,7 +71,11 @@ def manual_spend(wallet, refs: list, outputs: list, memo: str = "", expires: int
 # ------------------------------------------------------------------ cluster
 
 class Cluster:
-    """Constellations of witness processes; each witness is ``"rust"`` or ``"python"``."""
+    """Constellations of witness processes; each witness is ``"rust"`` or ``"python"``.
+
+    Entries with ``"role": "standby"`` are standby members of a successor committee; they
+    are never in ``directory()``, and ``committees()`` lists them instead.
+    """
 
     def __init__(self, directory: str, host: str = "127.0.0.1", wrap: list | None = None):
         self.dir = os.path.abspath(directory)
@@ -82,12 +87,21 @@ class Cluster:
             os.makedirs(os.path.join(self.dir, d), exist_ok=True)
         self.registry = os.path.join(self.dir, "registry.json")
 
-    def create(self, name: str, kinds: list, extra_args: dict | None = None) -> str:
+    def create(self, name: str, kinds: list, extra_args: dict | None = None, committee: list | None = None,
+               dead_man: int | None = None, standby_args: dict | None = None) -> str:
+        """Version 0 of a constellation; ``committee`` (kinds) and ``dead_man`` give it a
+        successor committee, whose standby members get ``standby_args[kind]``."""
         keys = [os.path.join(self.dir, "keys", f"{name}-{i}.json") for i in range(len(kinds))]
         for k in keys:
             witnessd("keygen", "--out", k)
+        ckeys = [os.path.join(self.dir, "keys", f"{name}-k{i}.json") for i in range(len(committee or []))]
+        for k in ckeys:
+            witnessd("keygen", "--out", k)
+        succ = ["--committee", *(os.path.splitext(k)[0] + ".pub" for k in ckeys), "--dead-man", str(dead_man)] if ckeys else []
         cid = witnessd("genesis", "--name", name, "--out", self.registry,
-                       "--keys", *(os.path.splitext(k)[0] + ".pub" for k in keys))
+                       "--keys", *(os.path.splitext(k)[0] + ".pub" for k in keys), *succ)
+        for i, (k, kind) in enumerate(zip(ckeys, committee or [])):
+            self.witnesses.append(self._standby(f"{name}-k{i}", cid, k, kind, (standby_args or {}).get(kind, [])))
         for i, (k, kind) in enumerate(zip(keys, kinds)):
             ext = "redb" if kind == "rust" else "db"
             self.witnesses.append({
@@ -121,6 +135,34 @@ class Cluster:
             out.append(n)
         return out
 
+    def _standby(self, name: str, cid: str, key: str, kind: str, args: list) -> dict:
+        ext = "redb" if kind == "rust" else "db"
+        return {"name": name, "cid": cid, "key": key, "kind": kind, "role": "standby",
+                "store": os.path.join(self.dir, "data", f"{name}.{ext}"),
+                "log": os.path.join(self.dir, "logs", f"{name}.log"),
+                "port": free_port(self.host), "args": list(args)}
+
+    def add_standbys(self, cid: str, kinds: list, extra_args: dict | None = None) -> list:
+        """Standby members for the committee of a later charter version of ``cid``, started
+        with ``--wait`` (they enter standby when the new version's handover arrives)."""
+        out = []
+        for kind in kinds:
+            n = len(self.witnesses)
+            key = os.path.join(self.dir, "keys", f"standby-{n}.json")
+            witnessd("keygen", "--out", key)
+            self.witnesses.append(self._standby(f"standby-{n}", cid, key, kind,
+                                                ["--wait", *(extra_args or {}).get(kind, [])]))
+            out.append(n)
+        return out
+
+    def committees(self, cids: list | None = None) -> dict:
+        """``{cid: [url, …]}`` of the standby members."""
+        out: dict = {}
+        for i, w in enumerate(self.witnesses):
+            if (cids is None or w["cid"] in cids) and w.get("role") == "standby":
+                out.setdefault(w["cid"], []).append(self.url(i))
+        return out
+
     def write_chain(self, cid: str, chain: list) -> None:
         """Record a longer charter chain in the registry file (what an operator does after a rotation)."""
         with open(self.registry) as f:
@@ -131,14 +173,15 @@ class Cluster:
             json.dump(reg, f)
         os.replace(tmp, self.registry)
 
-    def indices(self, cid: str, pending: bool = False) -> list:
-        return [i for i, w in enumerate(self.witnesses) if w["cid"] == cid and w.get("pending", False) == pending]
+    def indices(self, cid: str, pending: bool = False, role: str = "witness") -> list:
+        return [i for i, w in enumerate(self.witnesses)
+                if w["cid"] == cid and w.get("pending", False) == pending and w.get("role", "witness") == role]
 
     def directory(self, cids: list | None = None) -> dict:
         """``{cid: [url, …]}`` of the founding members (members added for a rotation are left out)."""
         out: dict = {}
         for i, w in enumerate(self.witnesses):
-            if (cids is None or w["cid"] in cids) and not w.get("pending"):
+            if (cids is None or w["cid"] in cids) and not w.get("pending") and w.get("role") != "standby":
                 out.setdefault(w["cid"], []).append(self.url(i))
         return out
 
@@ -147,8 +190,9 @@ class Cluster:
 
     def command(self, i: int) -> list:
         w = self.witnesses[i]
-        common = ["run", "--key", w["key"], "--registry", self.registry, "--constellation", w["cid"],
-                  "--store", w["store"], "--host", self.host, "--port", str(w["port"])]
+        common = ["standby" if w.get("role") == "standby" else "run", "--key", w["key"], "--registry", self.registry,
+                  "--constellation", w["cid"], "--store", w["store"], "--host", w.get("listen", self.host),
+                  "--port", str(w["port"])]
         if w["kind"] == "rust":
             return [*self.wrap, RUST_BIN, *common, *w["args"]]
         return [*self.wrap, sys.executable, "-m", "sigil.witnessd", *common, *w["args"]]

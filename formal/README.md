@@ -108,3 +108,27 @@ TLC instances of the proved spec (`MC_rotp.tla`, and `MC_rotpw.tla` for the
 non-vacuity configs): the proved rule must hold, and each mutant (the rule
 without one of its conditions) must be caught.
 
+
+## Succession proof
+
+`SigilSuccProofs.tla` is an unbounded TLAPS proof of safety under charter
+rotation **and constellation succession** (dead-man takeover, SPEC §5.5):
+4,208 obligations, all checked by tlapm with `--strict`, none omitted (see
+docs/VERIFICATION.md §1c). `check.sh` runs it, with its TLC instances instead of
+the default configs, only with `SIGIL_SUCC_PROOF=1` (it may be combined with
+`SIGIL_ROT_PROOF=1`); CI runs it in the `succession-proof` job.
+
+`MC_succ*.cfg` are TLC instances of the proved spec itself (`MC_succ.tla`,
+`MC_succ3.tla` for three versions, `MC_succw.tla` for the non-vacuity probes).
+TLC 1.7.4, 4 cores:
+
+| Config | Instance | Result | Distinct states | Depth |
+|---|---|---|---|---|
+| `MC_succ_a` | v0 = {h1,h2,h3,z} names committee {k1}; k1 alone is v1. The owner equivocates (Ta, Tb at (s,0)), Tg at (s,1); old members keep voting after the succession | `Inv` and every theorem hold | 5,764 | 17 |
+| `MC_succ_c` | three versions: v0 (no committee) rotated into v1 = {h4} naming committee {k1}, which v2 = {k1} succeeds | hold | 8,196 | 17 |
+| `MC_succ_a_nomirror_mutant` | witnesses vote without mirror acks (`MirQ <- MirAny`) | **Safety violated** (expected) | — | 7 |
+| `MC_succ_a_nofence_mutant` | standby members keep storing after they signed (`MirrorAck <- MirrorAckNoFence`) | **Safety violated** (expected) | — | 11 |
+| `MC_succ_a_quorum_mutant` | the successor adopts from fewer than a committee quorum | **Safety violated** (expected) | — | 9 |
+| `MC_succ_c_standby_mutant` | a committee stands by without the history its version inherited | **Safety violated** (expected) | — | 9 |
+| `MC_succ_witness_lone`, `…_contested`, `…_late`, `…_seal`, `…_recovery` | probes: after a succession a lone binding is inherited / a record is contested; the old quorum votes after a standby member fenced; the successor seals; the owner recovers at (s,1) through a succession (instance B) | **violated** (expected: reachable) | — | 8–13 |
+| `MC_succ` *(opt-in)* | instance B (sigils s, x; Ty kills Tb; recovery spend Tg) | does not finish within the CI budget (over 190k distinct states after 25 minutes); `SIGIL_TLC_EXTRA=MC_succ.cfg` | — | — |
