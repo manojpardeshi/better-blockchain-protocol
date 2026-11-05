@@ -178,6 +178,8 @@ class Standby:
         """
         if not isinstance(snapshots, list):
             raise ValueError("snapshots must be a list")
+        if not _is_int(version):
+            raise ValueError("version must be an integer")
         self._version_body(cid, version)
         if self.cid is not None:
             if (self.cid, self.version) == (cid, version):
@@ -247,8 +249,9 @@ class Standby:
         self._active()
         try:
             h, t, proof = entry["header"], entry["tid"], entry["proof"]
-            ok = (isinstance(sigil, str) and entry.get("kind") == "release" and transition_id(h) == t
-                  and [sigil, entry.get("gen")] in h["inputs"] and (sigil, entry["gen"], t) in self.mirrored)
+            ok = (isinstance(sigil, str) and entry.get("kind") == "release" and _is_int(entry.get("gen"))
+                  and transition_id(h) == t and [sigil, entry["gen"]] in h["inputs"]
+                  and (sigil, entry["gen"], t) in self.mirrored)
             big = _too_big(proof, MAX_PROOF_BYTES) if ok else None
             if big:
                 raise Rejected("death proof too large")
@@ -272,7 +275,8 @@ class Standby:
         try:
             body = self.registry.charter(self.cid, self.version)
             ok = (isinstance(heartbeat, dict) and heartbeat["constellation"] == self.cid
-                  and heartbeat["version"] == self.version and heartbeat["challenge"] == challenge
+                  and _is_int(heartbeat["version"]) and heartbeat["version"] == self.version
+                  and heartbeat["challenge"] == challenge
                   and heartbeat["witness"] in body["witnesses"] and verify_heartbeat(heartbeat))
         except (KeyError, TypeError):
             ok = False
@@ -317,9 +321,10 @@ class Standby:
             raise Rejected("not standing by")
         cur = self.registry.charter(self.cid, self.version)
         try:
-            well_formed = next_charter == charter_body(next_charter["name"], next_charter["version"],
-                                                       next_charter["witnesses"], next_charter["prev"],
-                                                       next_charter.get("successor"))
+            well_formed = (next_charter == charter_body(next_charter["name"], next_charter["version"],
+                                                        next_charter["witnesses"], next_charter["prev"],
+                                                        next_charter.get("successor"))
+                           and all(isinstance(k, str) for k in next_charter["witnesses"]))
         except (KeyError, TypeError, ValueError, AttributeError):
             well_formed = False
         if not well_formed:
