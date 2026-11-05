@@ -101,14 +101,16 @@ SigilsA == {"s"}
 TidsA   == {"Ta", "Tb", "Tg"}
 HdrA    == [t \in TidsA |-> IF t = "Tg" THEN {<<"s", 1>>} ELSE {<<"s", 0>>}]
 
-(* Instance B, sigils s and x (the rotation proof's Bug 1 scenario):       *)
-(*   Ty = {(x,0)}  Tb = {(s,0),(x,0)}  Ta = {(s,0)}  Tg = {(s,1)}           *)
-(* Ty consumes x and so kills Tb; Tg is the owner's recovery spend.         *)
+(* Instance B, sigils s and x: recovery through a succession.              *)
+(*   Ty = {(x,0)}  Tb = {(s,0),(x,0)}  Tg = {(s,1)}                         *)
+(* Ty consumes x and so kills Tb (sealed at (s,0) or not); Tg is the        *)
+(* owner's recovery spend at generation 1.  (With the equivocating          *)
+(* Ta = {(s,0)} of instance A added, the state space passes 350,000 states *)
+(* without finishing; instance A covers equivocation.)                      *)
 SigilsB == {"s", "x"}
-TidsB   == {"Tb", "Ta", "Ty", "Tg"}
+TidsB   == {"Tb", "Ty", "Tg"}
 HdrB    == [t \in TidsB |->
               CASE t = "Tb" -> {<<"s", 0>>, <<"x", 0>>}
-                [] t = "Ta" -> {<<"s", 0>>}
                 [] t = "Ty" -> {<<"x", 0>>}
                 [] t = "Tg" -> {<<"s", 1>>}]
 

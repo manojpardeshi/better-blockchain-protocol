@@ -12,7 +12,7 @@ These are the only cryptographic facts the protocol relies on:
 
 from .charter import Registry, quorum
 from .crypto import verify
-from .model import sigil_of, vote_payload, votes_of_seal
+from .model import ack_payload, heartbeat_payload, sigil_of, vote_payload, votes_of_seal
 
 
 def verify_vote(v: dict) -> bool:
@@ -55,6 +55,42 @@ def verify_equivocation(proof: dict) -> bool:
         a, b = proof["a"], proof["b"]
         same = all(a[k] == b[k] for k in ("witness", "constellation", "sigil", "gen"))
         return same and a["tid"] != b["tid"] and verify_vote(a) and verify_vote(b)
+    except (KeyError, TypeError, RecursionError):
+        return False
+
+
+def verify_ack(a: dict) -> bool:
+    """A mirror ack's signature by its own ``member`` key (SPEC §5.5)."""
+    try:
+        return verify(a["member"], "mirror", ack_payload(a), a["sig"])
+    except (KeyError, TypeError, RecursionError):
+        return False
+
+
+def acked_by(acks, committee, cid: str, version: int, sigil: str, gen: int, tid: str) -> set:
+    """Distinct ``committee`` members with a valid mirror ack for exactly ``(cid, version, sigil, gen, tid)``.
+
+    Anything else in ``acks`` (malformed entries, other bindings, other versions,
+    keys outside the committee) is ignored.
+    """
+    if not isinstance(acks, list):
+        return set()
+    members, out = set(committee), set()
+    want = {"constellation": cid, "version": version, "sigil": sigil, "gen": gen, "tid": tid}
+    for a in acks[: 4 * len(members) + 4]:  # more acks than members can only be junk
+        try:
+            if (isinstance(a, dict) and a["member"] in members and a["member"] not in out
+                    and all(a[k] == v and type(a[k]) is type(v) for k, v in want.items())
+                    and verify_ack(a)):
+                out.add(a["member"])
+        except (KeyError, TypeError):
+            continue
+    return out
+
+
+def verify_heartbeat(h: dict) -> bool:
+    try:
+        return verify(h["witness"], "heartbeat", heartbeat_payload(h), h["sig"])
     except (KeyError, TypeError, RecursionError):
         return False
 

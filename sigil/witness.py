@@ -18,11 +18,11 @@ so a crash can never make it forget a vote and equivocate.
 
 from dataclasses import asdict, dataclass, field
 
-from .charter import Registry, charter_hash, sign_charter
+from .charter import Registry, charter_hash, quorum, sign_charter
 from .crypto import KeyPair
 from .locks import evaluate
-from .model import sigil_of, transition_id, vote_payload
-from .proofs import proves_dead, verify_seal, verify_vote
+from .model import heartbeat_payload, sigil_of, transition_id, vote_payload
+from .proofs import acked_by, proves_dead, verify_seal, verify_vote
 from .stamps import StampMint
 from .store import WitnessStore
 
@@ -195,6 +195,13 @@ class Witness:
         if rec.vote is None and rec.abstain:
             raise Rejected("this key already voted for another transition at this generation")
         if rec.vote is None:
+            # Mirror before vote (SPEC §5.5): a version with a successor committee
+            # never creates a vote that a committee quorum has not stored first, so
+            # any succession inherits it. Nothing is persisted on refusal.
+            committee = self.registry.committee(self.cid, self.version)
+            if committee is not None and len(acked_by(req.get("mirror"), committee, self.cid, self.version,
+                                                      sigil, gen, tid)) < quorum(len(committee)):
+                raise Rejected("needs mirror acks from a quorum of the successor committee")
             rec.vote = self._vote(sigil, gen, tid)
             rec.votes.append(rec.vote)
         if rec != old:
@@ -296,6 +303,21 @@ class Witness:
         if self.stamps is None:
             raise Rejected("this witness does not sell stamps")
         return self.stamps.sign_blinded(blinded)
+
+    def heartbeat(self, challenge) -> dict:
+        """Show a standby member that this witness is alive and voting (SPEC §5.5).
+
+        Only an active, unfrozen witness answers: a frozen one will never vote again.
+        The challenge is the standby member's own fresh string, so an answer cannot
+        be replayed later to fake liveness.
+        """
+        if self.cid is None or self.frozen:
+            raise Rejected("witness not active")
+        if not isinstance(challenge, str) or not 0 < len(challenge) <= 128:
+            raise Rejected("challenge must be a string of 1 to 128 characters")
+        h = {"constellation": self.cid, "version": self.version, "witness": self.pk, "challenge": challenge}
+        h["sig"] = self.kp.sign("heartbeat", heartbeat_payload(h))
+        return h
 
     # -------------------------------------------------------------- rotation
 
