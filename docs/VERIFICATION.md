@@ -138,7 +138,9 @@ constellation succession** (dead-man takeover, [SPEC §5.5](SPEC.md)), for any
 number of charter versions, witnesses per version, successor-committee members,
 sigils, transitions and generations, with keys re-used across versions and
 committees: **4,208 proof obligations, all checked by tlapm 1.6.0-pre with
-`--strict`**, none omitted, in 970 s from an empty fingerprint cache on 4 cores.
+`--strict`**, none omitted, in about 16 minutes (970–994 s) from an empty
+fingerprint cache on 4 cores; the whole `SIGIL_SUCC_PROOF=1 formal/check.sh`
+run, with the base proof and the TLC instances, takes about 19 minutes.
 Run it with `SIGIL_SUCC_PROOF=1 formal/check.sh` (CI job `succession-proof`),
 which also runs its TLC instances.
 
