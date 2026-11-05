@@ -9,7 +9,7 @@ use sigil_witness::charter::{charter_hash, constellation_id, Registry};
 use sigil_witness::crypto::KeyPair;
 use sigil_witness::json::{obj, parse, Json};
 use sigil_witness::ratelimit::RateLimiter;
-use sigil_witness::store::Store;
+use sigil_witness::store::{Loaded, Store};
 use sigil_witness::succession::Standby;
 use sigil_witness::testkit::spend_request;
 use sigil_witness::witness::{Clock, Error, Witness};
@@ -175,6 +175,26 @@ fn witnesses_vote_only_with_an_ack_quorum() {
     assert_eq!(wit.heartbeat(&Json::str("")).0, Err(Error::Rejected("challenge must be a string of 1 to 128 characters".into())));
     wit.freeze(&w.next).0.unwrap();
     assert_eq!(wit.heartbeat(&Json::str("c")).0, Err(Error::Rejected("witness not active".into())));
+}
+
+/// A member (or standby member) whose registry is older than its store, e.g. restarted with a
+/// registry file nobody updated after a rotation into a version with a committee, cannot tell
+/// whether acks are needed: it fails closed.
+#[test]
+fn without_its_own_charter_nothing_is_voted_or_signed() {
+    let w = world("cass");
+    let now = Arc::new(AtomicI64::new(1_700_000_000));
+    let loaded = Loaded { member: Some((w.cid.clone(), 1)), ..Default::default() };
+    let wit = Witness::open(key("cassn0"), w.reg.clone(), &w.cid, Store::memory(), loaded, clock(&now)).unwrap();
+    let (ra, sa, _) = spend_request(&w.owner, &w.cid, "aa", 0, 1 << 40, "a");
+    assert_eq!(wit.spend(&ra).0, Err(Error::Rejected("own charter version unknown".into())));
+    assert!(wit.record(&sa).is_none());
+    let standby = obj([("constellation", Json::str(&w.cid)), ("version", Json::Int(1)), ("since", Json::Int(0))]);
+    let loaded = Loaded { standby: Some(standby), ..Default::default() };
+    let k = Standby::open(key("cassk0"), w.reg.clone(), &w.cid, Store::memory(), loaded, clock(&now), false).unwrap();
+    now.fetch_add(10 * DEAD as i64, Ordering::SeqCst);
+    assert!(!k.dead());
+    assert_eq!(k.succeed(&w.next, None).0, Err(Error::Rejected("own charter version unknown".into())));
 }
 
 async fn http(addr: std::net::SocketAddr, method: &str, path: &str, auth: Option<&str>, body: &str) -> (u16, Json) {

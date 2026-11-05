@@ -482,7 +482,7 @@ impl Standby {
         let mut st = self.state.lock().expect("state lock");
         let Some((cid, version)) = st.member.clone() else { return rejected("not standing by") };
         let registry = self.registry();
-        let cur = registry.charter(&cid, version).ok_or_else(|| Error::Rejected("not standing by".into()))?;
+        let cur = registry.charter(&cid, version).ok_or_else(|| Error::Rejected("own charter version unknown".into()))?;
         if !well_formed_body(next) {
             return bad("malformed charter body");
         }

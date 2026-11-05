@@ -304,6 +304,8 @@ class Standby:
         if self.cid is None:
             return False
         body = self.registry.charter(self.cid, self.version)
+        if body is None:  # a registry older than our store: never declare it dead
+            return False
         d = body["successor"]["dead_man"]
         now = int(self.clock())
         alive = {pk for pk, t in self.heard.items() if now - t <= d}
@@ -320,6 +322,8 @@ class Standby:
         if self.cid is None:
             raise Rejected("not standing by")
         cur = self.registry.charter(self.cid, self.version)
+        if cur is None:
+            raise Rejected("own charter version unknown")
         try:
             well_formed = (next_charter == charter_body(next_charter["name"], next_charter["version"],
                                                         next_charter["witnesses"], next_charter["prev"],

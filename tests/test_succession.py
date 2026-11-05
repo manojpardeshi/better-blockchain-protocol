@@ -18,7 +18,7 @@ from unittest import mock
 
 import sigil.proofs
 from sigil import KeyPair, Network, Wallet, locks, model
-from sigil.charter import (MAX_CHARTER_BYTES, MAX_WITNESSES, charter_body, charter_hash, constellation_id,
+from sigil.charter import (MAX_CHARTER_BYTES, MAX_WITNESSES, Registry, charter_body, charter_hash, constellation_id,
                            quorum, sign_charter, successor_clause, taken_over, valid_successor, verify_chain)
 from sigil.gossip import GossipStore, fork_signers
 from sigil.proofs import acked_by, verify_ack, verify_seal
@@ -715,6 +715,29 @@ class MoreAdversarialTests(unittest.TestCase):
                 w.spend(dict(rb, mirror=acks))
             self.assertNotIn(s, w.records, name)        # nothing is persisted on refusal
         self.assertTrue(w.spend(dict(rb, mirror=h.acks(rb))))
+
+    def test_a_witness_without_its_own_charter_votes_on_nothing(self):
+        """A member of a version with a committee restarted with a registry older than
+        its store cannot tell whether acks are needed: it fails closed (it used to vote
+        without acks, breaking mirror before vote)."""
+        h = Home()
+        h.net.rotate(h.X, [KeyPair.generate() for _ in range(4)], successor={"n": 4, "dead_man": DEAD})
+        w = h.net.witnesses(h.X)[0]
+        stale = Registry()
+        stale.add_chain(h.X, h.net.registry.chain(h.X)[:1])
+        w.registry = stale
+        p, s = h.parcel("aa")
+        r = h.req(h.hdr([(s, 0)], "1"), s, p)
+        with self.assertRaisesRegex(Rejected, "own charter version unknown"):
+            w.spend(dict(r, mirror=[]))
+        self.assertNotIn(s, w.records)
+        m = h.net.committees[h.X][0]
+        m.registry = stale
+        self.assertFalse(m.dead())
+        with self.assertRaisesRegex(Rejected, "own charter version unknown"):
+            m.succeed(h.net.registry.latest(h.X))
+        w.registry = h.net.registry                  # the operator updates the registry file
+        self.assertEqual(w.spend(dict(r, mirror=h.acks(r)))["version"], 1)
 
     def test_forged_cooperative_request_is_not_a_request(self):
         h = Home()

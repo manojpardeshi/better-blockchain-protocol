@@ -231,7 +231,11 @@ class Witness:
         if rec.vote is None:
             # Mirror before vote (SPEC §5.5): a version with a successor committee
             # never creates a vote that a committee quorum has not stored first, so
-            # any succession inherits it. Nothing is persisted on refusal.
+            # any succession inherits it. Nothing is persisted on refusal. Without
+            # our own charter (a registry older than our store) we cannot tell
+            # whether acks are needed, so we create no vote at all.
+            if self.registry.charter(self.cid, self.version) is None:
+                raise Rejected("own charter version unknown")
             committee = self.registry.committee(self.cid, self.version)
             if committee is not None and len(acked_by(req.get("mirror"), committee, self.cid, self.version,
                                                       sigil, gen, tid)) < quorum(len(committee)):

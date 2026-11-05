@@ -428,9 +428,12 @@ impl Witness {
         // acks from a quorum of it, so any succession inherits the binding. The acks are checked
         // here, outside the lock (at most one signature per member); the verdict is used below
         // only if a vote must be created. Our version's charter never changes, so neither does
-        // its committee.
-        let acked = self.registry().charter(&cid, version).and_then(|c| c.successor.as_ref()).map(|k| {
-            acked_by(req.get("mirror"), &k.committee, &cid, version, sigil, gen, &tid).len() >= quorum(k.committee.len())
+        // its committee. Without our own charter (a registry older than our store) we cannot
+        // tell whether acks are needed: `None`, and no vote is created at all.
+        let gate: Option<Option<bool>> = self.registry().charter(&cid, version).map(|c| {
+            c.successor.as_ref().map(|k| {
+                acked_by(req.get("mirror"), &k.committee, &cid, version, sigil, gen, &tid).len() >= quorum(k.committee.len())
+            })
         });
 
         // The vote is fully determined by (membership, sigil, gen, tid, now), so sign it before
@@ -484,9 +487,11 @@ impl Witness {
             return rejected("this key already voted for another transition at this generation");
         }
         if rec.vote.is_none() {
-            if acked == Some(false) {
-                // Nothing is persisted on refusal.
-                return rejected("needs mirror acks from a quorum of the successor committee");
+            // Nothing is persisted on refusal.
+            match gate {
+                None => return rejected("own charter version unknown"),
+                Some(Some(false)) => return rejected("needs mirror acks from a quorum of the successor committee"),
+                _ => {}
             }
             rec.vote = Some(fresh.clone());
             rec.votes.push(fresh);
