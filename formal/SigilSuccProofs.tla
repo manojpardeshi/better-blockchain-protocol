@@ -2303,7 +2303,7 @@ LEMMA FreezeInv ==
     BY <1>post DEF NormalVote
 <1>sl. \A s, g, t : Sealed(s, g, t)' <=> Sealed(s, g, t) BY <1>post DEF Sealed
 (* Freezing adds w0's snapshot; what any evidence covers is unchanged.     *)
-<1>cf. \A E, v1 \in Vers : CoversV(E, v1, fr, sb, fz, mir) => CoversV(E, v1, fr', sb', fz', mir')
+<1>cf. \A E : \A v1 \in Vers : CoversV(E, v1, fr, sb, fz, mir) => CoversV(E, v1, fr', sb', fz', mir')
     <2> SUFFICES ASSUME NEW E, NEW v1 \in Vers, CoversV(E, v1, fr, sb, fz, mir)
                  PROVE  CoversV(E, v1, fr', sb', fz', mir')
         OBVIOUS
@@ -2934,7 +2934,7 @@ LEMMA MirrorAckInv ==
           mir'[v][m][s] = IF v = v0 /\ m = m0 /\ s = s0 THEN mir[v][m][s] \cup {b0} ELSE mir[v][m][s]
     BY <1>i, <1>post DEF TypeOK
 <1>grow. \A v \in Vers, m \in Honest, s \in Sigils : mir[v][m][s] \subseteq mir'[v][m][s] BY <1>mir
-<1>cf. \A E, v1 \in Vers : CoversV(E, v1, fr, sb, fz, mir) => CoversV(E, v1, fr', sb', fz', mir')
+<1>cf. \A E : \A v1 \in Vers : CoversV(E, v1, fr, sb, fz, mir) => CoversV(E, v1, fr', sb', fz', mir')
     <2> SUFFICES ASSUME NEW E, NEW v1 \in Vers, CoversV(E, v1, fr, sb, fz, mir)
                  PROVE  CoversV(E, v1, fr', sb', fz', mir')
         OBVIOUS
@@ -2984,7 +2984,7 @@ LEMMA FenceInv ==
          /\ UNCHANGED <<votes, act, kv, adv, frz, gen, bnd, cand, abst, lg, ld, fr, sb, sd, hev, mir, sa>>
     BY DEF Fence
 <1>fz. \A v \in Vers : fz'[v] = IF v = v0 THEN fz[v] \cup {m0} ELSE fz[v] BY <1>i, <1>post DEF TypeOK
-<1>cf. \A E, v1 \in Vers : CoversV(E, v1, fr, sb, fz, mir) => CoversV(E, v1, fr', sb', fz', mir')
+<1>cf. \A E : \A v1 \in Vers : CoversV(E, v1, fr, sb, fz, mir) => CoversV(E, v1, fr', sb', fz', mir')
     <2> SUFFICES ASSUME NEW E, NEW v1 \in Vers, CoversV(E, v1, fr, sb, fz, mir)
                  PROVE  CoversV(E, v1, fr', sb', fz', mir')
         OBVIOUS
@@ -3035,7 +3035,7 @@ LEMMA StandbyCoreInv ==
     BY <1>i, <1>post DEF TypeOK
 <1>sa. \A v \in Vers : sa'[v] = IF v = v0 THEN sa[v] \cup {m0} ELSE sa[v] BY <1>i, <1>post DEF TypeOK
 <1>grow. \A v \in Vers, m \in Honest, s \in Sigils : mir[v][m][s] \subseteq mir'[v][m][s] BY <1>mir
-<1>cf. \A E2, v1 \in Vers : CoversV(E2, v1, fr, sb, fz, mir) => CoversV(E2, v1, fr', sb', fz', mir')
+<1>cf. \A E2 : \A v1 \in Vers : CoversV(E2, v1, fr, sb, fz, mir) => CoversV(E2, v1, fr', sb', fz', mir')
     <2> SUFFICES ASSUME NEW E2, NEW v1 \in Vers, CoversV(E2, v1, fr, sb, fz, mir)
                  PROVE  CoversV(E2, v1, fr', sb', fz', mir')
         OBVIOUS
