@@ -216,7 +216,13 @@ The proof found one problem, in itself: the first complete draft stated four
 frame steps as `\A E, v1 \in Vers : ...`, which TLA+ reads as bounding the
 evidence `E` by `Vers` too, so nine obligations failed; quantifying `E`
 unboundedly fixed them. No protocol or code bug was found by the succession
-proof.
+proof. Reviewing the code against the proved rules found one: the mirror-ack
+gate failed open when a witness's registry lacked its own charter version (a
+member of a version with a committee restarted with a registry file nobody
+updated): it found no committee and voted without acks, which the model does
+not allow. It now creates no vote until it knows its charter (Python and Rust,
+`test_a_witness_without_its_own_charter_votes_on_nothing` and
+`without_its_own_charter_nothing_is_voted_or_signed`).
 
 ---
 
