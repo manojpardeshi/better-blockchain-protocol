@@ -1,7 +1,8 @@
 """The witness daemon: one witness, one durable store, served over HTTP.
 
     python -m sigil.witnessd keygen  --out key.json
-    python -m sigil.witnessd genesis --name orion --keys k1.pub k2.pub k3.pub k4.pub --out registry.json
+    python -m sigil.witnessd genesis --name orion --keys k1.pub k2.pub k3.pub k4.pub --out registry.json \\
+                                     [--committee m1.pub m2.pub m3.pub m4.pub --dead-man SECONDS]
     python -m sigil.witnessd run     --key key.json --registry registry.json --constellation <cid> \\
                                      --store data.db [--host 127.0.0.1] [--port 7000] [--stamps] \\
                                      [--admin-token FILE] [--adopt] [--rate-limit R] [--rate-burst B]
@@ -27,6 +28,14 @@ A witness listening on a non-loopback ``--host`` limits each client to
 ``--rate-limit`` requests per second (default 20, bursts of ``--rate-burst``,
 default 100; docs/WIRE.md "Admission control"); ``--rate-limit 0`` disables it.
 On loopback there is no limit unless ``--rate-limit`` asks for one.
+
+``standby`` serves a member of a successor committee (SPEC §5.5): it mirrors
+bindings for clients, probes the version's members for heartbeats
+(``--members``, every ``--probe-every`` seconds) and signs a successor when
+asked cooperatively or once the dead-man period has passed (``/v0/standby``,
+``/v0/succeed`` and ``/v0/probe`` need ``--admin-token``). A fresh store stands
+by for version 0 at once; with ``--wait`` it waits for the handover of a later
+version (docs/WIRE.md "Succession").
 
 Every vote is made durable before it is sent (SPEC §5), so the daemon may be
 killed at any moment, even with SIGKILL, and restarted on the same store.

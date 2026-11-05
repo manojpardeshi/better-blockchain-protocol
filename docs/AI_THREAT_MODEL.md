@@ -54,7 +54,7 @@ regression test (`tests/test_limits.py`, `tests/redteam/test_redteam.py::Resourc
 | Witnesses cannot steal (SPEC §8) | Holder re-checks the owner's unlock (validate §6.4) | **No**: even an all-Byzantine quorum cannot forge the owner's signature |
 | Witnesses cannot inflate | Holder checks conservation (validate §6.5) | **No** — *except* via BUG-1, a cache defect, not a math break ([§3](#3-findings)) |
 | Fees cannot censor; witness cannot discriminate | Blind RSA-FDH stamps | Only by breaking RSA-FDH or the blinding |
-| Safety holds across rotation | ADOPT + evidence logs | Bounded-checked only (not size-free); see [§2.11](#211-rotation-and-succession) |
+| Safety holds across rotation and succession | ADOPT + evidence logs; mirror before vote + fence; `≤ f_k` Byzantine per committee | **No** (TLAPS-proved for all sizes on abstract models, [VERIFICATION §1b, §1c](VERIFICATION.md#1b-safety-under-charter-rotation-unbounded-formalsigilrotproofstla)); see [§2.11](#211-rotation-and-succession) |
 | Liveness / recovery / deep confirmation | **Honest-majority of current operators, honest STATUS answers, cooperative counter-parties** | **Yes, at the assumption**: see BUG-2 (fixed), BUG-4, BUG-5 and [§2.5](#25-timing-partitions-and-gossip-withholding) |
 | Slashing deters a corrupt quorum | Bond economics + who can satisfy the equivocation branch | **Yes, by design flaw**: the equivocator claims its own bond (BUG-6, [§2.9](#29-economic-attacks-t9)) |
 
@@ -531,17 +531,26 @@ invent (SPEC §5.4). The implemented sibling-contested ADOPT is TLC-checked
 regression tests ([VERIFICATION §4](VERIFICATION.md#4)). FREEZE now binds to one
 successor (no charter fork).
 
-**Residual risk — Medium.** Rotation safety is **bounded-checked only**, never
-size-free ([VERIFICATION §5](VERIFICATION.md#5)): 2 versions, 2 sigils, ≤ 4
-transitions, gens 0..1. Succession (dead-man takeover) is **unimplemented** (ROADMAP
-Phase 4 ⬜), so a constellation that dies strands its parcels — an AI adversary that
-can DoS a small constellation into death permanently freezes its value. BUG-2
-exploited the rotation seam specifically (fixed on main by seal settlement of
-CONTESTED records, in both the Python and the newly ported Rust witness).
+**Residual risk — Medium.** Rotation and succession safety are now TLAPS-proved
+for unbounded sizes ([VERIFICATION §1b, §1c](VERIFICATION.md)), on abstract models
+tied to the code by conformance tests and golden vectors. Succession (dead-man
+takeover, SPEC §5.5) is implemented in Python and Rust: a charter may name a
+successor committee whose quorum stores every binding before a vote is created and
+signs the next version once the home is dead, safely even if it was only
+partitioned. What remains is liveness, and it moves the target: the committee's
+availability gates every vote of its home (an adversary that can DoS a committee
+quorum halts the home, and one that kills it for good halts the home for good),
+and a partition longer than `dead_man` retires a live home (safely). A committee
+with more than `f_k` Byzantine members can sign a successor at will, as a corrupt
+quorum can rotate. Standby members bound what one request can make them store
+(SPEC §5.5) and apply the same admission control as witnesses. BUG-2 exploited
+the rotation seam specifically (fixed on main by seal settlement of CONTESTED
+records, in both the Python and the Rust witness).
 
-**Mitigation:** **P2** extend the rotation proof toward more versions, including the
-new seal-settlement path; implement and model-check succession with partition
-tolerance (whitepaper §10.4).
+**Mitigation:** run committees on other operators and hosting than their home and
+size them for availability; rotate a home onto a new committee while the old one is
+healthy (SPEC §9); `dead_man` well above probe period, delay and clock drift
+(SPEC §5.5 L2).
 
 ---
 

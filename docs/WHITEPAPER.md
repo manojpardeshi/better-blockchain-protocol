@@ -162,7 +162,7 @@ Sigil doesn't do everything a blockchain does, and this paper doesn't claim it d
 6. **Witness clocks** are trusted for time-locks, but only to within the honest-quorum assumption. Each honest witness enforces time locally, so a seal shows that an honest quorum member saw the time.
 7. **Stalling counter-parties** are answered by *kill switches*: each party adds a one-unit parcel of its own to a multi-party transition and withholds its unlock until the others' inputs are bound. A counter-party that binds our inputs and stalls is answered by spending our kill switch elsewhere, which is a death proof (`Wallet.abort`).
 8. **Pathological splits in multi-party transitions.** If a counter-party equivocates and the votes split *without* reaching a quorum on anything (some witnesses unreachable forever), a death proof may not exist and the honest party's input stays locked until those witnesses come back. Bonding counter-parties and retrying with fresh witnesses reduce this. A complete fix is open.
-8. **Formal verification.** The safety argument is a proof sketch backed by randomised model checking. A TLA+ or Ivy proof is the next step.
+9. **Formal verification.** The safety theorem is machine-checked with TLAPS for unbounded numbers of witnesses, sigils, transitions and generations, also under charter rotation and constellation succession, on abstract models of the protocol; TLC model-checks further features on small instances, and the code is tied to the models by conformance tests and golden vectors (docs/VERIFICATION.md). The code itself is not verified, and liveness is argued, not proved.
 
 ## 11. Lineage
 
