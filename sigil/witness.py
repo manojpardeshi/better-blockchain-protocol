@@ -20,6 +20,7 @@ from dataclasses import asdict, dataclass, field
 
 from .charter import Registry, charter_hash, quorum, sign_charter
 from .crypto import KeyPair
+from .encoding import canonical
 from .locks import evaluate
 from .model import heartbeat_payload, sigil_of, transition_id, vote_payload
 from .proofs import acked_by, proves_dead, verify_seal, verify_vote
@@ -40,6 +41,29 @@ class Conflict(Rejected):
 
 
 CONTESTED = "!contested"
+
+# What one request can make a witness store (SPEC §5.1, §5.2). Each refusal is a
+# clean Rejected that changes nothing: declining to vote or to release is
+# abstention, which is always safe, so these bound storage without touching safety.
+MAX_AUTH_BYTES = 32 << 10    # enc({home, lock, salt, unlock, header}) of a SPEND
+MAX_PROOF_BYTES = 128 << 10  # enc(proof) of a RELEASE (a death proof for 128 witnesses fits)
+MAX_GEN = 16                 # a sigil is newly bound only below this generation (so at most 16 times)
+
+
+def _encoding(x):
+    """``enc(x)``, or a key unique to ``x`` if it has none (in-process callers only)."""
+    try:
+        return canonical(x)
+    except (ValueError, TypeError, RecursionError):
+        return id(x)
+
+
+def _too_big(x, limit: int) -> bool | None:
+    """Is ``enc(x)`` longer than ``limit`` bytes? None if ``x`` has no canonical encoding."""
+    try:
+        return len(canonical(x)) > limit
+    except (ValueError, TypeError, RecursionError):
+        return None
 
 
 @dataclass
@@ -166,7 +190,10 @@ class Witness:
         if req.get("home") != self.cid:
             raise Rejected("sigil does not live here")
         auth = {k: req.get(k) for k in ("home", "lock", "salt", "unlock", "header")}
-        bound = authorises(sigil, auth)
+        big = _too_big(auth, MAX_AUTH_BYTES)
+        if big:
+            raise Rejected("authorisation too large")
+        bound = authorises(sigil, auth) if big is not None else None
         if bound is None:
             raise Rejected("malformed request or lock not satisfied")
         gen, tid = bound
@@ -188,6 +215,13 @@ class Witness:
             # expired, an owner can safely conclude a failed spend is dead.
             if int(self.clock()) > auth["unlock"]["expires"]:
                 raise Rejected("authorisation expired")
+            # Each new binding is at a higher generation than the last (a release
+            # moves past it), so this bounds the bindings one sigil can collect. It
+            # reads our own counter, not the log: ADOPT evidence from a Byzantine
+            # predecessor can hold junk entries, but cannot raise a generation
+            # without the owner's signature or a valid death proof.
+            if gen >= MAX_GEN:
+                raise Rejected("generation limit reached for this sigil")
             rec.tid, rec.header = tid, auth["header"]
             rec.log.append({"kind": "bind", "gen": gen, "auth": auth})
         if rec.tid != tid:
@@ -224,10 +258,13 @@ class Witness:
         if self.cid is None or self.frozen:
             raise Rejected("witness not active")
         rec = self.records.get(sigil)
-        if rec is not None and rec.tid == CONTESTED:
-            return self._release_contested(sigil, rec, proof)
         if rec is None or rec.tid is None:
             raise Rejected("nothing to release")
+        big = _too_big(proof, MAX_PROOF_BYTES)
+        if big is not False:
+            raise Rejected("death proof too large" if big else "invalid death proof")
+        if rec.tid == CONTESTED:
+            return self._release_contested(sigil, rec, proof)
         if not proves_dead(rec.header, rec.tid, proof, self.registry):
             raise Rejected("invalid death proof")
         rec = rec.copy()
@@ -358,12 +395,23 @@ class Witness:
         self._check_member(cid, version)
         records: dict[str, Record] = {}
         evidence: dict[str, list] = {}
+        seen: dict[str, set] = {}  # per sigil, the encodings of the entries kept so far
         for snap in snapshots:
             if not isinstance(snap, dict):
                 continue
             for sigil, log in snap.items():
-                if isinstance(log, list):
-                    evidence.setdefault(sigil, []).extend(e for e in log if isinstance(e, dict))
+                if not isinstance(log, list):
+                    continue
+                # The evidence is a set: honest predecessors hand over the same
+                # entries, and without dropping repeats each rotation would
+                # multiply a sigil's log by the number of signers.
+                kept, have = evidence.setdefault(sigil, []), seen.setdefault(sigil, set())
+                for e in log:
+                    if isinstance(e, dict):
+                        k = _encoding(e)
+                        if k not in have:
+                            have.add(k)
+                            kept.append(e)
         for sigil, log in evidence.items():
             binds: dict[tuple, dict] = {}   # (gen, tid) -> header
             dead: set[str] = set()          # tids proven unsealable

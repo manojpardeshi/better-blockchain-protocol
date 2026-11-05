@@ -7,6 +7,13 @@ use ed25519_dalek::VerifyingKey;
 use crate::crypto::{decode_pk, digest, verify};
 use crate::json::Json;
 
+/// Members of one charter version (SPEC §3.7, `charter.MAX_WITNESSES`). Genesis charters need
+/// no signatures and anyone may gossip one, so without this one 1 MiB message could register a
+/// constellation of ~14,000 witnesses.
+pub const MAX_WITNESSES: usize = 128;
+/// `enc(charter)` of one version, its body and signatures (`charter.MAX_CHARTER_BYTES`).
+pub const MAX_CHARTER_BYTES: usize = 64 << 10;
+
 /// Byzantine witnesses tolerated by a constellation of size n.
 pub fn faults(n: usize) -> usize {
     n.saturating_sub(1) / 3
@@ -36,8 +43,8 @@ pub struct Successor {
 }
 
 impl Successor {
-    /// `charter.valid_successor`: exactly `{committee, dead_man}`, a non-empty list of distinct
-    /// strings and a positive integer (booleans are not integers).
+    /// `charter.valid_successor`: exactly `{committee, dead_man}`, a list of 1..=`MAX_WITNESSES`
+    /// distinct strings and a positive integer (booleans are not integers).
     fn parse(v: &Json) -> Result<Successor, String> {
         let bad = || "malformed successor clause".to_string();
         let m = v.as_obj().ok_or_else(bad)?;
@@ -53,7 +60,7 @@ impl Successor {
         let mut unique: Vec<&str> = committee.iter().map(String::as_str).collect();
         unique.sort_unstable();
         unique.dedup();
-        if committee.is_empty() || unique.len() != committee.len() {
+        if committee.is_empty() || committee.len() > MAX_WITNESSES || unique.len() != committee.len() {
             return Err(bad());
         }
         Ok(Successor { committee, dead_man })
@@ -91,6 +98,9 @@ impl Charter {
         if witnesses.is_empty() || unique.len() != witnesses.len() {
             return Err("charter witnesses must be non-empty and unique".into());
         }
+        if witnesses.len() > MAX_WITNESSES {
+            return Err(format!("a charter names at most {MAX_WITNESSES} witnesses"));
+        }
         let successor = match body.get("successor") {
             None => None,
             Some(s) => Some(Successor::parse(s)?),
@@ -116,6 +126,9 @@ impl Charter {
 /// `charter.verify_chain`: a list of `{"body", "sigs"}` charters, version 0 first.
 pub fn verify_chain(cid: &str, chain: &[Json]) -> Result<Vec<Charter>, String> {
     let first = chain.first().ok_or("empty chain")?;
+    if chain.iter().any(|c| c.canonical().len() > MAX_CHARTER_BYTES) {
+        return Err(format!("a charter is at most {MAX_CHARTER_BYTES} bytes"));
+    }
     let fb = first.get("body").ok_or("charter without body")?;
     if fb.get("version").and_then(Json::as_int) != Some(0) {
         return Err("chain must start at version 0".into());

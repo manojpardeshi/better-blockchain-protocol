@@ -10,7 +10,13 @@ with the committee's signatures.
 """
 
 from .crypto import KeyPair, verify
-from .encoding import digest
+from .encoding import canonical, digest
+
+# Size of one charter version (SPEC §3.7). Genesis charters need no signatures and
+# anyone may gossip one, so without these one 1 MiB message could register a
+# constellation of ~14,000 witnesses (or a 1 MiB name, or 1 MiB of junk signatures).
+MAX_WITNESSES = 128            # members of one charter version
+MAX_CHARTER_BYTES = 64 << 10   # enc(charter): its body and signatures
 
 
 def faults(n: int) -> int:
@@ -27,15 +33,17 @@ def successor_clause(committee: list, dead_man: int) -> dict:
     """A charter's successor committee (SPEC §3.7, §5.5)."""
     succ = {"committee": list(committee), "dead_man": dead_man}
     if not valid_successor(succ):
-        raise ValueError("a committee is a non-empty list of distinct keys and dead_man a positive integer")
+        raise ValueError(f"a committee is a list of 1..{MAX_WITNESSES} distinct keys and dead_man a positive integer")
     return succ
 
 
 def valid_successor(succ) -> bool:
+    """A successor clause: exactly ``{committee, dead_man}``, 1..MAX_WITNESSES distinct
+    string keys and a positive integer (booleans are not integers)."""
     try:
         c, d = succ["committee"], succ["dead_man"]
         return (isinstance(succ, dict) and set(succ) == {"committee", "dead_man"} and isinstance(c, list)
-                and len(c) > 0 and all(isinstance(k, str) for k in c) and len(set(c)) == len(c)
+                and 0 < len(c) <= MAX_WITNESSES and all(isinstance(k, str) for k in c) and len(set(c)) == len(c)
                 and isinstance(d, int) and not isinstance(d, bool) and d > 0)
     except (KeyError, TypeError):
         return False
@@ -44,6 +52,8 @@ def valid_successor(succ) -> bool:
 def charter_body(name: str, version: int, witnesses: list, prev: str | None, successor: dict | None = None) -> dict:
     if len(set(witnesses)) != len(witnesses) or not witnesses:
         raise ValueError("witness list must be non-empty and unique")
+    if len(witnesses) > MAX_WITNESSES:
+        raise ValueError(f"a charter names at most {MAX_WITNESSES} witnesses")
     body = {"name": name, "version": version, "witnesses": list(witnesses), "prev": prev}
     if successor is not None:
         if not valid_successor(successor):
@@ -110,6 +120,8 @@ def verify_chain(cid: str, chain: list) -> bool:
     for c in chain:
         ws = c["body"]["witnesses"]
         if not ws or len(set(ws)) != len(ws):  # an empty charter would accept unsigned evidence
+            return False
+        if len(ws) > MAX_WITNESSES or len(canonical(c)) > MAX_CHARTER_BYTES:
             return False
         if "successor" in c["body"] and not valid_successor(c["body"]["successor"]):
             return False

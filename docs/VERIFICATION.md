@@ -115,6 +115,14 @@ constellation whose charter chain is fixed (FREEZE binding one successor makes
 it the only verifiable chain). Not modelled: holder validation, expiry and
 time, the network, and wallets (see §2 and §3b for those).
 
+The resource bounds (SPEC §5.1 step 2a and the generation cap, §5.2 step 1a, §5.6
+admission control) leave the proof unchanged: each is a SPEND or RELEASE the witness
+declines, and in the model SPEND and RELEASE are actions that may simply not be
+taken, so every behaviour of the bounded witness is a behaviour of the spec. ADOPT
+now keeps each distinct log entry once; the model's log and snapshots are already
+sets (`lg`, `ld`, `sb`, `sd`), so the evidence ADOPT reads is the same set. The
+proof was re-run after the change (`SIGIL_ROT_PROOF=1 formal/check.sh`).
+
 TLC instances of the proved spec (`MC_rotp*.cfg`; `MC_rotp_cex.cfg`, the proved rule on
 the Bugs 3/4 instance, is opt-in via `SIGIL_TLC_EXTRA` as it takes over 20 minutes) check that it is non-vacuous
 (recovery after rotation, abstention, contested release, lone inheritance and

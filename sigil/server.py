@@ -27,6 +27,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from .charter import Registry, charter_body, charter_hash, quorum, successor_clause
 from .crypto import verify
 from .gossip import GossipStore
+from .ratelimit import (DEFAULT_BURST, DEFAULT_RATE, IDLE_TIMEOUT, MAX_CLIENT_CONNECTIONS, MAX_CONNECTIONS,
+                        ConnectionLimiter, RateLimiter, client_key, is_loopback)
 from .witness import Conflict, Rejected, Witness
 
 MAX_BODY = 1 << 20
@@ -37,19 +39,57 @@ ADMIN_METHODS = ("freeze", "adopt")
 
 # ------------------------------------------------------------------ server
 
+class _HTTPServer(ThreadingHTTPServer):
+    """A threading HTTP server that refuses connections over its caps (closed unread)."""
+
+    daemon_threads = True
+    request_queue_size = 128  # the default of 5 drops bursts of connects (clients retry after 1 s)
+
+    def __init__(self, addr, handler, conns: ConnectionLimiter):
+        self.conns = conns
+        super().__init__(addr, handler)
+
+    def process_request(self, request, client_address):
+        key = client_key(client_address[0])
+        if not self.conns.acquire(key):
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self.conns.release(key)
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self.conns.release(client_key(client_address[0]))
+
+
 class WitnessServer:
     """Serves one ``Witness`` over HTTP. Calls are serialised per witness.
 
     ``admin_token`` enables the rotation calls (``freeze``, ``adopt``) for
     requests carrying ``Authorization: Bearer <admin_token>``.
+
+    ``rate_limit`` is the admission control of docs/WIRE.md: requests per
+    second per client (``sigil.ratelimit``), with bursts of ``rate_burst``.
+    ``None`` (the default) means ``DEFAULT_RATE`` on a non-loopback ``host``
+    and no limit on loopback; ``0`` means no limit. Rotation calls are never
+    limited (they are refused before their body is read without the token).
     """
 
     admin_methods = ADMIN_METHODS
 
     def __init__(self, witness: Witness, host: str = "127.0.0.1", port: int = 0, *,
-                 admin_token: str | None = None):
+                 admin_token: str | None = None, rate_limit: float | None = None,
+                 rate_burst: int = DEFAULT_BURST):
         self.witness = witness
         self.admin_token = admin_token
+        if rate_limit is None:
+            rate_limit = 0 if is_loopback(host) else DEFAULT_RATE
+        self.limiter = RateLimiter(rate_limit, rate_burst) if rate_limit > 0 else None
         self._lock = threading.Lock()
         # Gossip shares the witness's registry: a verified rotation learned
         # by gossip is immediately what the witness serves and checks against.
@@ -57,10 +97,36 @@ class WitnessServer:
         server = self
 
         class Handler(BaseHTTPRequestHandler):
+            timeout = IDLE_TIMEOUT  # a silent or slow client is dropped, never waited on forever
+
             def log_message(self, *args):  # quiet
                 pass
 
+            def _admitted(self, method: str, body: bool) -> bool:
+                """Charge the client one token; answer 429 if it has none left."""
+                if server.limiter is None or method in ADMIN_METHODS:
+                    return True
+                wait = server.limiter.admit(client_key(self.client_address[0]))
+                if not wait:
+                    return True
+                if body:  # read (and drop) what was sent, so the client reliably gets the answer
+                    try:
+                        left = int(self.headers.get("Content-Length", "0"))
+                    except ValueError:
+                        left = 0
+                    left = max(0, min(left, MAX_BODY))
+                    while left > 0:
+                        chunk = self.rfile.read(min(left, 1 << 16))
+                        if not chunk:
+                            break
+                        left -= len(chunk)
+                self._reply(429, {"error": "rejected", "message": "rate limited", "vote": None},
+                            {"Retry-After": str(wait)})
+                return False
+
             def do_GET(self):
+                if not self._admitted(self.path.removeprefix("/v0/"), False):
+                    return
                 if self.path == "/v0/info":
                     return self._reply(200, {"ok": server.info()})
                 if self.path == "/v0/charters":
@@ -74,6 +140,8 @@ class WitnessServer:
                 self._reply(404, {"error": "bad_request", "message": "unknown path", "vote": None})
 
             def do_POST(self):
+                if not self._admitted(self.path.removeprefix("/v0/"), True):
+                    return
                 try:
                     method = self.path.removeprefix("/v0/")
                     admin = method in server.admin_methods
@@ -96,16 +164,18 @@ class WitnessServer:
                 except Exception:  # never drop a connection without an answer
                     self._reply(500, {"error": "internal", "message": "internal error", "vote": None})
 
-            def _reply(self, code, obj):
+            def _reply(self, code, obj, headers=None):
                 data = json.dumps(obj).encode()
                 self.send_response(code)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(data)))
+                for k, v in (headers or {}).items():
+                    self.send_header(k, v)
                 self.end_headers()
                 self.wfile.write(data)
 
-        self.httpd = ThreadingHTTPServer((host, port), Handler)
-        self.httpd.daemon_threads = True
+        conns = ConnectionLimiter(MAX_CONNECTIONS, MAX_CLIENT_CONNECTIONS if self.limiter is not None else None)
+        self.httpd = _HTTPServer((host, port), Handler, conns)
         self._thread = None
 
     @property

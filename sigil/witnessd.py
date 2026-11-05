@@ -4,7 +4,7 @@
     python -m sigil.witnessd genesis --name orion --keys k1.pub k2.pub k3.pub k4.pub --out registry.json
     python -m sigil.witnessd run     --key key.json --registry registry.json --constellation <cid> \\
                                      --store data.db [--host 127.0.0.1] [--port 7000] [--stamps] \\
-                                     [--admin-token FILE] [--adopt]
+                                     [--admin-token FILE] [--adopt] [--rate-limit R] [--rate-burst B]
 
 ``keygen`` writes the private key (mode 0600) and its public key next to it
 (``key.pub``). ``genesis`` builds charter version 0 from public keys and
@@ -18,6 +18,11 @@ new member with ``--adopt`` and it waits, voting on nothing, until an operator
 sends ``/v0/adopt`` (``RemoteNetwork.rotate`` does). The rotation calls
 (``/v0/freeze``, ``/v0/adopt``) need the token in ``--admin-token FILE``;
 without it they are disabled.
+
+A witness listening on a non-loopback ``--host`` limits each client to
+``--rate-limit`` requests per second (default 20, bursts of ``--rate-burst``,
+default 100; docs/WIRE.md "Admission control"); ``--rate-limit 0`` disables it.
+On loopback there is no limit unless ``--rate-limit`` asks for one.
 
 Every vote is made durable before it is sent (SPEC §5), so the daemon may be
 killed at any moment, even with SIGKILL, and restarted on the same store.
@@ -35,6 +40,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from .charter import Registry, charter_body, constellation_id, successor_clause
 from .crypto import KeyPair
+from .ratelimit import DEFAULT_BURST, DEFAULT_RATE
 from .server import StandbyServer, WitnessServer
 from .stamps import StampMint
 from .store import WitnessStore
@@ -210,7 +216,8 @@ def standby(args) -> None:
 def run(args) -> None:
     token = load_admin_token(args.admin_token)
     w = build_witness(args.key, args.registry, args.constellation, args.store, args.stamps, args.adopt)
-    server = WitnessServer(w, args.host, args.port, admin_token=token).start()
+    server = WitnessServer(w, args.host, args.port, admin_token=token, rate_limit=args.rate_limit,
+                           rate_burst=args.rate_burst).start()
     stop = threading.Event()
     for sig in (signal.SIGTERM, signal.SIGINT):
         signal.signal(sig, lambda *_: stop.set())
@@ -268,6 +275,11 @@ def main(argv=None) -> None:
                    help="file holding the operator token that authorises /v0/freeze and /v0/adopt")
     r.add_argument("--adopt", action="store_true",
                    help="on a fresh store, do not join: wait for /v0/adopt into a later charter version")
+    r.add_argument("--rate-limit", type=float, metavar="R", default=None,
+                   help=f"requests per second per client (0: no limit; default {DEFAULT_RATE:g} on a "
+                        "non-loopback host, none on loopback)")
+    r.add_argument("--rate-burst", type=int, metavar="B", default=DEFAULT_BURST,
+                   help=f"requests a client may burst above the rate (default {DEFAULT_BURST})")
 
     args = p.parse_args(argv)
     if args.cmd == "keygen":
