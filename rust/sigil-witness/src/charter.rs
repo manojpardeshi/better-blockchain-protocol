@@ -7,6 +7,13 @@ use ed25519_dalek::VerifyingKey;
 use crate::crypto::{decode_pk, digest, verify};
 use crate::json::Json;
 
+/// Members of one charter version (SPEC §3.7, `charter.MAX_WITNESSES`). Genesis charters need
+/// no signatures and anyone may gossip one, so without this one 1 MiB message could register a
+/// constellation of ~14,000 witnesses.
+pub const MAX_WITNESSES: usize = 128;
+/// `enc(charter)` of one version, its body and signatures (`charter.MAX_CHARTER_BYTES`).
+pub const MAX_CHARTER_BYTES: usize = 64 << 10;
+
 /// Byzantine witnesses tolerated by a constellation of size n.
 pub fn faults(n: usize) -> usize {
     n.saturating_sub(1) / 3
@@ -51,6 +58,9 @@ impl Charter {
         if witnesses.is_empty() || unique.len() != witnesses.len() {
             return Err("charter witnesses must be non-empty and unique".into());
         }
+        if witnesses.len() > MAX_WITNESSES {
+            return Err(format!("a charter names at most {MAX_WITNESSES} witnesses"));
+        }
         let keys = witnesses.iter().filter_map(|w| decode_pk(w).map(|k| (w.clone(), k))).collect();
         Ok(Charter { body: body.clone(), version, witnesses, keys })
     }
@@ -63,6 +73,9 @@ impl Charter {
 /// `charter.verify_chain`: a list of `{"body", "sigs"}` charters, version 0 first.
 pub fn verify_chain(cid: &str, chain: &[Json]) -> Result<Vec<Charter>, String> {
     let first = chain.first().ok_or("empty chain")?;
+    if chain.iter().any(|c| c.canonical().len() > MAX_CHARTER_BYTES) {
+        return Err(format!("a charter is at most {MAX_CHARTER_BYTES} bytes"));
+    }
     let fb = first.get("body").ok_or("charter without body")?;
     if fb.get("version").and_then(Json::as_int) != Some(0) {
         return Err("chain must start at version 0".into());

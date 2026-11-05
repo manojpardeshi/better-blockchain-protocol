@@ -92,8 +92,58 @@ class Resources(unittest.TestCase):
         self.assertLessEqual(worst, locks.MAX_KEYS)
 
     def test_storage_amplification_measured(self):
+        """Before MAX_AUTH_BYTES one ~800 KiB SPEND pinned ~800 KiB of witness
+        state (ratio 1.0). Now it is a clean Rejected that stores nothing, and
+        the largest accepted SPEND pins a record of about that cap."""
+        from sigil.witness import MAX_AUTH_BYTES
         r = resources.storage_per_spend()
-        self.assertGreaterEqual(r["stored_bytes"], 500_000)
+        self.assertTrue(r["rejected"])
+        self.assertEqual(r["stored_bytes"], 0)
+        self.assertLessEqual(r["largest_accepted"]["stored_bytes"], MAX_AUTH_BYTES + 4096)
+
+    def test_per_sigil_record_is_bounded(self):
+        """Before: 40 bind/release cycles with junk-padded death proofs grew one
+        sigil's record to ~32 MB (rewritten whole on every update). Now proofs
+        over MAX_PROOF_BYTES are refused and a sigil is bound only below MAX_GEN."""
+        from sigil.witness import MAX_AUTH_BYTES, MAX_GEN
+        r = resources.sigil_log_growth()
+        self.assertEqual(r["binds"], MAX_GEN)
+        self.assertEqual(r["padded_proofs_stored"], 0)
+        self.assertLess(r["record_bytes"], MAX_GEN * (MAX_AUTH_BYTES // 8))
+
+    def test_rotation_does_not_multiply_evidence(self):
+        """Before: each rotation multiplied a bound sigil's evidence log by the
+        number of signers (8, 32, 128, ..., 8192 entries after six rotations of
+        n = 4). ADOPT now keeps each entry once, so the log stays put."""
+        r = resources.rotation_log_growth()
+        self.assertEqual(len(set(r["log_lengths"])), 1, r)
+        self.assertLessEqual(r["log_lengths"][-1], 8)
+
+    def test_gossip_charter_size_is_capped(self):
+        """Before: one ~1 MiB gossip message registered a 14,000-witness charter
+        (or a 900 KiB name, or 800 KiB of ignored signatures)."""
+        from sigil.charter import MAX_CHARTER_BYTES
+        r = resources.gossip_store_growth()
+        self.assertEqual((r["accepted"], r["junk_sigs_accepted"], r["long_name_accepted"]), (0, 0, 0))
+        self.assertLessEqual(r["largest_accepted_charter_bytes"], MAX_CHARTER_BYTES)
+
+    def test_open_witness_rate_limits_each_client(self):
+        """Before: a witness on a public address served every request of every
+        client (600 of 600 here). With the open-network default one client gets
+        its burst plus the refill rate, and the rest are answered 429."""
+        from sigil.ratelimit import DEFAULT_BURST, DEFAULT_RATE
+        r = resources.rate_limit_burst()
+        self.assertGreaterEqual(r["served"], DEFAULT_BURST)
+        self.assertLessEqual(r["served"], DEFAULT_BURST + DEFAULT_RATE * r["seconds"] + 2)
+        self.assertEqual(r["served"] + r["refused_429"], r["requests"])
+
+    def test_idle_connections_are_capped_and_dropped(self):
+        """Before: 300 silent connections pinned 300 handler threads forever."""
+        from sigil.ratelimit import MAX_CONNECTIONS
+        r = resources.idle_connections()
+        self.assertLessEqual(r["open_at_once"], MAX_CONNECTIONS)
+        self.assertLessEqual(r["peak_handler_threads"], MAX_CONNECTIONS + 2)
+        self.assertEqual(r["open_after_idle"], 0)
 
 
 # ---------------------------------------------------------------- findings

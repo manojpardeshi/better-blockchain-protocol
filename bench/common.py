@@ -148,7 +148,7 @@ class Cluster:
     def command(self, i: int) -> list:
         w = self.witnesses[i]
         common = ["run", "--key", w["key"], "--registry", self.registry, "--constellation", w["cid"],
-                  "--store", w["store"], "--host", self.host, "--port", str(w["port"])]
+                  "--store", w["store"], "--host", w.get("listen", self.host), "--port", str(w["port"])]
         if w["kind"] == "rust":
             return [*self.wrap, RUST_BIN, *common, *w["args"]]
         return [*self.wrap, sys.executable, "-m", "sigil.witnessd", *common, *w["args"]]

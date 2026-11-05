@@ -778,12 +778,15 @@ dependencies = [
  "clap",
  "ed25519-dalek",
  "hex",
+ "hyper",
+ "hyper-util",
  "num-bigint-dig",
  "num-integer",
  "num-traits",
  "rand",
  "redb",
  "tokio",
+ "tower-service",
 ]
 
 [[package]]

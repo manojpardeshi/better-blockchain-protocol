@@ -22,11 +22,11 @@ Every reply is one JSON object:
 * success (HTTP 200): `{"ok": result}`;
 * failure: `{"error": kind, "message": str, "vote": vote | null}`. `kind` is one of the following:
   * `conflict` (HTTP 409). The sigil is already bound to another transition at that generation, and `vote` holds the existing vote.
-  * `rejected` (HTTP 403). The request was well formed but refused, for example because the lock was not satisfied or the stamp was missing.
+  * `rejected` (HTTP 403). The request was well formed but refused, for example because the lock was not satisfied or the stamp was missing. A client over its rate limit gets `rejected` with HTTP 429, the message `rate limited` and a `Retry-After` header (seconds), before the call runs (see "Admission control").
   * `bad_request` (HTTP 400). The request was malformed.
   * `internal` (HTTP 500).
 
-Big integers (RSA stamp values) are lowercase hex strings. Request bodies are capped at 1 MiB (the admin calls: 256 MiB, read only after the token is checked). A witness handles its calls one at a time and persists state before it answers (SPEC §5). An unlock carries at most 64 equivocation proofs (SPEC §3.5), so one lock evaluation verifies at most 64 of them, far fewer than the ~1,400 a 1 MiB body could hold.
+Big integers (RSA stamp values) are lowercase hex strings. Request bodies are capped at 1 MiB (the admin calls: 256 MiB, read only after the token is checked). Within that, a SPEND's authorisation `{home, lock, salt, unlock, header}` is at most 32 KiB encoded, a sigil is newly bound only below generation 16, and a RELEASE's death proof is at most 128 KiB (SPEC §5.1, §5.2): anything larger is `rejected` and changes nothing, so no request can make a witness store more than about its own size. A witness handles its calls one at a time and persists state before it answers (SPEC §5). An unlock carries at most 64 equivocation proofs (SPEC §3.5), so one lock evaluation verifies at most 64 of them, far fewer than the ~1,400 a 1 MiB body could hold.
 
 ## Rotation
 
@@ -38,12 +38,23 @@ FREEZE is irreversible, so `/v0/freeze` and `/v0/adopt` are operator calls. They
 
 `RemoteNetwork.rotate(cid, new_urls, admin_token)` drives a rotation like `Network.rotate`: every reachable member freezes for the next charter and signs it; signatures that do not verify are dropped with their evidence; with a quorum, the new chain is gossiped to old and new members, and every new member adopts the union of the signers' evidence. A re-used key whose old process did not sign is left waiting (`RotationIncomplete`), because it must bring its own votes. Operators then add the new chain to their registry files, since gossip state is not persisted.
 
+## Admission control
+
+A witness on the open network must not serve every request of every client (SPEC §5.5). Both daemons apply these rules, with the same defaults:
+
+* **Rate limit.** Each client has a token bucket of `--rate-burst` tokens (default 100) that refills at `--rate-limit` tokens per second (default 20). Every call costs one token, except the rotation calls, which are refused before their body is read unless they carry the admin token. A call with no token left is answered HTTP 429 (`rejected`, `rate limited`, `Retry-After`) and never reaches the witness, so it changes no state. A client is an IPv4 address, or an IPv6 /64 (one subscriber usually holds a whole /64). At most 65,536 buckets are kept; the least recently seen is forgotten first, which only ever gives that client a full bucket again.
+* **Default.** The limit is on when the daemon listens on a non-loopback address (`--host 0.0.0.0`, a public address, a hostname other than `localhost`) and off on loopback, so tests and the local testnet (`testnet/`) run unlimited. `--rate-limit 0` turns it off anywhere; `--rate-limit R` turns it on anywhere. The Docker testnet (`docker-compose.yml`) listens on 0.0.0.0 inside its containers but publishes on 127.0.0.1 only, so it passes `--rate-limit 0`.
+* **Connections.** At most 256 connections are open at once, and, with a rate limit, at most 16 from one client; a connection over a cap is closed unread. A connection whose client sends nothing (no request, or a stalled body) or accepts nothing for 30 seconds is closed (the Rust witness gives a request body 30 seconds in all, and an authorised ADOPT body unlimited time).
+
+Why a rate limit and not stamps by default: stamps (SPEC §3.10) price attention, but `/v0/sell_stamp` blind-signs for anyone who asks, since the protocol leaves payment to the deployment. Stamps on by default would therefore limit nothing, and each sale costs the witness an RSA-2048 signature. A per-client bucket needs no payment system and bounds what one address can make a witness do. It does not stop an attacker with many addresses; a deployment that can take payment should also require stamps (`--stamps`, with `sell_stamp` behind the payment) and put the witness behind a network-level filter. A reverse proxy in front of a witness makes every client the proxy's address; give the proxy its own limits and run the witness with `--rate-limit 0`.
+
 ## Client behaviour
 
 * A witness that cannot be reached counts as crashed. It does not vote, and it can never be assumed to hold no vote (see the wallet's `unpledge_if_unbound`).
 * A request may be delayed in flight and reach a witness after the client gave up on it. Witnesses refuse to newly bind on an authorisation whose `unlock.expires` has passed (SPEC §5.1), so a wallet releases a failed pledge only after `expires` plus a clock-skew margin, and only if every current member answered STATUS with no binding or vote for it (SPEC §4 rule 3).
 * Constellation sizes come from the verified charter, never from how many witnesses answered.
 * Charter chains fetched from witnesses are verified against the constellation id (SPEC §3.7) before use. Invalid or forked chains are ignored.
+* A `rejected` reply with HTTP 429 means "not now": the reference client raises `Rejected("rate limited")`, like any refusal, and the witness counts as not having voted.
 
 ## Gossip
 
@@ -71,10 +82,10 @@ On a witness, gossip uses the witness's own charter registry, so a verified rota
 
 A wallet builds its store as `GossipStore(network.registry)`, so newly learned charters reach its `TrustPolicy`. It then calls `store.apply(wallet.policy)` to convict every proven equivocator, and from then on that witness's votes no longer count toward seals. `equivocations_in(votes)` extracts proofs from any votes the wallet sees, such as STATUS replies or death proofs.
 
-**Caps.** A message holds at most 64 charter chains, 1024 versions per chain, 64 proofs and 16 forks, within the 1 MiB body limit. A message over any cap is refused as a whole with `bad_request`. A store accepts at most 10 000 new constellations, while extensions of known constellations are always accepted. A client reads at most 16 MiB from one witness per pull.
+**Caps.** A message holds at most 64 charter chains, 1024 versions per chain, 64 proofs and 16 forks, within the 1 MiB body limit. A message over any cap is refused as a whole with `bad_request`. A charter names at most 128 witnesses and encodes to at most 64 KiB (SPEC §3.7); a chain holding a larger one does not verify, so it is dropped like any invalid item. A store accepts at most 10 000 new constellations, while extensions of known constellations are always accepted. A client reads at most 16 MiB from one witness per pull.
 
 **Threats.**
-* *Spam.* Genesis charters need no signatures, so anyone can mint constellations. The constellation cap bounds this. Proofs against keys outside every known charter are refused, so throwaway keys cannot grow the store. Verification costs at most the signatures that fit in one 1 MiB body.
+* *Spam.* Genesis charters need no signatures, so anyone can mint constellations. The constellation cap bounds how many, the charter caps how large each version is (before them, one message registered a 14,000-witness charter), and the rate limit how fast. Proofs against keys outside every known charter are refused, so throwaway keys cannot grow the store. Verification costs at most the signatures that fit in one 1 MiB body.
 * *Forgery.* Every item is checked against signatures that chain back to the cid or the vote key. A forged chain, proof or fork is dropped and never forwarded, because only stored items are served.
 * *Withholding.* A witness can refuse to serve or forward what it knows. A fact reaches a participant as long as one honest path exists to that participant. Clients pull from every witness, and any single honest relay is enough.
 * *Forks.* The first branch seen is kept, so different participants may hold different branches of a forked constellation. Fork evidence then spreads to all of them. A fork proves that the quorum of the forked-from version is compromised, and `fork_signers(fork)` names the keys that signed both branches. Holders should stop trusting that constellation. This is a policy decision, and gossip does not make it automatically. Signing two charters is not a §3.8 vote equivocation, so it does not unlock an `equivocation(witness)` bond.

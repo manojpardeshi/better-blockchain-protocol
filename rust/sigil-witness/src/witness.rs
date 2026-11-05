@@ -29,6 +29,16 @@ use crate::store::{Entry, Loaded, Store};
 
 pub const CONTESTED: &str = "!contested";
 
+/// `enc({home, lock, salt, unlock, header})` of a SPEND (`witness.MAX_AUTH_BYTES`). Each of these
+/// bounds what one request can make a witness store; a refusal is a clean rejection that changes
+/// nothing (abstention), so they cannot affect safety.
+pub const MAX_AUTH_BYTES: usize = 32 << 10;
+/// `enc(proof)` of a RELEASE (`witness.MAX_PROOF_BYTES`).
+pub const MAX_PROOF_BYTES: usize = 128 << 10;
+/// A sigil is newly bound only below this generation, so at most this many times
+/// (`witness.MAX_GEN`).
+pub const MAX_GEN: i128 = 16;
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Error {
     /// The witness declined (HTTP 403 `rejected`).
@@ -394,6 +404,9 @@ impl Witness {
             return rejected("sigil does not live here");
         }
         let auth = obj(["home", "lock", "salt", "unlock", "header"].map(|k| (k, req.get(k).cloned().unwrap_or(Json::Null))));
+        if auth.canonical().len() > MAX_AUTH_BYTES {
+            return rejected("authorisation too large");
+        }
         let now = self.now();
         // One evaluation against our clock suffices: the lock language is monotone, so a lock
         // satisfied at `now` is satisfied with time conditions ignored (the reference checks both).
@@ -442,6 +455,13 @@ impl Witness {
             if now > expires {
                 return rejected("authorisation expired");
             }
+            // Each new binding is at a higher generation than the last, so this bounds the
+            // bindings one sigil can collect. It reads our own counter, not the log: ADOPT
+            // evidence can hold junk entries, but cannot raise a generation without the
+            // owner's signature or a valid death proof.
+            if gen >= MAX_GEN {
+                return rejected("generation limit reached for this sigil");
+            }
             rec.tid = Some(tid.clone());
             rec.header = auth.get("header").cloned();
             rec.log.push(obj([("kind", "bind".into()), ("gen", Json::Int(gen)), ("auth", auth)]));
@@ -486,6 +506,9 @@ impl Witness {
                 _ => return rejected("nothing to release"),
             }
         };
+        if proof.canonical().len() > MAX_PROOF_BYTES {
+            return rejected("death proof too large");
+        }
         let sigil = sigil.as_str().expect("checked");
         let registry = self.registry();
         let home = self.state.lock().expect("state lock").active().map(|(c, _)| c);
@@ -686,19 +709,25 @@ impl Witness {
             _ => return Err(not_member()),
         }
         let batch = self.batch_verify;
-        let mut evidence: OrderedMap<String, Vec<Json>> = OrderedMap::new();
+        // Per sigil, the entries kept and the encodings seen. The evidence is a set: honest
+        // predecessors hand over the same entries, and without dropping repeats each rotation
+        // would multiply a sigil's log by the number of signers.
+        let mut evidence: OrderedMap<String, (Vec<Json>, HashSet<Vec<u8>>)> = OrderedMap::new();
         for snap in snapshots {
             let Some(m) = snap.as_obj() else { continue };
             for (sigil, log) in m {
                 if let Some(log) = log.as_arr() {
-                    evidence
-                        .get_mut_or_insert_with(sigil.clone(), Vec::new)
-                        .extend(log.iter().filter(|e| e.as_obj().is_some()).cloned());
+                    let (kept, seen) = evidence.get_mut_or_insert_with(sigil.clone(), Default::default);
+                    for e in log.iter().filter(|e| e.as_obj().is_some()) {
+                        if seen.insert(e.canonical()) {
+                            kept.push(e.clone());
+                        }
+                    }
                 }
             }
         }
         let mut records: Vec<(String, Record)> = Vec::with_capacity(evidence.items.len());
-        for (sigil, log) in evidence.items {
+        for (sigil, (log, _)) in evidence.items {
             let sigil_j = Json::str(&sigil);
             let mut binds: OrderedMap<(i128, String), Json> = OrderedMap::new(); // (gen, tid) -> header
             let mut dead: HashSet<String> = HashSet::new(); // tids proven unsealable

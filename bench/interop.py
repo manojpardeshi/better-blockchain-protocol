@@ -15,7 +15,9 @@ then runs, through ``sigil.server.RemoteNetwork`` and ``sigil.wallet.Wallet``: i
 constellations, a double spend (conflict carrying the first vote; no second seal), recovery
 of a parcel from a dead swap via a death proof (RELEASE), expiry of owner authorisations,
 time locks, and a SIGKILL of a Rust witness mid-payments followed by a restart on the same
-store (it returns the same vote byte for byte and refuses the conflicting spend).
+store (it returns the same vote byte for byte and refuses the conflicting spend). Then rotation,
+stamps, gossip, and the resource bounds (admission control on an open listener, the size caps
+of SPEND and RELEASE, and the charter caps in gossip) on Rust and Python witnesses alike.
 
 Exits non-zero on the first failure.
 """
@@ -561,10 +563,81 @@ class Interop:
         assert store.apply(alice.policy) == 1 and alice.policy.convicted == {keys[0].pk}
         assert gossip_round(net, store)["pushed"] == 0, "a further round is a no-op"
 
+    @check("resource bounds: open listeners rate-limit each client (429), size and charter caps match")
+    def limits(self):
+        import json
+        import urllib.error
+        import urllib.request
+        from sigil.charter import MAX_WITNESSES, constellation_id
+        from sigil.ratelimit import DEFAULT_BURST
+        from sigil.witness import MAX_AUTH_BYTES
+        c = self.c
+
+        def post(url, path, body: dict):
+            req = urllib.request.Request(url + path, data=json.dumps(body).encode(), method="POST",
+                                         headers={"Content-Type": "application/json"})
+            try:
+                with urllib.request.urlopen(req, timeout=5) as r:
+                    return r.status, json.loads(r.read()), r.headers
+            except urllib.error.HTTPError as e:
+                return e.code, json.loads(e.read()), e.headers
+
+        # Listening on 0.0.0.0 (not loopback): the per-client limit is on by default.
+        L = c.create("open", ["rust", "python"], self.admin())
+        idx = c.indices(L)
+        for i in idx:
+            c.witnesses[i]["listen"] = "0.0.0.0"
+        c.start_all(idx)
+        for i in idx:
+            url = c.url(i)
+            first = None
+            for n in range(DEFAULT_BURST + 200):
+                code, body, headers = post(url, "/v0/status", {"sigil": "00" * 32})
+                if code == 429:
+                    first = n
+                    break
+                assert code == 200, (code, body)
+            assert first is not None and DEFAULT_BURST - 2 <= first <= DEFAULT_BURST + 100, (c.witnesses[i]["kind"], first)
+            assert body == {"error": "rejected", "message": "rate limited", "vote": None}, body
+            assert int(headers["Retry-After"]) >= 1
+            # Rotation calls are not rate limited (the admin token decides), and a limited
+            # client gets a clean Rejected from the reference client.
+            assert post(url, "/v0/freeze", {})[:2] == (403, {"error": "rejected", "message": "bad admin token", "vote": None})
+            try:
+                w = RemoteWitness.__new__(RemoteWitness)  # a client without the /v0/info call
+                w.url, w.timeout, w.admin_token = url, 5, None
+                w.status("00" * 32)
+                raise AssertionError("not limited")
+            except Rejected as e:
+                assert str(e) == "rate limited", e
+            c.kill(i, signal.SIGTERM)
+        # Loopback with an explicit limit, and the size caps (both kinds of witness, same answers).
+        Q, qidx = self.constellation("tight", ["rust", "python"], {"rust": ["--rate-limit", "1", "--rate-burst", "3"],
+                                                                    "python": ["--rate-limit", "1", "--rate-burst", "3"]})
+        for i in qidx:
+            codes = [post(c.url(i), "/v0/status", {"sigil": "00" * 32})[0] for _ in range(6)]
+            assert codes.count(429) >= 2, (c.witnesses[i]["kind"], codes)
+        for i in c.indices(self.Z):
+            url = c.url(i)
+            salt = "e" * (MAX_AUTH_BYTES + 1)  # refused before the lock is even looked at
+            p = model.parcel(self.Z, "x", 1, locks.sig("00" * 32), salt)
+            s = model.sigil_of(p)
+            req = {"sigil": s, "header": {"inputs": [[s, 0]], "body": "11" * 32}, "home": self.Z, "lock": p["lock"],
+                   "salt": salt, "unlock": locks.empty_unlock(2 ** 40)}
+            code, body, _ = post(url, "/v0/spend", {"request": req})
+            assert (code, body) == (403, {"error": "rejected", "message": "authorisation too large", "vote": None}), (code, body)
+            code, body, _ = post(url, "/v0/status", {"sigil": s})
+            assert body["ok"] == {"gen": 0, "tid": None, "votes": []}
+            # Charters: one over MAX_WITNESSES is dropped, one at it is learned.
+            for n, want in ((MAX_WITNESSES + 1, 0), (MAX_WITNESSES, 1)):
+                b = {"name": f"big{n}", "version": 0, "witnesses": [os.urandom(32).hex() for _ in range(n)], "prev": None}
+                code, body, _ = post(url, "/v0/gossip", {"charters": {constellation_id(b): [{"body": b, "sigs": {}}]}})
+                assert (code, body["ok"]["charters"]) == (200, want), (c.witnesses[i]["kind"], n, body)
+
     def run_all(self):
         for t in (self.charters, self.payments, self.swap, self.double_spend, self.release,
                   self.expiry_and_timelocks, self.crash_restart, self.errors, self.rotation,
-                  self.regression_reopen, self.regression_sibling, self.stamps, self.gossip):
+                  self.regression_reopen, self.regression_sibling, self.stamps, self.gossip, self.limits):
             t()
 
 

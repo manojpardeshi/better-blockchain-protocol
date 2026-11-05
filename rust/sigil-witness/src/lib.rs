@@ -7,7 +7,8 @@
 //! * [`stamps`]: blind RSA-FDH stamps (SPEC §3.10);
 //! * [`gossip`]: storage of gossiped charter chains, equivocation proofs and fork evidence;
 //! * [`store`]: durable state with group commit;
-//! * [`server`]: the v0 HTTP JSON wire protocol (docs/WIRE.md).
+//! * [`server`]: the v0 HTTP JSON wire protocol (docs/WIRE.md);
+//! * [`ratelimit`]: admission control (per-client token buckets, connection caps).
 
 pub mod charter;
 pub mod crypto;
@@ -16,6 +17,7 @@ pub mod json;
 pub mod locks;
 pub mod model;
 pub mod proofs;
+pub mod ratelimit;
 pub mod server;
 pub mod stamps;
 pub mod store;

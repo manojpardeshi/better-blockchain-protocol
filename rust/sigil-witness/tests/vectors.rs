@@ -264,3 +264,49 @@ fn witness_script_matches_reference() {
         }
     }
 }
+
+#[test]
+fn limits_script_matches_reference() {
+    // The size caps of SPEND and RELEASE, the per-sigil generation cap, ADOPT keeping each evidence
+    // entry once and the charter caps in gossip (docs/AI_THREAT_MODEL.md §2.6).
+    let v = vectors();
+    let n = replay_script(v.get("limits").unwrap(), None);
+    assert!(n > 40, "{n} steps");
+}
+
+#[test]
+fn rate_limiter_matches_reference() {
+    use sigil_witness::ratelimit::{self as rl, client_key_str, is_loopback, RateLimiter};
+    let v = vectors();
+    let r = v.get("ratelimit").unwrap();
+    let d = r.get("defaults").unwrap();
+    let f = |x: &Json| match x {
+        Json::Float(f) => *f,
+        Json::Int(i) => *i as f64,
+        _ => panic!("not a number"),
+    };
+    assert_eq!(f(d.get("rate").unwrap()), rl::DEFAULT_RATE);
+    assert_eq!(d.get("burst").and_then(Json::as_int), Some(rl::DEFAULT_BURST as i128));
+    assert_eq!(d.get("max_clients").and_then(Json::as_int), Some(rl::MAX_CLIENTS as i128));
+    assert_eq!(d.get("max_connections").and_then(Json::as_int), Some(rl::MAX_CONNECTIONS as i128));
+    assert_eq!(d.get("max_client_connections").and_then(Json::as_int), Some(rl::MAX_CLIENT_CONNECTIONS as i128));
+    assert_eq!(f(d.get("idle_timeout").unwrap()), rl::IDLE_TIMEOUT.as_secs_f64());
+    for b in arr(r, "buckets") {
+        let burst = b.get("burst").and_then(Json::as_int).unwrap() as u32;
+        let max_clients = b.get("max_clients").and_then(Json::as_int).unwrap() as usize;
+        let lim = RateLimiter::with_max_clients(f(b.get("rate").unwrap()), burst, max_clients).unwrap();
+        for (i, c) in arr(b, "calls").iter().enumerate() {
+            let c = c.as_arr().unwrap();
+            let want = c[2].as_int().unwrap() as u64;
+            assert_eq!(lim.admit_at(c[0].as_str().unwrap(), f(&c[1])), want, "call {i} of {}", b.canonical_string().len());
+        }
+    }
+    for k in arr(r, "keys") {
+        let k = k.as_arr().unwrap();
+        assert_eq!(client_key_str(k[0].as_str().unwrap()), k[1].as_str().unwrap());
+    }
+    for k in arr(r, "loopback") {
+        let k = k.as_arr().unwrap();
+        assert_eq!(Json::Bool(is_loopback(k[0].as_str().unwrap())), k[1], "{}", k[0].canonical_string());
+    }
+}

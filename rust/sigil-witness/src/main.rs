@@ -5,7 +5,7 @@
 //! sigil-witness genesis --name orion --keys k1.pub k2.pub k3.pub k4.pub --out registry.json
 //! sigil-witness run     --key key.json --registry registry.json --constellation <cid> \
 //!                       --store data.redb [--host 127.0.0.1] [--port 7000] [--stamps] \
-//!                       [--admin-token FILE] [--adopt]
+//!                       [--admin-token FILE] [--adopt] [--rate-limit R] [--rate-burst B]
 //! ```
 //!
 //! Every vote is made durable before it is sent, so the daemon may be killed at any moment,
@@ -15,17 +15,21 @@
 //! `<store>.stamps.json` (the reference's file and format), created on first use. A fresh
 //! store joins charter version 0; a new member of a later version is started with `--adopt`
 //! and waits for `/v0/adopt`. The rotation calls need the token in `--admin-token FILE`.
+//!
+//! A witness listening on a non-loopback `--host` limits each client to `--rate-limit` requests
+//! per second (default 20, bursts of `--rate-burst`, default 100; docs/WIRE.md "Admission
+//! control"); `--rate-limit 0` disables it. On loopback there is no limit unless asked for.
 
 use std::io::Write;
 use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
-use sigil_witness::charter::{constellation_id, short};
+use sigil_witness::charter::{constellation_id, short, MAX_WITNESSES};
 use sigil_witness::json::{obj, parse, Json};
 use sigil_witness::stamps::load_mint;
 use sigil_witness::store::Store;
 use sigil_witness::witness::system_clock;
-use sigil_witness::{load_admin_token, load_key, load_registry, server, write_private, KeyPair, Witness};
+use sigil_witness::{load_admin_token, load_key, load_registry, ratelimit, server, write_private, KeyPair, Witness};
 
 #[derive(Parser)]
 #[command(name = "sigil-witness", about = "Sigil v0 witness (Rust)", version)]
@@ -75,6 +79,12 @@ enum Cmd {
         /// On a fresh store, do not join: wait for /v0/adopt into a later charter version.
         #[arg(long)]
         adopt: bool,
+        /// Requests per second per client (0: no limit; default 20 on a non-loopback host, none on loopback).
+        #[arg(long, value_name = "R")]
+        rate_limit: Option<f64>,
+        /// Requests a client may burst above the rate.
+        #[arg(long, value_name = "B", default_value_t = ratelimit::DEFAULT_BURST)]
+        rate_burst: u32,
         /// Verify each signature on its own instead of Ed25519 batch verification.
         #[arg(long)]
         no_batch_verify: bool,
@@ -124,6 +134,8 @@ fn main() {
             stamps,
             admin_token,
             adopt,
+            rate_limit,
+            rate_burst,
             no_batch_verify,
             threads,
             unsafe_memory_store,
@@ -137,6 +149,8 @@ fn main() {
             stamps,
             admin_token,
             adopt,
+            rate_limit,
+            rate_burst,
             batch: !no_batch_verify,
             threads,
             memory: unsafe_memory_store,
@@ -164,6 +178,9 @@ fn genesis(name: &str, keys: &[String], out: &str) -> Result<(), String> {
     uniq.dedup();
     if pks.is_empty() || uniq.len() != pks.len() {
         return Err("witness list must be non-empty and unique".into());
+    }
+    if pks.len() > MAX_WITNESSES {
+        return Err(format!("a charter names at most {MAX_WITNESSES} witnesses"));
     }
     let body = obj([
         ("name", Json::str(name)),
@@ -198,6 +215,8 @@ struct RunArgs {
     stamps: bool,
     admin_token: Option<String>,
     adopt: bool,
+    rate_limit: Option<f64>,
+    rate_burst: u32,
     batch: bool,
     threads: Option<usize>,
     memory: bool,
@@ -224,6 +243,10 @@ fn run(a: RunArgs) -> Result<(), String> {
     }
     w.batch_verify = a.batch;
     let w = Arc::new(w);
+    // Admission control (docs/WIRE.md): on by default unless we only listen on loopback.
+    let rate = a.rate_limit.unwrap_or(if ratelimit::is_loopback(host) { 0.0 } else { ratelimit::DEFAULT_RATE });
+    let limiter = if rate > 0.0 { Some(Arc::new(ratelimit::RateLimiter::new(rate, a.rate_burst)?)) } else { None };
+    let per_client = limiter.is_some().then_some(ratelimit::MAX_CLIENT_CONNECTIONS);
 
     let mut rt = tokio::runtime::Builder::new_multi_thread();
     if let Some(n) = a.threads {
@@ -240,9 +263,7 @@ fn run(a: RunArgs) -> Result<(), String> {
             _ => println!("witness {} awaiting ADOPT into {} listening on http://{}:{}", short(&w.pk), short(cid), addr.ip(), addr.port()),
         }
         let _ = std::io::stdout().flush();
-        axum::serve(listener, server::router_with_admin(w.clone(), token))
-            .tcp_nodelay(true)
-            .with_graceful_shutdown(shutdown_signal())
+        server::serve(listener, server::router_with_limits(w.clone(), token, limiter), per_client, shutdown_signal())
             .await
             .map_err(|e| e.to_string())
     })?;
