@@ -26,6 +26,44 @@ pub fn constellation_id(genesis_body: &Json) -> String {
     digest("constellation", genesis_body)
 }
 
+/// A charter's successor committee (SPEC §3.7, §5.5): the authority over the next version.
+#[derive(Debug, Clone)]
+pub struct Successor {
+    /// The committee's keys as written (non-empty, distinct).
+    pub committee: Vec<String>,
+    /// The dead-man period in seconds (positive).
+    pub dead_man: i128,
+}
+
+impl Successor {
+    /// `charter.valid_successor`: exactly `{committee, dead_man}`, a non-empty list of distinct
+    /// strings and a positive integer (booleans are not integers).
+    fn parse(v: &Json) -> Result<Successor, String> {
+        let bad = || "malformed successor clause".to_string();
+        let m = v.as_obj().ok_or_else(bad)?;
+        if m.len() != 2 {
+            return Err(bad());
+        }
+        let c = m.get("committee").and_then(Json::as_arr).ok_or_else(bad)?;
+        let dead_man = m.get("dead_man").and_then(Json::as_int).filter(|d| *d > 0).ok_or_else(bad)?;
+        let mut committee = Vec::with_capacity(c.len());
+        for k in c {
+            committee.push(k.as_str().ok_or_else(bad)?.to_string());
+        }
+        let mut unique: Vec<&str> = committee.iter().map(String::as_str).collect();
+        unique.sort_unstable();
+        unique.dedup();
+        if committee.is_empty() || unique.len() != committee.len() {
+            return Err(bad());
+        }
+        Ok(Successor { committee, dead_man })
+    }
+
+    pub fn is_member(&self, pk: &str) -> bool {
+        self.committee.iter().any(|k| k == pk)
+    }
+}
+
 /// One verified charter version.
 #[derive(Debug, Clone)]
 pub struct Charter {
@@ -35,6 +73,8 @@ pub struct Charter {
     pub witnesses: Vec<String>,
     /// Decoded member keys (members whose key does not decode can never sign anything).
     pub keys: HashMap<String, VerifyingKey>,
+    /// The successor committee, if the charter names one (SPEC §5.5).
+    pub successor: Option<Successor>,
 }
 
 impl Charter {
@@ -51,12 +91,25 @@ impl Charter {
         if witnesses.is_empty() || unique.len() != witnesses.len() {
             return Err("charter witnesses must be non-empty and unique".into());
         }
+        let successor = match body.get("successor") {
+            None => None,
+            Some(s) => Some(Successor::parse(s)?),
+        };
         let keys = witnesses.iter().filter_map(|w| decode_pk(w).map(|k| (w.clone(), k))).collect();
-        Ok(Charter { body: body.clone(), version, witnesses, keys })
+        Ok(Charter { body: body.clone(), version, witnesses, keys, successor })
     }
 
     pub fn is_member(&self, pk: &str) -> bool {
         self.witnesses.iter().any(|w| w == pk)
+    }
+
+    /// Whose quorum must sign the next version: the successor committee if there is one,
+    /// else the witnesses (SPEC §3.7).
+    pub fn authority(&self) -> &[String] {
+        match &self.successor {
+            Some(s) => &s.committee,
+            None => &self.witnesses,
+        }
     }
 }
 
@@ -82,9 +135,11 @@ pub fn verify_chain(cid: &str, chain: &[Json]) -> Result<Vec<Charter>, String> {
             return Err("charter does not extend its predecessor".into());
         }
         let prev = out.last().expect("non-empty");
-        let mut members: Vec<&str> = prev.witnesses.iter().map(String::as_str).collect();
+        // The previous version's authority: its committee if it names one (a rotation or a
+        // succession of it alike), else its witnesses (SPEC §3.7, §5.5).
+        let mut members: Vec<&str> = prev.authority().iter().map(String::as_str).collect();
         members.sort_unstable();
-        members.dedup(); // Python: set(pb["witnesses"])
+        members.dedup(); // Python: set(authority(pb))
         let sigs = pair[1].get("sigs").and_then(Json::as_obj).ok_or("charter sigs must be an object")?;
         let signers = sigs
             .iter()
