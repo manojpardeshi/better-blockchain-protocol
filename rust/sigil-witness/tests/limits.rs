@@ -161,12 +161,13 @@ fn adopt_keeps_each_evidence_entry_once() {
         (0..3 * MAX_GEN).map(|i| obj([("kind", "bind".into()), ("gen", Json::Int(i)), ("auth", Json::Null)])).collect();
     three.push(Json::Obj([(fs.clone(), Json::Arr(junk))].into_iter().collect()));
     a.adopt(&Json::str(&cid), &Json::Int(1), &three).0.unwrap();
-    // One bind entry (identical in every snapshot) and the three signers' own votes.
+    // One bind entry (identical in every snapshot); the signers' own votes are not kept in the
+    // log (only an adopter's own votes matter, and a re-used key brings its own).
     let log = a.record(&s).unwrap().log;
-    assert_eq!(log.len(), 4, "{}", Json::Arr(log.clone()).canonical_string());
-    // The junk never counts, and the generation cap reads the record: the owner can spend.
+    assert_eq!(log.len(), 1, "{}", Json::Arr(log.clone()).canonical_string());
+    // The junk is dropped, and the generation cap reads the record: the owner can spend.
     let r = a.record(&fs).unwrap();
-    assert_eq!((r.log.len() as i128, r.gen), (3 * MAX_GEN, 0));
+    assert_eq!((r.log.len(), r.gen), (0, 0));
     assert!(a.spend(&fresh).0.is_ok());
 }
 

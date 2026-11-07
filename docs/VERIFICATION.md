@@ -226,6 +226,16 @@ not allow. It now creates no vote until it knows its charter (Python and Rust,
 `test_a_witness_without_its_own_charter_votes_on_nothing` and
 `without_its_own_charter_nothing_is_voted_or_signed`).
 
+**Code that stores less than the model.** ADOPT keeps in the new record's log
+only verified bind entries and the verified releases and seals of transactions
+bound in the evidence (SPEC §5.4). The proved spec keeps every entry it
+models, so the code may forward fewer releases or seals than the model. Every
+such entry was either unverifiable (never modelled) or about a transaction no
+binding in that evidence names, which no decision at that ADOPT reads; at a
+later ADOPT its absence is what the model produces when the Byzantine member
+that supplied it omits it, a run the proofs cover. The code therefore still
+refines the proved specs (rotation and succession).
+
 ---
 
 ## 2. What is model-checked exhaustively (TLC)

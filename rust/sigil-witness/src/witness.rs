@@ -784,7 +784,12 @@ impl Witness {
                     }
                 }
             }
-            for e in &log {
+            // Which entries the new record keeps: verified binds, and verified releases and seals
+            // of transactions bound in this evidence (witness.py adopt).
+            let mut keep = vec![false; log.len()];
+            let mut releases: Vec<(usize, String)> = Vec::new();
+            let mut seals: Vec<(usize, (i128, String))> = Vec::new();
+            for (i, e) in log.iter().enumerate() {
                 match e.get("kind").and_then(Json::as_str) {
                     Some("vote") => {
                         let Some(v) = e.get("vote") else { continue };
@@ -800,6 +805,7 @@ impl Witness {
                         // A non-object unlock (`Err`) is never bound by an honest witness.
                         if let Ok(Some(b)) = authorises(&sigil_j, &auth, None, batch) {
                             binds.insert(b, auth.get("header").cloned().unwrap_or(Json::Null));
+                            keep[i] = true;
                         }
                     }
                     Some("seal") => {
@@ -810,6 +816,7 @@ impl Witness {
                         {
                             if let (Some(g), Some(t)) = (sl.get("gen").and_then(Json::as_int), sl.get("tid").and_then(Json::as_str)) {
                                 sealed.insert((g, t.to_string()));
+                                seals.push((i, (g, t.to_string())));
                             }
                         }
                     }
@@ -819,6 +826,7 @@ impl Witness {
                         let Some(t) = e.get("tid").and_then(Json::as_str) else { continue };
                         if transition_id(h) == t && proves_dead(h, t, e.get("proof").unwrap_or(&null), &registry, batch) {
                             dead.insert(t.to_string());
+                            releases.push((i, t.to_string()));
                         }
                     }
                     _ => {}
@@ -828,6 +836,20 @@ impl Witness {
             // A death proof is a timeless fact about a transition, so it retires that binding
             // wherever it was reported.
             let alive: Vec<&((i128, String), Json)> = binds.items.iter().filter(|((_, t), _)| !dead.contains(t)).collect();
+            // Releases and seals only ever bear on bound transactions, and an honest witness logs
+            // one only for a transaction it bound: those of unbound transactions are junk.
+            let bound: HashSet<&String> = binds.items.iter().map(|((_, t), _)| t).collect();
+            for (i, t) in &releases {
+                if bound.contains(t) {
+                    keep[*i] = true;
+                }
+            }
+            for (i, b) in &seals {
+                if binds.items.iter().any(|(k, _)| k == b) {
+                    keep[*i] = true;
+                }
+            }
+            let log: Vec<Json> = log.into_iter().zip(keep).filter_map(|(e, k)| k.then_some(e)).collect();
             let mut rec = Record { gen: floor, log, votes: own.items.iter().map(|(_, v)| v.clone()).collect(), ..Default::default() };
             // Two tids bound at one generation mean the owner equivocated there, and the log
             // cannot show which one (if either) a quorum sealed. So a lone live binding is

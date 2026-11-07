@@ -395,6 +395,13 @@ class Witness:
         wire, ``/v0/adopt``), so malformed parts are skipped like any other
         unverifiable evidence: a snapshot that is not an object, a log that
         is not a list, and log entries that are not objects.
+
+        The new record's log keeps only the evidence that verified and bears
+        on a binding: bind entries with a valid authorisation, and release and
+        seal entries that verify for a transaction bound in this evidence.
+        Everything else (junk, other keys' votes, releases of transactions
+        nobody bound) is dropped, so a Byzantine predecessor cannot pad a
+        sigil's log for every later version.
         """
         self._check_member(cid, version)
         records: dict[str, Record] = {}
@@ -423,6 +430,9 @@ class Witness:
             floor = 0                       # lowest generation still usable
             prior = self.records.get(sigil)
             own = {(v["gen"], v["tid"]): v for v in (prior.votes if prior else [])}  # votes our key cast
+            kept_binds: list = []           # verified entries, in log order
+            releases: list = []             # (tid, entry) whose death proof verified
+            seals: list = []                # ((gen, tid), entry) whose seal verified
             for e in log:
                 if e.get("kind") == "vote":
                     v = e.get("vote")
@@ -436,12 +446,14 @@ class Witness:
                     b = authorises(sigil, e.get("auth", {}))
                     if b is not None:
                         binds[b] = e["auth"]["header"]
+                        kept_binds.append(e)
                 elif e.get("kind") == "seal":
                     sl = e.get("seal")
                     try:
                         if (sl["sigil"] == sigil and sl["constellation"] == cid
                                 and verify_seal(sl, self.registry)):
                             sealed.add((sl["gen"], sl["tid"]))
+                            seals.append(((sl["gen"], sl["tid"]), e))
                     except (KeyError, TypeError):
                         pass
                 elif e.get("kind") == "release":
@@ -449,6 +461,7 @@ class Witness:
                     try:
                         if transition_id(h) == t and proves_dead(h, t, e.get("proof"), self.registry):
                             dead.add(t)
+                            releases.append((t, e))
                     except (KeyError, TypeError, ValueError):
                         pass
             for (g, t) in binds:
@@ -456,7 +469,14 @@ class Witness:
             # A death proof is a timeless fact about a transition, so it
             # retires that binding wherever it was reported.
             alive = {(g, t): h for (g, t), h in binds.items() if t not in dead}
-            rec = Record(gen=floor, log=log, votes=list(own.values()))
+            # Releases and seals only ever bear on bound transactions (they mark
+            # them dead or settled), and an honest witness logs one only for a
+            # transaction it bound, so those of unbound transactions are junk.
+            bound_tids = {t for (_g, t) in binds}
+            useful = {id(e) for e in kept_binds}
+            useful |= {id(e) for t, e in releases if t in bound_tids}
+            useful |= {id(e) for b, e in seals if b in binds}
+            rec = Record(gen=floor, log=[e for e in log if id(e) in useful], votes=list(own.values()))
             # A lone live binding (g, t) is inherited only if it is the top of
             # the evidence: every other binding, dead or alive, is at a LOWER
             # generation, and our own key never voted above g. Otherwise the log

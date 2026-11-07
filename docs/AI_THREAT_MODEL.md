@@ -357,7 +357,11 @@ verdicts from the golden vectors):
   handles calls one at a time but parses concurrently; neither caps concurrent
   parses separately.
 * **Admin calls** are exempt from the rate limit (an operator token is needed for
-  anything but a cheap refusal), and an authorised ADOPT may send 256 MiB.
+  anything but a cheap refusal), and an authorised ADOPT may send 256 MiB. What
+  ADOPT *stores* is bounded by the evidence that verifies: it keeps only verified
+  binds and the verified releases and seals of bound transactions (SPEC §5.4), so
+  a Byzantine member of a freezing quorum can no longer pad a sigil's log for
+  every later version (`tests/test_adopt_evidence.py`).
 
 **Mitigation:**
 * ~~**P1:** stamps (or PoW) default-on for open witnesses~~ **done** as a default
