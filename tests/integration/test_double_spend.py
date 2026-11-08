@@ -7,6 +7,7 @@ the first vote, the second spend never seals, and holders reject it.
 import json
 import shutil
 import threading
+import unittest
 
 from sigil import model, wallet_store
 from sigil.proofs import verify_vote
@@ -128,3 +129,40 @@ class DoubleSpendTests(IntegrationCase):
         # The parcels mallory's wallet still lists: those a race sealed are gone at the witnesses.
         self.check_invariants({"mallory": mallory, "bob": bob, "carol": carol}, headers=headers,
                               stale={"mallory": stale})
+
+    @unittest.expectedFailure
+    def test_replayed_payment_rejected_while_home_mostly_unreachable(self):
+        """BUG (wallet receive, high for merchants: double credit): a payment the payee already
+        received *and spent* is credited again when most of its home's witnesses do not answer.
+
+        Scenario: alice pays bob with a parcel homed in B; bob receives it (CLI) and spends it
+        to carol. Later three of B's four witnesses are unreachable from bob (crash, partition,
+        or a network attacker between bob and B), and alice hands bob the same old payment file
+        again as payment for something else. ``Wallet.receive`` verifies the dossier (valid),
+        the address (bob issued it), that bob holds no parcel with that sigil (he spent it),
+        and that "at most f witnesses report a binding" -- but it counts only the witnesses
+        that answered, and one answering witness reporting the binding is <= f = 1. The CLI
+        prints ``received`` and ``balance`` shows 30 more, backed by a consumed parcel that
+        can never be spent. (With all four unreachable the check is vacuous.)
+
+        Suggested fix: fail closed in ``Wallet.receive``: require STATUS answers from at least
+        a quorum (n - f) of the home's current members, none of them reporting a binding, else
+        raise "cannot confirm the parcel is unspent" (retryable); and refuse a parcel whose
+        sigil is an input of a transition in the wallet's own dossier (bob's own spend proves
+        it consumed without asking anyone).
+        """
+        c = self.c
+        B, b_idx = c.constellation("lyra", ["python", "rust", "rust", "python"])
+        self.write_directory(c.directory())
+        self.cli("alice", "init", "--home", self.X)
+        self.cli("bob", "init", "--home", B)
+        self.cli("carol", "init", "--home", self.X)
+        usd = self.cli("alice", "issue", "USD", "100")["asset"]
+        pay1, _ = self.cli_pay("alice", "bob", usd, 30)                 # homed in B
+        self.cli("bob", "receive", pay1)
+        pay2, _ = self.cli_pay("bob", "carol", usd, 30)                 # bob spends it
+        self.cli("carol", "receive", pay2)
+        self.assertEqual(self.cli("bob", "receive", pay1, ok=False)["error"], "InvalidDossier")  # B is up
+        for i in b_idx[1:]:
+            c.kill(i)
+        self.assertEqual(self.cli("bob", "receive", pay1, ok=False)["error"], "InvalidDossier")
