@@ -14,6 +14,9 @@ misbehaves per request, choosing among the enabled ``--modes`` with a seeded RNG
   status is expected, a vote with a bad signature or for another tid, a reply of
   ``--oversize`` bytes, a stalled reply.
 * ``silent``: accepts the connection and never answers.
+* ``badstatus``: every STATUS reply is ``{"gen": 0, "tid": null, "votes": [0]}`` (deterministic).
+* ``always``: never fall back to honest behaviour (by default a quarter of the requests are
+  answered honestly, so a Byzantine member mostly looks alive).
 
 With no applicable mode a request is answered like an honest witness would (an in-memory
 ``Witness``), so a Byzantine member mostly looks alive. Its store is never written: a
@@ -48,7 +51,7 @@ class Byzantine:
         """One of ``wanted`` that is enabled (or None for honest behaviour), at random."""
         live = [m for m in wanted if m in self.modes]
         with self.lock:
-            if not live or self.rng.random() < 0.25:
+            if not live or ("always" not in self.modes and self.rng.random() < 0.25):
                 return None
             return self.rng.choice(live)
 
@@ -102,6 +105,8 @@ class Byzantine:
             return "json", (200, {"ok": v})
 
     def status(self, sigil: str):
+        if "badstatus" in self.modes:  # deterministic: a vote list holding a non-object
+            return "json", (200, {"ok": {"gen": 0, "tid": None, "votes": [0]}})
         mode = self.pick("lie", "garbage", "silent")
         if mode == "silent":
             return "silent", None

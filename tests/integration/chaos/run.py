@@ -100,6 +100,8 @@ class Config:
         n_const = r.choice([2, 2, 3])
         sizes = [r.choice([4, 4, 5, 7]) for _ in range(n_const)]
         cfg = cls(seed=seed, sizes=sizes, kinds=r.choice(["mixed", "mixed", "mixed", "rust", "python"]),
+                  byz_modes=r.choice(["equivocate,lie,withhold", "equivocate,lie,withhold",
+                                      "equivocate,lie,withhold,garbage"]),
                   committee=r.random() < 0.7, rotation=r.random() < 0.6, succession=r.random() < 0.5,
                   skew=r.choice(["none", "within", "within", "beyond_f"]),
                   byz=r.choice([0, 0, 1]), byz_other=r.choice([0, 0, 1]),
@@ -108,8 +110,6 @@ class Config:
         cfg.succession = cfg.succession and cfg.committee
         for k, v in over.items():
             setattr(cfg, k, v)
-        if cfg.byz > faults(cfg.sizes[0]) and "beyond" not in str(over.get("note", "")):
-            pass  # beyond-f runs are allowed (non-vacuity); the result says so
         return cfg
 
 
@@ -164,9 +164,25 @@ class ChaosRun:
         frames = [f for f in tb if "/sigil/" in f.filename] or tb
         loc = f"{os.path.relpath(frames[-1].filename)}:{frames[-1].lineno} in {frames[-1].name}" if frames else "?"
         key = f"{type(exc).__name__} at {loc}"
-        self.anomalies.append({"op": where, "key": key, "error": repr(exc)[:300],
-                               "trace": "".join(traceback.format_exception(exc))[-2500:]})
+        for a in self.anomalies:
+            if a["key"] == key:
+                a["count"] += 1
+                a["ops"] = sorted(set(a["ops"]) | {where})
+                return
+        self.anomalies.append({"key": key, "count": 1, "ops": [where], "error": repr(exc)[:300],
+                               "trace": "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))[-3000:]})
         self.log(f"ANOMALY in {where}: {key}: {exc!r}"[:300])
+
+    def _safe(self, where: str, fn, *args, default=None):
+        """Call wallet code that must not take the harness down: expected refusals give
+        ``default``, anything else is recorded as an anomaly."""
+        try:
+            return fn(*args)
+        except EXPECTED:
+            return default
+        except Exception as e:  # noqa: BLE001
+            self.anomaly(where, e)
+            return default
 
     # ------------------------------------------------------------ setup
 
@@ -225,7 +241,7 @@ class ChaosRun:
         self.mal_asset = self.mallory.issue("MAL", 64)
         self.mal_coins = 8
         # split mallory's coin into small parcels to double-spend later (no faults yet)
-        self._split_mallory()
+        self._safe("setup", self._split_mallory)
         self.log(f"setup: sizes={cfg.sizes} kinds={[w['kind'] for w in c.witnesses]} "
                  f"committee={bool(self.committees)} byz={len(self.byz_idx)}")
 
@@ -327,6 +343,10 @@ class ChaosRun:
         try:
             payee.receive(payer.dossier.ancestry([tid]), refs)
             return True
+        except (TypeError, KeyError, AttributeError, IndexError) as e:
+            self.anomaly("receive", e)
+            self.undelivered.append((payer.name, payee.name, tid, refs))
+            return False
         except InvalidDossier as e:
             if "already used" in str(e):
                 return True
@@ -495,9 +515,14 @@ class ChaosRun:
             return f"sealed-{len(sealed)}"
 
     def op_delayed_expiry(self, r: random.Random) -> str:
-        """SPEC §4 rule 3: the spend is held in flight past expiry, then delivered late."""
         names = [n for n in self.wallets]
-        a, b, c2 = (r.sample(names, 3) + names)[:3]
+        a, b, c2 = r.sample(names, 3)
+        return self.delayed_expiry(a, b, c2, r)
+
+    def delayed_expiry(self, a: str, b: str, c2: str, r: random.Random) -> str:
+        """SPEC §4 rule 3: ``a``'s payment to ``b`` is held in flight past its expiry; ``a``
+        releases the pledge and pays ``c2`` instead; the held requests reach the witnesses
+        right after the release, before the new payment."""
         payer, p1, p2 = self.wallets[a], self.wallets[b], self.wallets[c2]
         with self._locked(a, b, c2):
             payer.release_expired_pledges()
@@ -951,7 +976,7 @@ class ChaosRun:
         while time.monotonic() < deadline:
             busy = False
             for name, w in self.wallets.items():
-                w.release_expired_pledges()
+                self._safe("settle", w.release_expired_pledges)
                 self._deliver_completed(w)
                 if self._live_pledges(w):
                     busy = True
@@ -959,7 +984,7 @@ class ChaosRun:
             for payer, payee, tid, refs in todo:
                 if not self._deliver(self.wallets[payer], self.wallets[payee], tid, refs):
                     busy = True
-            self._settle_swaps()
+            self._safe("settle-swaps", self._settle_swaps)
             if not busy:
                 break
             time.sleep(1.0)
@@ -985,11 +1010,13 @@ class ChaosRun:
                     ok = self._deliver(w, to, tid, [model.ref(tid, 0)])
                 except EXPECTED as e:
                     err = repr(e)
-                    w.release_expired_pledges()
+                    self._safe("final-payment", w.release_expired_pledges)
                     time.sleep(1)
                 except Exception as e:  # noqa: BLE001
+                    err = repr(e)
                     self.anomaly("final-payment", e)
-                    break
+                    self._safe("final-payment", w.release_expired_pledges)
+                    time.sleep(1)
             self.ops["final-payment:" + ("ok" if ok else "failed")] += 1
             if not ok:
                 self.liveness.append({"kind": "final-payment-failed", "wallet": name, "error": err})

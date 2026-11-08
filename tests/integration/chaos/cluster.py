@@ -31,7 +31,7 @@ from .proxy import FaultProxy
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(HERE)))
 sys.path.insert(0, os.path.join(ROOT, "bench"))
-from common import RUST_BIN, Cluster  # noqa: E402
+from common import RUST_BIN, Cluster, free_port  # noqa: E402
 
 TOKEN = "chaos-admin-token"
 
@@ -86,17 +86,50 @@ class ChaosCluster(Cluster):
 
     # ------------------------------------------------------------ addressing
 
+    def _taken(self) -> set:
+        return {w["port"] for w in self.witnesses} | {p.port for p in self.all_proxies()}
+
+    def _fix_ports(self) -> None:
+        """``free_port`` only says a port is free *now*: a later proxy, or a process that is down
+        at the moment, may hold it. Give every process a port no other process or proxy uses."""
+        with self.lock:
+            used = {p.port for p in self.all_proxies()}
+            for w in self.witnesses:
+                while w["port"] in used:
+                    w["port"] = free_port(self.host)
+                used.add(w["port"])
+
+    def create(self, *a, **kw):
+        cid = super().create(*a, **kw)
+        self._fix_ports()
+        return cid
+
+    def add_members(self, *a, **kw):
+        out = super().add_members(*a, **kw)
+        self._fix_ports()
+        return out
+
+    def add_standbys(self, *a, **kw):
+        out = super().add_standbys(*a, **kw)
+        self._fix_ports()
+        return out
+
+    def _new_proxy(self, name: str, i: int, seed: int) -> FaultProxy:
+        while True:
+            p = FaultProxy(name, (self.host, self.witnesses[i]["port"]), self.observer, seed,
+                           client_timeout=self.client_timeout)
+            if p.port not in self._taken():
+                return p
+            p.stop()
+
     def _ensure_proxies(self, i: int) -> None:
         with self.lock:
             if i in self.proxies:
                 return
             w = self.witnesses[i]
-            p = FaultProxy(w["name"], (self.host, w["port"]), self.observer, self.seed * 1009 + i,
-                           client_timeout=self.client_timeout)
-            self.proxies[i] = p
+            self.proxies[i] = self._new_proxy(w["name"], i, self.seed * 1009 + i)
             if w.get("role") != "standby":
-                self.probes[i] = FaultProxy(w["name"] + "/probe", (self.host, w["port"]), self.observer,
-                                            self.seed * 2003 + i, client_timeout=self.client_timeout)
+                self.probes[i] = self._new_proxy(w["name"] + "/probe", i, self.seed * 2003 + i)
 
     def url(self, i: int) -> str:
         self._ensure_proxies(i)
