@@ -61,7 +61,7 @@ common = _load_bench_common()
 Cluster, free_port, manual_spend, RUST_BIN = common.Cluster, common.free_port, common.manual_spend, common.RUST_BIN
 
 from sigil import model, wallet_store  # noqa: E402
-from sigil.charter import Registry, faults  # noqa: E402
+from sigil.charter import Registry  # noqa: E402
 from sigil.locks import keys_in  # noqa: E402
 from sigil.proofs import verify_seal, verify_vote  # noqa: E402
 from sigil.server import RemoteNetwork, RemoteWitness, Unreachable  # noqa: E402

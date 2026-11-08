@@ -7,7 +7,6 @@ abusive client is played from 127.0.0.2, the honest wallets from 127.0.0.1.
 
 import http.client
 import json
-import signal
 import threading
 import unittest
 import urllib.parse
