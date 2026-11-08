@@ -97,3 +97,40 @@ jobs:
         run: PYTHONPATH=. python rust/sigil-witness/tests/gen_vectors.py | cmp - rust/sigil-witness/tests/vectors.json
       - name: Interop (Python wallet against Rust witness processes)
         run: python bench/interop.py
+
+  integration:
+    # Soak (short) and compatibility integration tests: Rust and Python witness processes,
+    # wire twins generated from docs/WIRE.md, store and wallet formats, daemon operability
+    # (tests/integration/__init__.py lists the knobs). A long soak, locally:
+    #   SIGIL_SOAK_SECONDS=1800 python -m unittest tests.integration.test_soak
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/target
+          key: cargo-${{ runner.os }}-${{ hashFiles('rust/Cargo.lock') }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install cryptography
+      - run: cargo build --release --locked --manifest-path rust/Cargo.toml
+      - name: Soak (3 minutes) and compatibility
+        env:
+          SIGIL_SOAK_SECONDS: "180"
+          SIGIL_SOAK_OUT: soak.json
+          SIGIL_WIRE_OUT: wire.json
+        run: python -m unittest discover -s tests/integration -t . -v
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: integration-numbers
+          path: |
+            soak.json
+            wire.json
+          if-no-files-found: ignore

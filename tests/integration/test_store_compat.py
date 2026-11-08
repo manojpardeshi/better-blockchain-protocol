@@ -157,6 +157,63 @@ class RustRestartTests(RestartIdentityMixin, unittest.TestCase):
     KIND = "rust"
 
 
+class StandbyRestartTests(unittest.TestCase):
+    """A standby member's store (mirror logs, standby and fence state) survives restarts:
+    the same acks, byte for byte, and the fence, for both implementations."""
+
+    def test_standby_restart_identical(self):
+        kinds = ["python"] + (["rust"] if rust_available() else [])
+        d = make_tmpdir(self, "standby-restart")
+        token, tfile = write_token(d)
+        c = new_constellation(d, "heir", 4, committee=4, dead_man=60)
+        os.makedirs(os.path.join(d, "logs"))
+        cid = c["cid"]
+        mkeys = [load_key(k) for k in c["keys"]]
+        owner = KeyPair.from_seed(b"\x09" * 32)
+        exp = int(time.time()) + 3600
+        reqs = []
+        for i in range(5):
+            p = model.parcel(cid, "x", 1, locks.sig(owner.pk), f"{i:032x}")
+            s = model.sigil_of(p)
+            h = {"inputs": [[s, 0]], "body": f"{i:x}" * 64}
+            u = locks.empty_unlock(exp)
+            u["sigs"][owner.pk] = locks.sign_unlock(owner, s, model.transition_id(h), exp)
+            reqs.append({"sigil": s, "header": h, "home": cid, "lock": p["lock"], "salt": p["salt"], "unlock": u,
+                         "version": 0})
+        with open(c["registry"]) as f:
+            cur = json.load(f)[cid][0]["body"]
+        nxt = charter_body(cur["name"], 1, [k.pk for k in mkeys], charter_hash(cur))
+        sigs = {k.pk: k.sign("charter", nxt) for k in mkeys[:3]}
+        tok = {"Authorization": f"Bearer {token}"}
+        for n, kind in enumerate(kinds):
+            for fence in (False, True):
+                with self.subTest(kind=kind, fenced=fence):
+                    ext = "redb" if kind == "rust" else "db"
+                    store = os.path.join(d, f"sb-{kind}-{fence}.{ext}")
+                    dmn = Daemon(kind, c["committee"][n + 2 * fence], c["registry"], cid, store, store + ".log",
+                                 role="standby", args=["--admin-token", tfile]).start()
+                    self.addCleanup(dmn.stop, signal.SIGKILL)
+                    acks = [http(dmn.url, "/v0/mirror", {"request": r})[1]["ok"] for r in reqs[:4]]
+                    if fence:
+                        self.assertEqual(http(dmn.url, "/v0/succeed", {"charter": nxt, "sigs": sigs}, headers=tok)[0], 200)
+                    before = (http(dmn.url, "/v0/info")[1], http(dmn.url, "/v0/succeed", {"charter": nxt, "sigs": sigs},
+                                                                    headers=tok)[1] if fence else None)
+                    for sig in (signal.SIGTERM, signal.SIGKILL):
+                        self.assertEqual(dmn.stop(sig), 0 if sig == signal.SIGTERM else -signal.SIGKILL)
+                        dmn.start()
+                        after = (http(dmn.url, "/v0/info")[1], http(dmn.url, "/v0/succeed", {"charter": nxt, "sigs": sigs},
+                                                                       headers=tok)[1] if fence else None)
+                        self.assertEqual(after, before)
+                        for r, a in zip(reqs, acks):
+                            code, body, _ = http(dmn.url, "/v0/mirror", {"request": r})
+                            if fence:
+                                self.assertEqual((code, body["message"]),
+                                                 (403, "fenced: this member signed a successor of the version"))
+                            else:
+                                self.assertEqual(body["ok"], a, "same ack, byte for byte")
+                    dmn.stop()
+
+
 # ------------------------------------------------------------------ legacy stores
 
 def legacy_entries(d: str) -> dict:

@@ -12,7 +12,12 @@ directory (or ``SIGIL_INTEGRATION=1`` is set). Environment variables:
 * ``SIGIL_SOAK_SECONDS``  soak duration (default 180; e.g. 1800-3600 for a long run)
 * ``SIGIL_SOAK_SAMPLE``   seconds between resource samples (default 10)
 * ``SIGIL_SOAK_ROTATE``   seconds between rotations (default 60; 0 disables)
+* ``SIGIL_SOAK_SERIES``   seconds between new asset series (default 120; bounds per-hop dossiers)
+* ``SIGIL_SOAK_SUCCESSION_AT``  when the dead-man takeover happens, as a fraction of the run
+  (default 0.5; negative disables)
+* ``SIGIL_SOAK_SEED``, ``SIGIL_SOAK_MAX_DISK`` (bytes, default 4 GiB), ``SIGIL_SOAK_VERBOSE``
 * ``SIGIL_SOAK_OUT``      write the soak's numbers (JSON) to this path
+* ``SIGIL_WIRE_OUT``      write the wire comparison (cases, differences) to this path
 * ``SIGIL_WITNESS_BIN``   the Rust witness binary (default rust/target/release/sigil-witness)
 * ``SIGIL_KEEP``          keep temp directories (for debugging)
 """
