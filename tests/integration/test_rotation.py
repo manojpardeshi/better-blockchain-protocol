@@ -7,7 +7,10 @@ paying across the rotation and deep-confirm history sealed by both versions.
 
 import os
 
-from sigil.server import RemoteNetwork, RemoteWitness
+from sigil import model
+from sigil.charter import taken_over, verify_chain
+from sigil.server import RemoteNetwork, RemoteStandby, RemoteWitness
+from sigil.wallet import Wallet, mirror_acks
 from tests.integration.harness import MIXED, IntegrationCase
 
 
@@ -81,6 +84,57 @@ class RotationTests(IntegrationCase):
         balances = {w: self.cli_balance(w, usd) for w in ("alice", "bob", "carol", "dave", "erin")}
         self.assertEqual(balances, {"alice": 720, "bob": 220, "carol": 5, "dave": 35, "erin": 20})
         self.check_invariants({w: self.load_wallet(w) for w in ("alice", "bob", "carol", "dave", "erin")})
+
+    def test_cooperative_rotation_of_a_home_with_a_committee(self):
+        """A rotation of a version with a successor committee: the members freeze and sign, the
+        committee co-signs (the authority over the successor), the new members adopt both the
+        members' and the committee's evidence, and a new committee stands by for version 1."""
+        c = self.c
+        S, old = c.constellation("heir", MIXED, committee=["rust", "python", "python", "rust"],
+                                 dead_man=86400, start=False)
+        ks = c.indices(S, role="standby")
+        c.start_all(old + ks)
+        committee = c.urls(ks)
+        net = self.net({S: c.urls(old)}, committees={S: committee})
+        alice, bob = Wallet("alice", net, S), Wallet("bob", net, S)
+        carol = Wallet("carol", net, S, deep_threshold=1)
+        usd = alice.issue("USD", 1000)
+        alice.pay(bob, usd, 100)
+        # A payment in flight during the rotation: mirrored, and voted by two members only.
+        header, body, _ = alice.prepare(*alice.payment_outputs(usd, 25, carol.address()))
+        unlocks = alice.authorise(header, body)
+        s = header["inputs"][0][0]
+        p = alice.dossier.output(body["inputs"][0])
+        req = {"sigil": s, "header": header, "home": S, "lock": p["lock"], "salt": p["salt"], "unlock": unlocks[s]}
+        req["mirror"] = mirror_acks(net, req)
+        for w in net.witnesses(S)[:2]:
+            w.spend(req)
+
+        new = c.add_members(S, ["python", "rust", "rust", "python"], c.admin())
+        nk = c.add_standbys(S, ["python", "rust", "python", "rust"], c.admin())
+        c.start_all(new + nk)
+        for i in new:
+            c.witnesses[i]["pending"] = False
+        self.assertEqual(net.rotate(S, c.urls(new), c.token, committee_urls=c.urls(nk), dead_man=86400), 1)
+        chain = net.registry.chain(S)
+        self.assertTrue(verify_chain(S, chain))
+        self.assertFalse(taken_over(chain, 0), "a cooperative rotation is not a takeover")
+        self.assertTrue(all(RemoteWitness(u)._get("info")["frozen"] for u in c.urls(old)))
+        self.assertTrue(all(RemoteStandby(u).info()["fenced"] for u in committee))
+        self.assertEqual({RemoteStandby(u).version for u in c.urls(nk)}, {1})
+
+        # The in-flight payment completes under version 1 (re-authorising the same tid), with
+        # acks from the new committee; history sealed by v0 is deep-confirmed against v1.
+        again = alice.authorise(header, body)
+        alice.seal(header, body, again)
+        tid = alice.finalise(header, body, again)
+        self.assertEqual(alice.dossier.seals[model.seal_key(s, tid)]["version"], 1)
+        carol.receive(alice.dossier.ancestry([tid]), [model.ref(tid, 0)])
+        bob.pay(carol, usd, 40)
+        alice.pay(bob, usd, 5)
+        self.assertEqual({w.name: w.balance(usd) for w in (alice, bob, carol)},
+                         {"alice": 870, "bob": 65, "carol": 65})
+        self.check_invariants({w.name: w for w in (alice, bob, carol)})
 
     def _new_members(self, cid: str, reuse: int) -> list:
         """Start four witnesses waiting for ADOPT; the first re-uses the key of witness ``reuse``."""
