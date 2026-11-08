@@ -194,9 +194,12 @@ class Constellations(Cluster):
 
 
 def require_rust() -> None:
+    """Skip without the Rust witness binary (fail instead if ``SIGIL_REQUIRE_RUST=1``, as in CI)."""
     if not os.path.exists(RUST_BIN):
-        raise unittest.SkipTest(f"Rust witness not built ({RUST_BIN}): "
-                                "cargo build --release --locked --manifest-path rust/Cargo.toml")
+        msg = f"Rust witness not built ({RUST_BIN}): cargo build --release --locked --manifest-path rust/Cargo.toml"
+        if os.environ.get("SIGIL_REQUIRE_RUST") == "1":
+            raise RuntimeError(msg)
+        raise unittest.SkipTest(msg)
 
 
 class IntegrationCase(unittest.TestCase):
