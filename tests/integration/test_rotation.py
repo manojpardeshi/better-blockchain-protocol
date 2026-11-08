@@ -10,8 +10,8 @@ import os
 from sigil import model
 from sigil.charter import taken_over, verify_chain
 from sigil.server import RemoteNetwork, RemoteStandby, RemoteWitness
-from sigil.wallet import Wallet, mirror_acks
-from tests.integration.harness import MIXED, IntegrationCase
+from sigil.wallet import SealFailed, Wallet, mirror_acks, request_seal
+from tests.integration.harness import MIXED, IntegrationCase, manual_spend
 
 
 class RotationTests(IntegrationCase):
@@ -135,6 +135,43 @@ class RotationTests(IntegrationCase):
         self.assertEqual({w.name: w.balance(usd) for w in (alice, bob, carol)},
                          {"alice": 870, "bob": 65, "carol": 65})
         self.check_invariants({w.name: w for w in (alice, bob, carol)})
+
+    def test_deep_confirmation_settles_a_contested_record_after_rotation(self):
+        """An owner bound two transitions of one parcel at different members (one sealed); after
+        a rotation the new members cannot tell which one sealed (SPEC §5.4: contested). A holder
+        paid with the sealed one deep-confirms, presenting its seal, which settles the record."""
+        c = self.c
+        R, old = c.constellation("rotor", MIXED)
+        net = self.net({R: c.urls(old)})
+        mallory, bob, carol = (Wallet(n, net, R) for n in ("mallory", "bob", "carol"))
+        dave = Wallet("dave", net, R, deep_threshold=1)
+        coin = mallory.issue("C", 5)
+        refs, _ = mallory.select(coin, 5)
+        b, cc = bob.address(), carol.address()
+        h1, b1, u1, r1 = manual_spend(mallory, refs, [model.parcel(R, coin, 5, b["lock"], b["salt"])])
+        h2, _b2, _u2, r2 = manual_spend(mallory, refs, [model.parcel(R, coin, 5, cc["lock"], cc["salt"])])
+        ws = net.witnesses(R)
+        seal1 = model.seal_from_votes([w.spend(r1[0]) for w in ws[:3]])   # T1 sealed by three members
+        ws[3].spend(r2[0])                                                # T2 bound at the fourth
+        tid1 = mallory.dossier.add_transition(h1, b1, u1)
+        mallory.dossier.add_seal(seal1)
+        bob.receive(mallory.dossier.ancestry([tid1]), [model.ref(tid1, 0)])
+
+        new = c.add_members(R, ["python", "rust", "rust", "python"], c.admin())
+        c.start_all(new)
+        for i in new:
+            c.witnesses[i]["pending"] = False
+        self.assertEqual(net.rotate(R, c.urls(new), c.token), 1)
+        s = r1[0]["sigil"]
+        self.assertEqual({w.status(s)["tid"] for w in net.witnesses(R)}, {"!contested"})
+        # bob pays dave; dave deep-confirms T1 and, finding the record contested, presents T1's
+        # seal: every new member (Rust and Python) settles on T1.
+        bob.pay(dave, coin, 3)
+        self.assertEqual({(w.status(s)["gen"], w.status(s)["tid"]) for w in net.witnesses(R)}, {(0, tid1)})
+        with self.assertRaises(SealFailed):
+            request_seal(net, r2[0])
+        self.check_invariants({w.name: w for w in (mallory, bob, carol, dave)}, headers=[h1, h2],
+                              stale={"mallory": 1})
 
     def _new_members(self, cid: str, reuse: int) -> list:
         """Start four witnesses waiting for ADOPT; the first re-uses the key of witness ``reuse``."""
