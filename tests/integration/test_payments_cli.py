@@ -5,6 +5,7 @@ travel between holders only as exported files.
 """
 
 import json
+import unittest
 
 from tests.integration.harness import MIXED, IntegrationCase, RemoteWitness
 
@@ -72,3 +73,27 @@ class CliPaymentTests(IntegrationCase):
         self.assertEqual(set(exported["charters"]), {A, B})
 
         self.check_invariants({w: self.load_wallet(w) for w in ("alice", "bob", "carol", "dave")})
+
+    @unittest.expectedFailure
+    def test_address_in_a_home_the_payee_does_not_trust_is_refused(self):
+        """BUG (CLI, low-medium: a typo burns the payer's money): ``address --home CID`` hands
+        out an address in any home, even one the wallet does not trust or that does not exist.
+
+        Scenario: bob runs ``address --home`` with a mistyped constellation id (or one added to
+        the directory after his ``init``, which his saved trust policy does not include; the CLI
+        has no command to trust it). alice pays that address: her own home's witnesses seal the
+        payment (nobody checks an output's home), and her balance drops. bob's ``receive``
+        rejects the parcel ("parcel lives in a constellation we do not trust"). For a home that
+        does not exist no witness will ever sign for the parcel, so the amount is gone for good;
+        for an untrusted one bob cannot accept it from the CLI.
+
+        Suggested fix: ``cmd_address`` (and ``Wallet.address``) should refuse a home the
+        wallet's trust policy does not trust (``policy.trusts(home)``: known charter and
+        trusted), with a CliError; optionally add a ``trust CID`` command for the owner's
+        explicit decision.
+        """
+        A, _ = self.c.constellation("orion", MIXED)
+        self.write_directory(self.c.directory())
+        self.cli("bob", "init", "--home", A)
+        typo = A[:-1] + ("0" if A[-1] != "0" else "1")
+        self.assertEqual(self.cli("bob", "address", "--home", typo, ok=False)["error"], "CliError")
