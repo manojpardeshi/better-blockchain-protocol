@@ -175,5 +175,41 @@ class LegacyWalletPreUpgradeAddress(unittest.TestCase):
         self.assertEqual(upgraded.balance(usd), 15)
 
 
+class KillSwitchDust(unittest.TestCase):
+    """Every atomic swap leaves each party a new, never-reused kill-switch parcel.
+
+    Scenario (found by the soak: wallet holdings and ``state.json`` grow with the number of
+    swaps): ``propose_swap`` calls ``Wallet.kill_switch()`` for both parties, which *issues a
+    new asset* ("kill-switch", supply 1) every time, adds its sigil to ``kill_switches``
+    forever, and the swap pays the unit back to a fresh address of the same party. That
+    returned parcel is never used as a kill switch again (``kill_switch`` always issues), and
+    no sigil is ever removed from ``kill_switches``. After N swaps a wallet holds N worthless
+    1-unit parcels of N different assets, N genesis transitions in its dossier and N entries in
+    ``kill_switches``, all saved on every ``wallet_store.save``.
+
+    Impact: low. Unbounded growth of wallet state and of the dossiers handed to swap
+    counter-parties, proportional to swaps made, not to value held; ``select`` and ``balance``
+    scan the dust on every call. Measured in the 180 s soak: 130-210 holdings per wallet.
+
+    Suggested fix: in ``kill_switch``, reuse an unpledged kill-switch parcel the wallet already
+    holds (the unit returned by an earlier swap) and only issue when there is none; drop sigils
+    from ``kill_switches`` once they are spent or no longer held.
+    """
+
+    @unittest.expectedFailure
+    def test_swaps_do_not_accumulate_kill_switch_parcels(self):
+        from sigil import Network
+        from sigil.swap import atomic_swap
+        net = Network()
+        X = net.create_constellation("x", n=4)
+        a, b = Wallet("a", net, X), Wallet("b", net, X)
+        usd, gold = a.issue("USD", 1000), b.issue("GOLD", 1000)
+        for _ in range(20):
+            atomic_swap(a, usd, 1, b, gold, 1)
+        dust = [h for h in a.holdings.values() if h["parcel"]["asset"] not in (usd, gold)]
+        self.assertLessEqual(len(dust), 2, f"{len(dust)} kill-switch parcels after 20 swaps")
+        self.assertLessEqual(len(a.kill_switches), 2)
+
+
 if __name__ == "__main__":
     unittest.main()
