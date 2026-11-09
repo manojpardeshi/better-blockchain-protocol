@@ -91,7 +91,8 @@ class Soak:
         self.stop_reader = threading.Event()
         self.rot_cycle = [["rust"] * 4, ["python"] * 4, ["rust", "python", "python", "rust"]]
         self.supply: dict = {}
-        self.fresh: list = []
+        self.fresh: dict = {}        # asset -> units held by fresh holders (dropped after receiving)
+        self.fresh_count = 0
 
     # ------------------------------------------------------------ setup
 
@@ -212,11 +213,13 @@ class Soak:
     def op_fresh_holder(self):
         src = self.rng.choice(self.holders())
         home = self.rng.choice([cid for cid in (self.R, self.P, self.M, self.H) if cid not in self.down])
-        f = Wallet(f"fresh{len(self.fresh)}", self.net, home)
+        f = Wallet(f"fresh{self.fresh_count}", self.net, home)
         asset = self.assets[self.rng.choice(list(self.assets))]
         if self.funded(src, asset, 1):
-            self.fresh.append(f)
+            self.fresh_count += 1
             self.pay(src, f, asset, 1, kind="fresh")
+            # Keep its balance, not the wallet (its dossier is the whole history of the coin).
+            self.fresh[asset] = self.fresh.get(asset, 0) + f.balance(asset)
 
     def op_save(self, reload: bool):
         name = self.rng.choice([n for n, w in self.wallets.items() if w.home not in self.down])
@@ -355,9 +358,8 @@ class Soak:
             f"client rss={me['rss'] / MIB:.0f}MiB")
 
     def check_conservation(self):
-        everyone = list(self.wallets.values()) + self.fresh
         for asset, supply in self.supply.items():
-            total = sum(w.balance(asset) for w in everyone)
+            total = sum(w.balance(asset) for w in self.wallets.values()) + self.fresh.get(asset, 0)
             if total != supply:
                 self.errors.append((self.t(), "conservation", f"{asset}: {total} != {supply}"))
 
