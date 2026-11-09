@@ -398,6 +398,34 @@ class Soak:
         finally:
             self.stop_reader.set()
             reader.join(10)
+        self.restart_check()
+
+    def restart_check(self):
+        """Restart one long-lived witness of each kind on its soaked store: same STATUS for the
+        sigils the wallets hold there, how long it takes, and its RSS before and after."""
+        self.restarts = {}
+        for kind, cid in (("rust", self.R), ("python", self.P)):
+            i = self.c.indices(cid)[0]
+            url = self.c.url(i)
+            sigils = sorted({h["sigil"] for w in self.wallets.values() for h in w.holdings.values()
+                             if h["parcel"]["home"] == cid})[:200]
+            for w in self.wallets.values():   # and spent ones: inputs sealed in cid
+                for tx in list(w.dossier.transitions.values())[-100:]:
+                    sigils += [s_ for s_, _ in tx["header"]["inputs"]]
+            before = {s_: http(url, "/v0/status", {"sigil": s_})[1]["ok"] for s_ in sigils}
+            rss_before = proc_stats(self.c.pid(i))["rss"]
+            self.c.kill(i, signal.SIGTERM)
+            t0 = time.monotonic()
+            self.c.start(i)
+            self.c.wait_ready(i, timeout=120)
+            ready = time.monotonic() - t0
+            time.sleep(1)
+            rss_after = proc_stats(self.c.pid(i))["rss"]
+            after = {s_: http(url, "/v0/status", {"sigil": s_})[1]["ok"] for s_ in sigils}
+            self.restarts[kind] = {"ready_s": round(ready, 2), "rss_before": rss_before, "rss_after_reload": rss_after,
+                                   "store": store_bytes(self.c.witnesses[i]["store"]), "sigils_checked": len(before),
+                                   "identical": before == after}
+            log(f"restart {kind}: {self.restarts[kind]}")
 
     # ------------------------------------------------------------ results
 
@@ -454,6 +482,7 @@ class Soak:
             "fresh_verify_per_tx": percentiles([h["verify"] / h["ntx"] for h in fresh]),
             "pack_per_tx": percentiles([h["pack"] / h["ntx"] for h in hops]),
             "events": self.events, "errors": self.errors, "third": third,
+            "restarts": getattr(self, "restarts", {}),
         }
 
 
@@ -475,6 +504,9 @@ class SoakTest(unittest.TestCase):
         log(json.dumps({k: s[k] for k in ("ops_total", "ops_per_s", "status_latency_windows", "seal_latency_windows",
                                            "hop_ntx_max", "hop_bytes_max", "disk_end")}, default=str))
         self.assertEqual(s["errors"], [], "operations failed or value was not conserved")
+        for kind, r in s["restarts"].items():
+            self.assertTrue(r["identical"], f"{kind}: STATUS changed across a restart on the soaked store: {r}")
+            self.assertLess(r["ready_s"], 60, r)
         self.assertGreater(s["ops_total"], DURATION / 10, "the workload hardly ran")
         if ROTATE > 0 and DURATION >= ROTATE * 1.5:
             self.assertTrue(any(e[1] == "rotation" for e in s["events"]))
