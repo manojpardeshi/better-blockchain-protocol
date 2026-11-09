@@ -581,7 +581,22 @@ class ChaosRun:
 
     # ------------------------------------------------------------ operator
 
+    def _gossip_registry(self) -> None:
+        """What an operator does after a rotation: every process learns the chains in the
+        registry file (gossip state is not persisted, so a process restarted between the
+        install and the registry update would otherwise not know its own version)."""
+        with open(self.c.registry) as f:
+            chains = json.load(f)
+        for i in range(len(self.c.witnesses)):
+            if i in self.c.retired or not self.c.alive(i):
+                continue
+            try:
+                RemoteWitness(self.c.real_url(i), 5).gossip({"charters": chains})
+            except Rejected:
+                pass
+
     def _publish(self, cid: str, urls: list, committee: list) -> None:
+        self._gossip_registry()
         with self.dir_lock:
             self.directory[cid] = list(urls)
             if committee:
@@ -968,6 +983,7 @@ class ChaosRun:
                 self.liveness.append({"kind": "restart-failed", "process": c.witnesses[i]["name"]})
         n = sum(p.deliver_held() for p in c.all_proxies())
         self.faults["held-delivered-at-heal"] += n
+        self._gossip_registry()
         self.log("healed")
 
     def settle(self) -> None:
@@ -1003,7 +1019,8 @@ class ChaosRun:
                 continue
             asset = sorted(assets)[0]
             ok, err = False, None
-            while time.monotonic() < deadline + 60 and not ok:
+            mine = max(deadline, time.monotonic()) + 30
+            while time.monotonic() < mine and not ok:
                 try:
                     refs, outputs = w.payment_outputs(asset, 1, to.address())
                     tid = self._transact(w, refs, outputs, to)
@@ -1019,7 +1036,9 @@ class ChaosRun:
                     time.sleep(1)
             self.ops["final-payment:" + ("ok" if ok else "failed")] += 1
             if not ok:
-                self.liveness.append({"kind": "final-payment-failed", "wallet": name, "error": err})
+                self.liveness.append({"kind": "final-payment-failed", "wallet": name, "error": err,
+                                      "pledges": [{"sigil": s, "gen": g, "tid": t, **self._diagnose(w, s, g, t)}
+                                                  for s, (g, t, _e) in self._live_pledges(w).items()]})
         # deliveries of the final payments
         todo, self.undelivered = self.undelivered, []
         for payer, payee, tid, refs in todo:
