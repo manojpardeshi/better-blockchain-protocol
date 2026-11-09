@@ -1273,7 +1273,9 @@ class ChaosRun:
         try:
             self.c.teardown()
         finally:
-            if not self.keep and not (self.violations and os.environ.get("SIGIL_CHAOS_KEEP_FAILED")):
+            failed = self.violations or self.anomalies or [x for x in self.liveness
+                                                          if not x["kind"].startswith("known:")]
+            if not self.keep and not (failed and os.environ.get("SIGIL_CHAOS_KEEP_FAILED")):
                 shutil.rmtree(self.tmp, ignore_errors=True)
 
 
