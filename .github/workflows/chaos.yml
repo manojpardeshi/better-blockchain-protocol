@@ -1,0 +1,50 @@
+name: chaos
+
+# Fault-injection integration tests (tests/integration/chaos): real Rust and Python witness
+# processes behind fault proxies, SIGKILLs, partitions, clock skew, full disks and Byzantine
+# processes. Too slow for every push, so they run nightly and on demand.
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      minutes:
+        description: "Long run: keep starting new seeds for this many minutes (0: skip)"
+        default: "60"
+      seeds:
+        description: "Seeds for the long run (first ones; more follow while time remains)"
+        default: "1-10"
+
+jobs:
+  chaos:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/target
+          key: cargo-${{ runner.os }}-${{ hashFiles('rust/Cargo.lock') }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install cryptography
+      - run: cargo build --release --locked --manifest-path rust/Cargo.toml
+      - name: Fast chaos suite (scenarios, mutation checks, a few seeds)
+        run: python -m unittest discover -v -s tests/integration -t .
+      - name: Long chaos run with statistics
+        if: ${{ github.event_name == 'schedule' || inputs.minutes != '0' }}
+        run: |
+          python -m tests.integration.chaos.run \
+            --seeds "${{ inputs.seeds || '1-10' }}" --minutes "${{ inputs.minutes || '60' }}" \
+            --set 'byz_modes="equivocate,lie,withhold"' --out chaos-stats.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: chaos-stats
+          path: chaos-stats.json
+          if-no-files-found: ignore
