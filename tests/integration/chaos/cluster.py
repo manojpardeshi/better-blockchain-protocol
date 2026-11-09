@@ -155,6 +155,8 @@ class ChaosCluster(Cluster):
                   "--port", str(w["port"]), "--admin-token", self.token_file]
         if kind == "rust":
             return [RUST_BIN, *common, *w["args"]]
+        if kind == "python" and os.environ.get("SIGIL_CHAOS_TRACE") == "1":
+            return [sys.executable, "-m", "tests.integration.chaos.mutant", "trace", *common, *w["args"]]
         if kind == "python":
             return [sys.executable, "-m", "sigil.witnessd", *common, *w["args"]]
         if kind.startswith("mutant:"):
@@ -281,7 +283,7 @@ class ChaosCluster(Cluster):
         if p is None or p.poll() is not None or shutil.which("prlimit") is None:
             return None
         size = max(os.path.getsize(f) for f in self._store_files(i))
-        r = subprocess.run(["prlimit", f"--pid={p.pid}", f"--fsize={size}"], capture_output=True)
+        r = subprocess.run(["prlimit", f"--pid={p.pid}", f"--fsize={size}:unlimited"], capture_output=True)
         if r.returncode != 0:
             return None
         self.disk_full[i] = "fsize"
@@ -302,7 +304,27 @@ class ChaosCluster(Cluster):
         elif how == "fsize":
             p = self.procs.get(i)
             if p is not None and p.poll() is None:
-                subprocess.run(["prlimit", f"--pid={p.pid}", "--fsize=unlimited"], capture_output=True)
+                r = subprocess.run(["prlimit", f"--pid={p.pid}", "--fsize=unlimited:unlimited"], capture_output=True)
+                if r.returncode != 0:
+                    raise RuntimeError(f"prlimit failed: {r.stderr!r}")
+
+    def fsize_limited(self) -> list:
+        """Live processes whose RLIMIT_FSIZE is not unlimited (should be none outside an episode)."""
+        out = []
+        for i, p in list(self.procs.items()):
+            try:
+                with open(f"/proc/{p.pid}/limits") as f:
+                    line = next(l for l in f if l.startswith("Max file size"))
+            except (OSError, StopIteration):
+                continue
+            if line.split()[3] != "unlimited":
+                out.append((i, p.pid, line.split()[3]))
+        return out
+
+    def reset_fsize(self, i: int) -> None:
+        p = self.procs.get(i)
+        if p is not None and p.poll() is None:
+            subprocess.run(["prlimit", f"--pid={p.pid}", "--fsize=unlimited:unlimited"], capture_output=True)
 
     # ------------------------------------------------------------ teardown
 

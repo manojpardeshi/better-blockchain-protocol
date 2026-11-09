@@ -886,6 +886,7 @@ class ChaosRun:
                 how = c.fill_disk(i)
                 if how:
                     self.faults[f"disk-full-{how}"] += 1
+                    self.log(f"disk full ({how}) on {c.witnesses[i]['name']} pid {c.procs[i].pid}")
 
                     def free(i=i):
                         c.free_disk(i)
@@ -969,6 +970,10 @@ class ChaosRun:
             p.kill_hook = None
         for i in list(c.disk_full):
             c.free_disk(i)
+        for i, pid, lim in c.fsize_limited():
+            self.log(f"LEAKED file size limit {lim} on {c.witnesses[i]['name']} pid {pid}")
+            self.faults["fsize-limit-leaked"] += 1
+            c.reset_fsize(i)
         for i in range(len(c.witnesses)):
             if i not in self.faulty_clock:
                 c.set_skew(i, 0)
@@ -1068,6 +1073,28 @@ class ChaosRun:
                 except Exception as e:  # noqa: BLE001
                     sts.append([rw.pk[:8], repr(e)[:80]])
             out["status"] = sts
+            if tid in w.pending:
+                try:
+                    p = w.pending[tid]
+                    unlocks = w.authorise(p["header"], p["body"], p.get("extra"))
+                    hp = h["parcel"]
+                    req = {"sigil": s, "header": p["header"], "home": hp["home"], "lock": hp["lock"],
+                           "salt": hp["salt"], "unlock": unlocks.get(s)}
+                    acks = mirror_acks(w.network, req)
+                    if acks:
+                        req["mirror"] = acks
+                    tries = []
+                    for rw in w.network.all_witnesses(hp["home"]):
+                        try:
+                            v = rw.spend(req)
+                            tries.append([rw.pk[:8], "vote", v.get("version")])
+                        except Exception as e:  # noqa: BLE001
+                            tries.append([rw.pk[:8], repr(e)[:120]])
+                    out["spend"] = tries
+                    out["acks"] = len(acks)
+                    out["registry_versions"] = len(w.network.registry.chain(hp["home"]))
+                except Exception as e:  # noqa: BLE001
+                    out["spend"] = repr(e)[:200]
         return out
 
     def _settle_swaps(self) -> None:
