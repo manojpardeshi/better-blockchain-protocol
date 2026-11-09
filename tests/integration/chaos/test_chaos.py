@@ -326,6 +326,99 @@ class Findings(ChaosCase):
                 errors.append(repr(e))
         self.assertEqual(errors, [], "a malformed STATUS from one Byzantine witness crashed an honest wallet")
 
+    @unittest.expectedFailure
+    def test_released_pledge_resurrected_by_succession(self):
+        """FINDING (Medium, liveness / owner intent; SPEC §4 rule 3 vs §5.5; found while
+        analysing delayed-request + succession interleavings of the seeded runs, reproduced
+        here deterministically).
+
+        Scenario: home with a successor committee. alice pays bob (T1): the committee mirrors
+        T1 and acknowledges, but every SPEND to the home's witnesses is lost in flight (held
+        by the network). T1 expires; ``release_expired_pledges`` asks every *witness* for
+        STATUS, none holds a binding, so the pledge is released (rule 3), exactly as
+        specified. Then the home is cut off from its committee for longer than ``dead_man``
+        and the committee succeeds it: the new members ADOPT the committee's mirror logs,
+        in which T1's bind entry is the only (hence "lone alive", SPEC §5.4) binding of the
+        coin, so every new member is now *bound to T1*.
+
+        Impact: alice's coin is stranded: ``authorise`` of any other spend refuses
+        ("already bound to another transition"), no death proof for T1 can exist (nothing
+        else is bound at that generation), and the wallet forgot T1 when it released the
+        pledge, so it never completes it. Anyone holding the lost T1 request (the network
+        adversary that delayed it) can also complete T1 later: the committee re-acks a
+        binding it holds and the new members vote a binding they hold whatever the expiry,
+        so a payment its owner considered cancelled goes through. Safety holds (a second
+        spend of the coin at that generation is impossible), but rule 3's promise "no
+        delayed request can still bind it" does not survive a succession.
+
+        Suggested fix: make rule 3 consult the committee too (a pledge is released only if
+        every standby member of the current committee also answered and holds no bind
+        entry for it, or holds a release for it), or have ``unpledge_if_unbound`` file a
+        ``note_release``-like "expired, never voted" entry that ADOPT treats as dead; and
+        state in SPEC §5.4/§5.5 how an expired, never-voted mirrored binding is handled.
+        """
+        run = self.scenario(kinds="mixed", committee=True, dead_man=3)
+        alice, bob = run.wallets["alice"], run.wallets["bob"]
+        cid = run.cids[0]
+        asset = next(a for a in run.assets if alice.balance(a) > 0)
+        refs, outputs = alice.payment_outputs(asset, 5, bob.address())
+        sigil = alice.holdings[model.parcel_id(refs[0])]["sigil"]
+        witnesses = [run.c.proxies[i] for i in run.c.indices(cid)]
+        for p in witnesses:
+            p.hold_filter = lambda method, body: method == "spend"
+        with self.assertRaises(SealFailed):
+            run._transact(alice, refs, outputs, bob)
+        for p in witnesses:
+            p.hold_filter = None
+        t1 = next(iter(alice.pending))
+        time.sleep(run.cfg.pledge_ttl + run.cfg.max_skew + 1.5)
+        alice.release_expired_pledges()
+        self.assertIn((sigil, 0, t1), run.released, "rule 3 released the pledge")
+        self.assertEqual(run.op_succession(random.Random(3)), "ok")
+        bound = [RemoteWitness(u).status(sigil)["tid"] for u in run.directory[cid]]
+        self.assertNotIn(t1, bound, "the successor's members are bound to the released transition")
+
+    @unittest.expectedFailure
+    def test_released_pledge_completed_by_replay_after_succession(self):
+        """FINDING (same root cause as ``test_released_pledge_resurrected_by_succession``):
+        the network adversary that held alice's lost T1 requests replays them after the
+        succession. The new committee re-acknowledges the binding it inherited and the new
+        members vote the binding they hold (no expiry check applies to an existing binding),
+        so T1 is sealed -- a payment alice released under rule 3 -- while alice's wallet still
+        counts the coin as hers (S4: a holding consumed by a complete transition). With
+        alice's later payments of that coin refused forever, the coin is in effect paid to bob
+        behind its owner's back. Same suggested fix."""
+        import json as _json
+        from sigil.wallet import mirror_acks
+        run = self.scenario(kinds="mixed", committee=True, dead_man=3)
+        alice, bob = run.wallets["alice"], run.wallets["bob"]
+        cid = run.cids[0]
+        asset = next(a for a in run.assets if alice.balance(a) > 0)
+        refs, outputs = alice.payment_outputs(asset, 5, bob.address())
+        old = [run.c.proxies[i] for i in run.c.indices(cid)]
+        for p in old:
+            p.hold_filter = lambda method, body: method == "spend"
+        with self.assertRaises(SealFailed):
+            run._transact(alice, refs, outputs, bob)
+        for p in old:
+            p.hold_filter = None
+        held = [_json.loads(h[3])["request"] for p in old for h in p.held]
+        for p in old:
+            p.drop_held()
+        time.sleep(run.cfg.pledge_ttl + run.cfg.max_skew + 1.5)
+        alice.release_expired_pledges()
+        self.assertEqual(run.op_succession(random.Random(3)), "ok")
+        req = {k: v for k, v in held[0].items() if k != "mirror"}
+        acks = mirror_acks(run.mallory.network, req)            # any client can ask the new committee
+        if acks:
+            req["mirror"] = acks
+        for u in run.directory[cid]:
+            try:
+                RemoteWitness(u).spend(req)
+            except Rejected:
+                pass
+        found = kinds_of(self.check(run))
+        self.assertNotIn("S4-holding-already-consumed", found)
 
 if __name__ == "__main__":
     unittest.main()
