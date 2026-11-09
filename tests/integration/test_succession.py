@@ -135,7 +135,6 @@ class SuccessionTests(IntegrationCase):
         alice.pay(bob, usd, 1)                                          # the successor keeps serving
         self.check_invariants({w.name: w for w in (alice, bob, carol, dave, erin)}, headers=[hx])
 
-    @unittest.expectedFailure
     def test_cli_wallet_spends_in_a_home_with_a_committee(self):
         """BUG (CLI, medium: parcels unspendable from the CLI, no safety loss): the command-line
         wallet cannot spend a parcel homed in a constellation whose charter names a successor
@@ -210,7 +209,6 @@ class SuccessionTests(IntegrationCase):
         self.assertEqual(bob.balance(usd), 100)
         self.check_invariants(self.wallets, headers=[header])
 
-    @unittest.expectedFailure
     def test_abort_survives_a_succession_when_the_committee_missed_the_release(self):
         """BUG (wallet, medium: funds stuck after a succession, no safety loss): an input aborted
         under the old version is unspendable under its successor if the committee never stored

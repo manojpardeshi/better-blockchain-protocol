@@ -165,7 +165,6 @@ class AdmissionTests(IntegrationCase):
         self.assertEqual((alice.balance(usd), bob.balance(usd)), (88, 12))
         self.check_invariants({"alice": alice, "bob": bob})
 
-    @unittest.expectedFailure
     def test_cli_wallet_pays_in_a_stamped_constellation(self):
         """BUG (CLI, medium: CLI unusable against stamp-requiring witnesses): the command-line
         wallet has no way to obtain stamps, so it can never pay when the home's witnesses run

@@ -78,7 +78,6 @@ class RecoveryTests(IntegrationCase):
         self.check_invariants({"alice": wallet_store.load(adir, self.net(directory)), "mallory": mallory, "bob": bob},
                               headers=[header])
 
-    @unittest.expectedFailure
     def test_abort_when_home_does_not_know_the_counterparty_home(self):
         """BUG (wallet, high: funds stuck, no safety loss): ``Wallet.abort`` reports an input
         released when no witness released it.

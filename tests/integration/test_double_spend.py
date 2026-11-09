@@ -130,7 +130,6 @@ class DoubleSpendTests(IntegrationCase):
         self.check_invariants({"mallory": mallory, "bob": bob, "carol": carol}, headers=headers,
                               stale={"mallory": stale})
 
-    @unittest.expectedFailure
     def test_replayed_payment_rejected_while_home_mostly_unreachable(self):
         """BUG (wallet receive, high for merchants: double credit): a payment the payee already
         received *and spent* is credited again when most of its home's witnesses do not answer.

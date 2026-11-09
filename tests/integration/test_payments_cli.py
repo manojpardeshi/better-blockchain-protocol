@@ -74,7 +74,6 @@ class CliPaymentTests(IntegrationCase):
 
         self.check_invariants({w: self.load_wallet(w) for w in ("alice", "bob", "carol", "dave")})
 
-    @unittest.expectedFailure
     def test_address_in_a_home_the_payee_does_not_trust_is_refused(self):
         """BUG (CLI, low-medium: a typo burns the payer's money): ``address --home CID`` hands
         out an address in any home, even one the wallet does not trust or that does not exist.

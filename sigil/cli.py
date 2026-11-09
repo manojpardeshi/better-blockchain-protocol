@@ -41,7 +41,10 @@ def _network(path: str):
     from .server import RemoteNetwork
     with open(path) as f:
         d = json.load(f)
-    return RemoteNetwork(d.get("constellations", d))
+    if "constellations" in d:
+        # {"constellations": {cid: [url]}, "committees": {cid: [url]}} (docs/WIRE.md "Files")
+        return RemoteNetwork(d["constellations"], committees=d.get("committees"))
+    return RemoteNetwork(d)
 
 
 def _load(args) -> Wallet:
@@ -77,6 +80,9 @@ def cmd_init(args):
 
 def cmd_address(args):
     w = _load(args)
+    if args.home and not w.policy.trusts(args.home):
+        # A payment to a home we do not trust would be sealed and then refused by us.
+        raise CliError("this wallet does not trust that constellation (see the trust command)")
     a = w.address(args.home)
     wallet_store.save(w, args.wallet)  # the key must be stored before the address leaves
     return a
@@ -101,6 +107,40 @@ def cmd_assets(args):
     return [{"asset": a, "name": _asset_name(w, a), "balance": b} for a, b in _balances(w).items()]
 
 
+def _hand_out_completed(w: Wallet, args) -> list:
+    """Write a payment file for every transition a retry completed (Wallet.completed)."""
+    done = []
+    for tid in list(w.completed):
+        refs = [model.ref(tid, i) for i, o in enumerate(w.dossier.transitions[tid]["body"]["outputs"])
+                if model.sigil_of(o) not in w.issued]
+        path = f"{args.out}.{tid[:16]}.json"
+        with open(path, "w") as f:
+            json.dump({"dossier": json.loads(w.dossier.ancestry([tid]).to_json()), "refs": refs}, f, sort_keys=True)
+        done.append({"tid": tid, "out": path})
+        w.completed.remove(tid)
+    if done:
+        wallet_store.save(w, args.wallet)
+    return done
+
+
+def cmd_trust(args):
+    w = _load(args)
+    if args.cid not in w.network.registry:
+        raise CliError("constellation not in the directory (or its charter could not be verified)")
+    w.trust(args.cid)
+    wallet_store.save(w, args.wallet)
+    return {"trusted": sorted(w.policy.trusted)}
+
+
+def cmd_buy_stamps(args):
+    w = _load(args)
+    if args.count <= 0:
+        raise CliError("count must be positive")
+    w.buy_stamps(args.cid, args.count)
+    wallet_store.save(w, args.wallet)  # bought stamps are money: never lose them
+    return {"stamps": {pk: len(v) for pk, v in w.stamps.items() if v}}
+
+
 def cmd_pay(args):
     w = _load(args)
     with open(args.address) as f:
@@ -109,7 +149,11 @@ def cmd_pay(args):
         raise CliError("address file must hold {home, lock, salt}")
     if args.amount <= 0:
         raise CliError("amount must be positive")
-    refs, outputs = w.payment_outputs(args.asset, args.amount, addr)
+    try:
+        refs, outputs = w.payment_outputs(args.asset, args.amount, addr)
+    finally:
+        # Selecting may complete an earlier payment that was left pending: hand it out.
+        completed = _hand_out_completed(w, args)
     header, body, _ = w.prepare(refs, outputs)
     unlocks = w.authorise(header, body)
     wallet_store.save(w, args.wallet)  # persist the pledge before any witness sees it
@@ -126,7 +170,7 @@ def cmd_pay(args):
     with open(args.out, "w") as f:
         json.dump(payment, f, sort_keys=True)
     return {"tid": tid, "out": args.out, "asset": args.asset, "amount": args.amount,
-            "balance": w.balance(args.asset)}
+            "balance": w.balance(args.asset), "completed": completed}
 
 
 def cmd_receive(args):
@@ -174,6 +218,9 @@ def parser() -> argparse.ArgumentParser:
     s = sub.add_parser("receive"); s.set_defaults(fn=cmd_receive)
     s.add_argument("payment"); s.add_argument("--deep", action="store_true")
     s = sub.add_parser("export-dossier"); s.set_defaults(fn=cmd_export_dossier)
+    s = sub.add_parser("trust"); s.set_defaults(fn=cmd_trust); s.add_argument("cid")
+    s = sub.add_parser("buy-stamps"); s.set_defaults(fn=cmd_buy_stamps)
+    s.add_argument("cid"); s.add_argument("count", type=int)
     return p
 
 

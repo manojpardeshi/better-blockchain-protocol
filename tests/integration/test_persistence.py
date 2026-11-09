@@ -63,7 +63,9 @@ class PersistenceTests(IntegrationCase):
             c.wait_ready(i)
         wait_until(expires + st["max_skew"] + 1, "the failed authorisation to expire")
         out = self.cli("alice", "pay", self.address_file("carol"), usd, 20, "--out", self.file("pay-20.json"))
-        self.assertEqual(self.state("alice")["completed"], [tid])
+        # The retried payment is handed out: its payment file is written and listed, then cleared.
+        self.assertEqual([c["tid"] for c in out["completed"]], [tid])
+        self.assertEqual(self.state("alice")["completed"], [])
         self.assertEqual(out["balance"], 500 - 50 - 20)                 # the retried payment and the new one
         return usd, tid, out
 
@@ -81,13 +83,9 @@ class PersistenceTests(IntegrationCase):
         gold = self.cli("bob", "issue", "GOLD", "9", "--home", A)["asset"]   # bob's asset lives in A
         usd, done, _out = self.outage_and_retry()
         self.assertEqual(self.cli("carol", "receive", self.file("pay-20.json"))["received"][0]["amount"], 20)
-        # The CLI does not write out the payment it completed (see the expected failure below);
-        # the payee can still be paid from the payer's exported dossier.
-        dossier = self.cli("alice", "export-dossier")
-        recovered = self.file("recovered.json")
-        with open(recovered, "w") as f:
-            json.dump({"dossier": dossier, "refs": [model.ref(done, 0)]}, f)
-        self.assertEqual(self.cli("carol", "receive", recovered, "--deep")["received"][0]["amount"], 50)
+        # The payment the retry completed was handed out as its own payment file.
+        handed = next(c["out"] for c in _out["completed"] if c["tid"] == done)
+        self.assertEqual(self.cli("carol", "receive", handed, "--deep")["received"][0]["amount"], 50)
         pay, r = self.cli_pay("alice", "bob", usd, 100)
         with open(pay) as f:
             self.assertEqual(json.load(f)["refs"], [model.ref(r["tid"], 0)])
@@ -103,7 +101,6 @@ class PersistenceTests(IntegrationCase):
                          self.load_wallet("alice").dossier.transitions.keys())
         self.check_invariants({w: self.load_wallet(w) for w in ("alice", "bob", "carol")})
 
-    @unittest.expectedFailure
     def test_cli_hands_out_a_payment_completed_by_a_retry(self):
         """BUG (CLI, medium: a payment is made but never delivered): when ``pay`` completes an
         earlier payment that had failed (``Wallet.release_expired_pledges`` -> ``_settle``), the
