@@ -110,6 +110,25 @@ class Scenarios(ChaosCase):
         self.assertEqual(self.check(run), [])
         self.assertTrue(run.released)
 
+    def test_clock_shim_skews_both_implementations(self):
+        """Harness self-check: the LD_PRELOAD clock shim moves the wall clock of a running Rust
+        and a running Python witness (their vote ``time``), so the skew faults are real."""
+        run = self.scenario(kinds="mixed", skew="within")
+        if run.skew_so is None:
+            self.skipTest("no C compiler for the clock shim")
+        c, home = run.c, run.cids[0]
+        picks = {k: next(j for j in c.indices(home) if c.witnesses[j]["kind"] == k) for k in ("rust", "python")}
+        for i in picks.values():
+            c.set_skew(i, -5000)   # behind: fresh authorisations still look unexpired
+        time.sleep(0.2)
+        self.pay(run, "alice", "bob", 1)
+        now = time.time()
+        for kind, i in picks.items():
+            times = [v["time"] for k, v in run.obs.votes.items() if k[0] == c.witnesses[i]["pk"]]
+            self.assertTrue(times and min(times) < now - 4000, f"{kind} witness clock not skewed: {times}")
+            c.set_skew(i, 0)
+        run.faulty_clock.clear()
+
     def test_disk_full_witness_refuses_rather_than_votes_unpersisted(self):
         """A full disk on a witness (Python: the store cannot grow; Rust: likewise, which the Rust
         store answers by aborting): payments still seal from the others, the witness emits no
