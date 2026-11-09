@@ -182,9 +182,10 @@ class FaultProxy:
             return self._hang_up(handler)
         faulty = f.only is None or method in f.only
         hf = self.hold_filter
-        if (hf is not None and hf(method, body)) or (faulty and method in f.hold_methods and self._roll(f.p_hold)):
+        pinned = hf is not None and hf(method, body)
+        if pinned or (faulty and method in f.hold_methods and self._roll(f.p_hold)):
             with self._held_lock:
-                self.held.append((verb, path, headers, body))
+                self.held.append((verb, path, headers, body, pinned))
             self._count("held")
             time.sleep(self.client_timeout)  # the client gives up
             return self._hang_up(handler)
@@ -229,12 +230,14 @@ class FaultProxy:
 
     # ------------------------------------------------------------ control
 
-    def deliver_held(self, keep=None) -> int:
-        """Forward every held request now (those ``keep(method, body)`` selects, default all)."""
+    def deliver_held(self, keep=None, pinned=None) -> int:
+        """Forward held requests now: those ``keep(method, body)`` selects (default all), and
+        only the ones a ``hold_filter`` pinned (``pinned=True``) or only random ones (False)."""
         with self._held_lock:
-            go = [h for h in self.held if keep is None or keep(h[1].removeprefix("/v0/"), h[3])]
+            go = [h for h in self.held if (keep is None or keep(h[1].removeprefix("/v0/"), h[3]))
+                  and (pinned is None or h[4] == pinned)]
             self.held = [h for h in self.held if h not in go]
-        for verb, path, headers, body in go:
+        for verb, path, headers, body, _pinned in go:
             reply = self._forward(verb, path, headers, body)
             self._observe(path.removeprefix("/v0/"), body, reply)
             self._count("held-delivered")

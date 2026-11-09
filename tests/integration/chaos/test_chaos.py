@@ -94,7 +94,9 @@ class SeededChaos(ChaosCase):
                 self.assertEqual(res["violations"], [], f"seed {seed}: safety violated: {res['violations']}")
                 self.assertEqual([a["key"] for a in res["anomalies"]], [], f"seed {seed}: {res['anomalies']}")
                 if strict:
-                    self.assertEqual(res["liveness"], [], f"seed {seed}: no liveness after healing")
+                    # "known:" entries are open findings with their own expectedFailure tests
+                    unknown = [x for x in res["liveness"] if not x["kind"].startswith("known:")]
+                    self.assertEqual(unknown, [], f"seed {seed}: no liveness after healing")
 
 
 class Scenarios(ChaosCase):
@@ -259,6 +261,34 @@ class NonVacuity(ChaosCase):
             pass  # the late binding makes the wallet refuse the second payment (or it fails)
         self.assertIn("S6-vote-after-pledge-release", kinds_of(self.check(run)))
 
+    @unittest.skipUnless(os.environ.get("SIGIL_CHAOS_RUST_MUTANTS") == "1",
+                         "builds mutated Rust witnesses (minutes): set SIGIL_CHAOS_RUST_MUTANTS=1")
+    def test_rust_mutants_are_caught(self):
+        """The same two mutations in the Rust witness (``rust_mutants.py``): a build whose
+        records never reach redb, and one that binds on expired authorisations."""
+        from . import rust_mutants
+        from .cluster import RUST_MUTANT_BINS
+        work = os.environ.get("SIGIL_CHAOS_MUTANT_DIR") or os.path.join(
+            os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))),
+            "rust", "target", "chaos-mutants")
+        os.makedirs(work, exist_ok=True)
+        for name in ("nopersist", "noexpiry"):
+            RUST_MUTANT_BINS[name] = rust_mutants.build(name, work)
+        with self.subTest("nopersist"):
+            run = self.scenario(mutant="rust:nopersist", mallory=True, mallory_targeted=0.0)
+            self.pay(run, "alice", "bob")
+            self._equivocate_across_restart(run)
+            found = kinds_of(self.check(run))
+            self.assertIn("S5-vote-forgotten", found)
+            self.assertIn("S2-honest-equivocation", found)
+        with self.subTest("noexpiry"):
+            run = self.scenario(mutant="rust:noexpiry")
+            try:
+                run.delayed_expiry("alice", "bob", "carol", random.Random(1))
+            except (ValueError, SealFailed):
+                pass
+            self.assertIn("S6-vote-after-pledge-release", kinds_of(self.check(run)))
+
     def test_byzantine_beyond_f_is_caught(self):
         """Two Byzantine witnesses of four (f = 1) with an equivocating owner: both
         transitions of one coin are sealed, and the harness reports the double consumption."""
@@ -402,7 +432,7 @@ class Findings(ChaosCase):
             run._transact(alice, refs, outputs, bob)
         for p in old:
             p.hold_filter = None
-        held = [_json.loads(h[3])["request"] for p in old for h in p.held]
+        held = [_json.loads(h[3])["request"] for p in old for h in p.held if h[4]]
         for p in old:
             p.drop_held()
         time.sleep(run.cfg.pledge_ttl + run.cfg.max_skew + 1.5)

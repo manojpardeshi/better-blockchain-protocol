@@ -84,6 +84,7 @@ class Config:
     skew: str = "within"            # none | within | beyond_f | beyond_q
     disk: bool = True
     mutant: str | None = None       # every honest witness of constellation 0 runs this mutant
+                                    # (mutant.py name, or "rust:<name>" for rust_mutants.py)
     mallory: bool = True
     mallory_targeted: float = 0.5
     delayed_expiry: int = 1         # how many delayed-request scenarios
@@ -204,7 +205,8 @@ class ChaosRun:
             for j in range(nbyz):
                 kinds[1 + j] = "byz:" + cfg.byz_modes
             if ci == 0 and cfg.mutant:
-                kinds = [("mutant:" + cfg.mutant) if k == "python" or k == "rust" else k for k in kinds]
+                m = ("rustm:" + cfg.mutant[5:]) if cfg.mutant.startswith("rust:") else ("mutant:" + cfg.mutant)
+                kinds = [m if k in ("python", "rust") else k for k in kinds]
             committee = self._kinds(4) if (ci == 0 and cfg.committee) else None
             cid = c.create(names[ci], kinds, committee=committee, dead_man=cfg.dead_man if committee else None)
             self.cids.append(cid)
@@ -873,8 +875,8 @@ class ChaosRun:
                 episodes.append((now + r.uniform(0.5, cfg.dead_man * 1.8), heal))
             elif roll < 0.66:
                 for p in c.all_proxies():
-                    if p.held and r.random() < 0.5:
-                        self.faults["held-delivered-late"] += p.deliver_held()
+                    if p.held and r.random() < 0.5:   # the random holds; scenarios deliver their own
+                        self.faults["held-delivered-late"] += p.deliver_held(pinned=False)
             elif roll < 0.72 and self.skew_so is not None and not standby and i not in self.byz_idx:
                 if cfg.skew in ("within", "beyond_f"):
                     if i in self.faulty_clock:
@@ -915,6 +917,9 @@ class ChaosRun:
                 self.ops[f"{op}:{outcome}"] += 1
             except EXPECTED as e:
                 self.ops[f"{op}:{type(e).__name__}"] += 1
+                if op in ("rotate", "succession"):
+                    tb = traceback.extract_tb(e.__traceback__)[-1]
+                    self.log(f"{op} gave up: {e!r} at {os.path.basename(tb.filename)}:{tb.lineno}")
             except Exception as e:  # noqa: BLE001 - classified as an anomaly
                 self.ops[f"{op}:anomaly"] += 1
                 self.anomaly(op, e)
@@ -1040,7 +1045,10 @@ class ChaosRun:
                     self._safe("final-payment", w.release_expired_pledges)
                     time.sleep(1)
             self.ops["final-payment:" + ("ok" if ok else "failed")] += 1
-            if not ok:
+            if not ok and self._resurrected(w):
+                self.liveness.append({"kind": "known:released-pledge-resurrected", "wallet": name, "error": err,
+                                      "coins": self._resurrected(w)})
+            elif not ok:
                 self.liveness.append({"kind": "final-payment-failed", "wallet": name, "error": err,
                                       "pledges": [{"sigil": s, "gen": g, "tid": t, **self._diagnose(w, s, g, t)}
                                                   for s, (g, t, _e) in self._live_pledges(w).items()]})
@@ -1049,6 +1057,24 @@ class ChaosRun:
         for payer, payee, tid, refs in todo:
             if not self._deliver(self.wallets[payer], self.wallets[payee], tid, refs):
                 self.liveness.append({"kind": "payment-undelivered", "payer": payer, "payee": payee, "tid": tid})
+
+    def _resurrected(self, w: Wallet) -> list:
+        """Coins of ``w`` whose released pledge the home's current members are bound to again
+        (the succession finding, test_chaos.Findings): known, reported apart."""
+        out = []
+        released = {(s, t) for s, _g, t in self.released}
+        for h in w.holdings.values():
+            for s, t in released:
+                if s != h["sigil"]:
+                    continue
+                for rw in w.network.all_witnesses(h["parcel"]["home"]):
+                    try:
+                        if rw.status(s).get("tid") == t:
+                            out.append(s)
+                            break
+                    except Exception:  # noqa: BLE001
+                        continue
+        return sorted(set(out))
 
     @staticmethod
     def _live_pledges(w: Wallet) -> dict:

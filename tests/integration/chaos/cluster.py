@@ -7,8 +7,8 @@ daemon, each process a ``sigil-witness`` or ``python -m sigil.witnessd``) with:
   second one in front of every witness for the standby members' heartbeat probes
   (``probe_url``), so standby members and witnesses can be partitioned apart while wallets
   still reach both;
-* process kinds beyond ``rust`` and ``python``: ``byz:<modes>`` (``byzantine.py``) and
-  ``mutant:<name>`` (``mutant.py``);
+* process kinds beyond ``rust`` and ``python``: ``byz:<modes>`` (``byzantine.py``),
+  ``mutant:<name>`` (``mutant.py``) and ``rustm:<name>`` (``rust_mutants.py``);
 * a per-process wall-clock offset (``set_skew``) through the ``skewclock.c`` LD_PRELOAD shim;
 * SIGKILL at any moment, from the harness or from a proxy kill hook, and restart on the same
   store and port;
@@ -34,6 +34,7 @@ sys.path.insert(0, os.path.join(ROOT, "bench"))
 from common import RUST_BIN, Cluster, free_port  # noqa: E402
 
 TOKEN = "chaos-admin-token"
+RUST_MUTANT_BINS: dict = {}   # mutation name -> mutated sigil-witness binary (rust_mutants.build)
 
 
 def build_skew_shim(out_dir: str) -> str | None:
@@ -155,6 +156,8 @@ class ChaosCluster(Cluster):
                   "--port", str(w["port"]), "--admin-token", self.token_file]
         if kind == "rust":
             return [RUST_BIN, *common, *w["args"]]
+        if kind.startswith("rustm:"):
+            return [RUST_MUTANT_BINS[kind.split(":", 1)[1]], *common, *w["args"]]
         if kind == "python" and os.environ.get("SIGIL_CHAOS_TRACE") == "1":
             return [sys.executable, "-m", "tests.integration.chaos.mutant", "trace", *common, *w["args"]]
         if kind == "python":
