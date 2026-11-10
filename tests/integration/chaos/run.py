@@ -543,7 +543,7 @@ class ChaosRun:
             refs, outputs = payer.payment_outputs(asset, amount, p1.address())
             sigils = {model.sigil_of(payer.dossier.output(x)) for x in refs}
             homes = {payer.dossier.output(x)["home"] for x in refs}
-            proxies = [self.c.proxies[i] for i in range(len(self.c.witnesses))
+            proxies = [p for i, p in list(self.c.proxies.items())    # (a rotation may be adding members)
                        if self.c.witnesses[i]["cid"] in homes and self.c.witnesses[i].get("role") != "standby"]
 
             def mine(method, body_bytes, _s=sigils):
