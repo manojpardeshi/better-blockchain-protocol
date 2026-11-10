@@ -23,7 +23,7 @@ import unittest
 from sigil import locks, model
 from sigil.crypto import KeyPair
 
-from tests.integration.harness import (ROOT, Daemon, daemon_cmd, free_port, http, make_tmpdir, new_constellation,
+from tests.integration.compat_harness import (ROOT, Daemon, daemon_cmd, free_port, http, make_tmpdir, new_constellation,
                                        requires_rust, run_cli, rust_available, witnessd, write_token)
 
 KINDS = ["python"] + (["rust"] if rust_available() else [])

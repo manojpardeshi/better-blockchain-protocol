@@ -10,8 +10,9 @@
   ``candidates`` and ``abstain``, and several rows per ``(kind, key)`` (before the store
   deleted superseded rows); Rust redb stores with ``frozen = true`` and records without
   ``candidates`` (written by ``rust/sigil-witness/tests/legacy_store.rs``, needs cargo).
-* Wallet directories saved by the current version reload with the same state and keep
-  paying; ``state.json`` without ``trusted``, ``issued``, ``kill_switches`` and the other
+* Wallet directories saved by the current version reload with the same state (including
+  ``aborted``) and keep paying; ``state.json`` without ``trusted``, ``issued``,
+  ``kill_switches``, ``aborted`` and the other
   later fields loads with the documented defaults; ``trusted: null`` is refused.
 * A constellation rotates from Python witnesses to Rust witnesses (re-using the same key
   files) and back, with payments continuing and old history deep-confirmed: keys and
@@ -38,7 +39,7 @@ from sigil.wallet import SealFailed, request_seal
 from sigil.witness import Witness
 from sigil.witnessd import load_key, load_registry
 
-from tests.integration.harness import (ROOT, Cluster, Daemon, http, make_tmpdir, manual_spend, new_constellation,
+from tests.integration.compat_harness import (ROOT, Cluster, Daemon, http, make_tmpdir, manual_spend, new_constellation,
                                        requires_rust, rust_available, store_bytes, write_token)
 
 
@@ -409,7 +410,7 @@ class WalletDirTests(unittest.TestCase):
     @staticmethod
     def state(w: Wallet) -> dict:
         return {"holdings": w.holdings, "pledged": w.pledged, "pending": w.pending, "issued": w.issued,
-                "kill": w.kill_switches, "trusted": w.policy.trusted, "convicted": w.policy.convicted,
+                "kill": w.kill_switches, "aborted": w.aborted, "trusted": w.policy.trusted, "convicted": w.policy.convicted,
                 "stamps": dict(w.stamps), "confirmed": w._confirmed, "keys": set(w.keys), "seeds": w.seeds,
                 "dossier": w.dossier.to_json(), "home": w.home, "deep": w.deep_threshold,
                 "ttl": w.pledge_ttl, "skew": w.max_skew}
@@ -420,6 +421,18 @@ class WalletDirTests(unittest.TestCase):
         usd, gold = alice.issue("USD", 1000), bob.issue("GOLD", 10)
         alice.pay(bob, usd, 100)
         atomic_swap(alice, usd, 10, bob, gold, 1)            # kill switches
+        # A dead swap alice aborts with a death proof (state.json "aborted").
+        mallory = Wallet("mallory", net, self.X)
+        tok = mallory.issue("TOK", 3)
+        header, body, _ = propose_swap(alice, usd, 7, mallory, tok, 3)
+        unlocks = {**alice.authorise(header, body), **mallory.authorise(header, body)}
+        me = mallory.address()
+        *_, betrayal = manual_spend(mallory, [body["inputs"][1]], [model.parcel(self.X, tok, 3, me["lock"], me["salt"])])
+        request_seal(net, betrayal[0])
+        with self.assertRaises(SealFailed):
+            alice.seal(header, body, unlocks)
+        self.assertEqual(len(alice.abort(header)), 1)
+        self.assertTrue(alice.aborted, "the abort is recorded")
         unused = alice.address()                              # issued, not yet paid
         refs, _ = alice.select(usd, 5)                        # a pledge left pending
         b = bob.address()
@@ -430,6 +443,7 @@ class WalletDirTests(unittest.TestCase):
         self.assertEqual(oct(os.stat(os.path.join(d, "keys.json")).st_mode & 0o777), "0o600")
         again = wallet_store.load(d, self.net())
         self.assertEqual(self.state(again), self.state(alice))
+        before = alice.balance(usd)
         bob.pay(again, usd, 20)                               # receives after reload
         to = Wallet("carol", bob.network, self.X)
         bob.network.refresh_charters(self.X)
@@ -438,7 +452,7 @@ class WalletDirTests(unittest.TestCase):
         tid = bob.transact(r2, outs)
         again.receive(bob.dossier.ancestry([tid]), [model.ref(tid, 0)])
         again.pay(to, usd, 15)                                # from what is not pledged
-        self.assertEqual(again.balance(usd), 1000 - 100 - 10 + 20 + 1 - 15)
+        self.assertEqual(again.balance(usd), before + 20 + 1 - 15)
         wallet_store.save(again, d)
         self.assertEqual(self.state(wallet_store.load(d, self.net())), self.state(again))
 
@@ -464,14 +478,15 @@ class WalletDirTests(unittest.TestCase):
         return w, peer, usd, d
 
     def test_legacy_wallet_without_later_fields_loads(self):
-        drop = ("version", "trusted", "issued", "kill_switches", "pledge_ttl", "max_skew", "deep_after_succession",
-                "pending", "completed", "convicted")
+        drop = ("version", "trusted", "issued", "kill_switches", "aborted", "pledge_ttl", "max_skew",
+                "deep_after_succession", "pending", "completed", "convicted")
         w, peer, usd, d = self.legacy_dir("legacy", drop, two_tuple_pledges=True)
         old = wallet_store.load(d, self.net())
         self.assertEqual((old.pledge_ttl, old.max_skew, old.deep_after_succession), (600, 120, True))
         self.assertEqual(old.policy.trusted, {self.X, self.Y})   # the default, never "any"
         self.assertEqual(old.issued, {h["sigil"] for h in w.holdings.values()})
         self.assertEqual(old.kill_switches, set())
+        self.assertEqual(old.aborted, {})
         self.assertTrue(all(len(v) == 3 and v[2] == 0 for v in old.pledged.values()), old.pledged)
         self.assertEqual(old.balance(usd), w.balance(usd))
         # It keeps working: receives at a fresh address and pays from unpledged funds.

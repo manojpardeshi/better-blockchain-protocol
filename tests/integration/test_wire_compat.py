@@ -30,7 +30,7 @@ from sigil.charter import MAX_WITNESSES, charter_body, charter_hash, constellati
 from sigil.crypto import KeyPair, verify
 from sigil.witnessd import load_key, load_mint
 
-from tests.integration.harness import (ROOT, Daemon, http, make_tmpdir, new_constellation, requires_rust,
+from tests.integration.compat_harness import (ROOT, Daemon, http, make_tmpdir, new_constellation, requires_rust,
                                        wait_http, witnessd, write_token)
 
 WIRE = os.path.join(ROOT, "docs", "WIRE.md")

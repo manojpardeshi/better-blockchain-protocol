@@ -14,7 +14,7 @@ from sigil import Wallet, model, wallet_store
 from sigil.charter import MAX_WITNESSES, charter_body, charter_hash
 from sigil.server import RemoteNetwork
 
-from tests.integration.harness import (Cluster, Daemon, http, make_tmpdir, new_constellation, requires_rust,
+from tests.integration.compat_harness import (Cluster, Daemon, http, make_tmpdir, new_constellation, requires_rust,
                                        write_token)
 
 
@@ -209,6 +209,45 @@ class KillSwitchDust(unittest.TestCase):
         dust = [h for h in a.holdings.values() if h["parcel"]["asset"] not in (usd, gold)]
         self.assertLessEqual(len(dust), 2, f"{len(dust)} kill-switch parcels after 20 swaps")
         self.assertLessEqual(len(a.kill_switches), 2)
+
+
+class WalletDossierNeverPruned(unittest.TestCase):
+    """A wallet's dossier keeps every transition it ever saw, also of parcels long spent.
+
+    Scenario (found by the 45-minute soak): ``Wallet.receive`` and ``finalise`` merge each
+    payment's ancestry into ``wallet.dossier`` and nothing ever removes it, even after every
+    parcel of that history has been paid away. ``wallet_store.save`` writes the whole dossier
+    on every save.
+
+    Impact: medium for long-lived wallets (performance and storage, not safety). In the soak,
+    after 45 minutes each wallet's dossier held ~13 900 transitions and its directory ~50 MB
+    although it held a few thousand units in a handful of parcels; ``save`` took 0.24 s (p50)
+    and reload 0.57 s, and the client's RSS reached ~970 MiB. Throughput of the whole workload
+    fell from ~10 to ~2.5 operations per second while every witness-side latency stayed flat
+    (seal p50 15-16 ms, STATUS ~1 ms): the cost is all in the wallet.
+
+    Suggested fix: after ``finalise`` (or in ``save``), keep only
+    ``dossier.ancestry(tids of holdings, pending, pledged and aborted entries)`` plus the seals
+    and charters it needs; history of spent parcels is not needed to prove anything the wallet
+    still holds. (The per-hop ancestry a payment hands over is a separate, documented open
+    problem: dossier growth.)
+    """
+
+    @unittest.expectedFailure
+    def test_dossier_drops_history_of_spent_parcels(self):
+        from sigil import Network
+        net = Network()
+        X = net.create_constellation("x", n=4)
+        alice, bob, carol = Wallet("alice", net, X), Wallet("bob", net, X), Wallet("carol", net, X)
+        keep = carol.issue("KEEP", 10)
+        carol.pay(alice, keep, 10)                 # alice keeps this
+        for i in range(10):
+            a = bob.issue(f"A{i}", 5)
+            bob.pay(alice, a, 5)
+            alice.pay(carol, a, 5)                 # and pays this away entirely
+        needed = alice.dossier.ancestry({h["ref"]["tx"] for h in alice.holdings.values()})
+        self.assertLessEqual(len(alice.dossier), len(needed) + 2,
+                             f"dossier holds {len(alice.dossier)} transitions, {len(needed)} needed")
 
 
 if __name__ == "__main__":

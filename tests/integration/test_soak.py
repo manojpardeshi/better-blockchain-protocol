@@ -12,7 +12,7 @@ Network (every witness and standby member is its own process):
 
 Six wallets (homes spread over the four constellations) plus occasional fresh holders run a
 mix of payments within and across constellations, atomic swaps across constellations,
-consolidations (many inputs, one output), wallet saves and reloads. A background reader hits
+consolidations (many inputs, one output), wallet saves and reloads. A prober process hits
 ``/v0/info`` and ``/v0/status`` on random witnesses. Every ``SIGIL_SOAK_SERIES`` seconds the
 issuers start a new series of their assets and payments move to it (holders do not pass one
 coin's whole history around forever; within a series the dossier grows, and is measured).
@@ -39,8 +39,8 @@ import json
 import os
 import random
 import signal
+import subprocess
 import sys
-import threading
 import time
 import traceback
 import unittest
@@ -50,7 +50,7 @@ from sigil.server import RemoteNetwork
 from sigil.swap import atomic_swap
 from sigil.validate import Dossier
 
-from tests.integration.harness import (Cluster, du, http, make_tmpdir, percentiles, proc_stats, requires_rust,
+from tests.integration.compat_harness import (Cluster, du, http, make_tmpdir, percentiles, proc_stats, requires_rust,
                                        store_bytes, write_token)
 
 ENV = os.environ.get
@@ -82,13 +82,11 @@ class Soak:
         self.samples: list = []
         self.hops: list = []
         self.ops: list = []          # (t, kind, seconds)
-        self.status_lat: list = []   # (t, seconds)
+        self.status_lat: list = []   # (t, seconds, kind), from the prober process
         self.errors: list = []
         self.events: list = []
         self.sealed: dict = {}       # cid -> transitions sealed with an input there
         self.down: set = set()       # constellations temporarily dead (succession window)
-        self.lock = threading.Lock()
-        self.stop_reader = threading.Event()
         self.rot_cycle = [["rust"] * 4, ["python"] * 4, ["rust", "python", "python", "rust"]]
         self.supply: dict = {}
         self.fresh: dict = {}        # asset -> units held by fresh holders (dropped after receiving)
@@ -275,6 +273,7 @@ class Soak:
         dt = time.perf_counter() - t0
         adopted = sum(store_bytes(c.witnesses[i]["store"]) for i in new)
         self.stop_old(old)
+        self.write_urls()
         self.events.append((self.t(), "rotation", {"version": v, "kinds": kinds, "seconds": round(dt, 2),
                                                    "new_store_bytes": adopted}))
         log(f"rotated vega to v{v} {kinds} in {dt:.1f}s")
@@ -306,6 +305,7 @@ class Soak:
         for i in new:
             c.witnesses[i]["pending"] = False
         self.stop_old(committee)   # fenced
+        self.write_urls()
         self.down.discard(H)
         dt = time.perf_counter() - t0
         self.events.append((self.t(), "succession", {"version": v, "seconds": round(dt, 2)}))
@@ -313,22 +313,62 @@ class Soak:
 
     # ------------------------------------------------------------ measuring
 
-    def reader(self):
-        """Background clients: info and STATUS on random live witnesses (connection churn)."""
-        rng = random.Random(SEED + 1)
-        while not self.stop_reader.wait(0.05):
-            urls = [self.c.url(i) for i in list(self.c.procs)]
-            if not urls:
-                continue
+    PROBER = r"""
+import json, os, random, sys, time, urllib.request
+urls_file, out_file = sys.argv[1], sys.argv[2]
+rng = random.Random(7)
+with open(out_file, "a", buffering=1) as out:
+    while os.path.exists(urls_file):
+        try:
+            with open(urls_file) as f:
+                urls = json.load(f)
+        except (OSError, ValueError):
+            urls = []
+        if urls:
             u = rng.choice(urls)
-            t0 = time.perf_counter()
+            body = json.dumps({"sigil": os.urandom(32).hex()}).encode()
+            req = urllib.request.Request(u + "/v0/status", data=body, headers={"Content-Type": "application/json"})
+            t0 = time.monotonic()
             try:
-                code, _, _ = http(u, "/v0/status", {"sigil": os.urandom(32).hex()}, timeout=5)
-                if code == 200:
-                    with self.lock:
-                        self.status_lat.append((self.t(), time.perf_counter() - t0))
+                with urllib.request.urlopen(req, timeout=5) as r:
+                    r.read()
+                out.write(f"{t0} {time.monotonic() - t0} {u}\n")
             except OSError:
                 pass   # a member being rotated out
+        time.sleep(0.05)
+"""
+
+    def write_urls(self):
+        """The live witnesses' URLs, for the prober process (atomically replaced)."""
+        tmp = self.urls_file + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump([self.c.url(i) for i in list(self.c.procs)], f)
+        os.replace(tmp, self.urls_file)
+
+    def start_prober(self):
+        """STATUS latency is measured from a separate process: a thread in this one would
+        measure the GIL held by the wallets' work, not the witnesses."""
+        self.urls_file = os.path.join(self.dir, "probe-urls.json")
+        self.probe_out = os.path.join(self.dir, "probe.txt")
+        self.write_urls()
+        self.prober = subprocess.Popen([sys.executable, "-c", self.PROBER, self.urls_file, self.probe_out],
+                                       stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.case.addCleanup(lambda: self.prober.poll() is None and self.prober.kill())
+
+    def stop_prober(self):
+        try:
+            os.unlink(self.urls_file)
+        except FileNotFoundError:
+            pass
+        try:
+            self.prober.wait(10)
+        except subprocess.TimeoutExpired:
+            self.prober.kill()
+        kinds = {self.c.url(i): w["kind"] for i, w in enumerate(self.c.witnesses)}
+        with open(self.probe_out) as f:
+            for line in f:
+                t, dt, u = line.split()
+                self.status_lat.append((round(float(t) - self.t0, 3), float(dt), kinds.get(u, "?")))
 
     def sample(self):
         c = self.c
@@ -368,8 +408,7 @@ class Soak:
     def run(self):
         self.t0 = time.monotonic()
         self.build()
-        reader = threading.Thread(target=self.reader, daemon=True)
-        reader.start()
+        self.start_prober()
         end = self.t0 + DURATION
         next_sample = time.monotonic()
         next_rotate = self.t0 + ROTATE if ROTATE > 0 else float("inf")
@@ -396,8 +435,7 @@ class Soak:
                         raise
             self.sample()
         finally:
-            self.stop_reader.set()
-            reader.join(10)
+            self.stop_prober()
         self.restart_check()
 
     def restart_check(self):
@@ -456,7 +494,9 @@ class Soak:
             return [x for t, x in xs if lo <= t < hi]
 
         T = self.samples[-1]["t"]
-        stat_w = [percentiles(window(self.status_lat, a * T / 3, (a + 1) * T / 3)) for a in range(3)]
+        stat = [(t, dt) for t, dt, _ in self.status_lat]
+        stat_w = [percentiles(window(stat, a * T / 3, (a + 1) * T / 3)) for a in range(3)]
+        stat_kind = {k: percentiles([dt for _, dt, kk in self.status_lat if kk == k]) for k in ("rust", "python")}
         seal = [(h["t"], h["seal"]) for h in self.hops if h["kind"] in ("pay", "cross")]
         seal_w = [percentiles(window(seal, a * T / 3, (a + 1) * T / 3)) for a in range(3)]
         by_kind = {}
@@ -469,7 +509,7 @@ class Soak:
                        "succession_at": SUCCESSION_AT},
             "ops_total": len(self.ops), "ops_per_s": len(self.ops) / max(T, 1e-9),
             "ops": {k: percentiles(v) for k, v in by_kind.items()},
-            "status_latency_windows": stat_w, "seal_latency_windows": seal_w,
+            "status_latency_windows": stat_w, "status_latency_by_kind": stat_kind, "seal_latency_windows": seal_w,
             "sealed_inputs": dict(self.sealed),
             "long_lived": per_proc,
             "client_rss": {"start": first["client"]["rss"], "end": last["client"]["rss"]},
@@ -535,7 +575,15 @@ class SoakTest(unittest.TestCase):
                 b2 = (end["procs"][n]["store"] - mid["procs"][n]["store"]) / ops2
                 with self.subTest(store=n):
                     self.assertLess(b2, 256 * 1024, f"{n}: {b2:.0f} bytes per op")
-                    self.assertLessEqual(b2, 2 * max(b1, 0) + 4096, f"{n}: store growth per op rose {b1:.0f} -> {b2:.0f}")
+                    # A redb file grows by doubling, so its size per op over a window is a step
+                    # function; the super-linear check is for SQLite, which grows smoothly.
+                    if soak.c.witnesses[soak.long_lived[n]]["kind"] == "python":
+                        self.assertLessEqual(b2, 2 * max(b1, 0) + 4096, f"{n}: store growth per op rose {b1:.0f} -> {b2:.0f}")
+        # redb against SQLite for the same kind of data: at most ~2x, plus one doubling step.
+        per_op = {p["kind"]: p["store_bytes_per_sealed_input"] for p in s["long_lived"].values()
+                  if p.get("store_bytes_per_sealed_input")}
+        if "rust" in per_op and "python" in per_op:
+            self.assertLessEqual(per_op["rust"], 4.5 * per_op["python"] + 4096, per_op)
         # Witness-side slowdown.
         st, se = s["status_latency_windows"], s["seal_latency_windows"]
         if st[0]["n"] >= 20 and st[2]["n"] >= 20:

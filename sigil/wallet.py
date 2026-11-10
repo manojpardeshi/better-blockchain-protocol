@@ -10,7 +10,7 @@ import time
 from collections import defaultdict
 
 from . import locks, model
-from .charter import faults, taken_over
+from .charter import faults, quorum, taken_over
 from .crypto import KeyPair
 from .locks import keys_in, sign_unlock
 from .network import Network
@@ -163,6 +163,10 @@ class Wallet:
         self.completed: list = []             # tids completed by a retry: hand their dossiers to the payees
         self.issued: set[str] = set()         # sigils of addresses we handed out: the only ones we accept
         self.kill_switches: set[str] = set()  # sigils of kill-switch parcels (multi-party transitions)
+        # sigil -> {"gen", "tid", "proof"} of each transition we aborted: re-presented to
+        # any witness that still holds the old binding (it missed the RELEASE, or a
+        # successor inherited it because the committee missed it, SPEC §5.5).
+        self.aborted: dict[str, dict] = {}
         # Called after every authorisation, before any witness sees it: save the
         # wallet here so a crash can never forget a pledge (wallet_store.save).
         self.on_pledge = on_pledge
@@ -223,8 +227,15 @@ class Wallet:
                 raise InvalidDossier("parcel is not addressed to us")
             if any(h["sigil"] == s for h in self.holdings.values()):
                 raise InvalidDossier("address already used: one sigil can only ever be spent once")
-            bound = sum(1 for w in self.network.witnesses(p["home"])
-                        if (_status(w, s) or {}).get("tid") is not None)
+            # A parcel the wallet itself already saw consumed is never credited again.
+            if any(r in tx["body"]["inputs"] for tx in self.dossier.transitions.values()):
+                raise InvalidDossier("parcel was already spent")
+            # Fail closed: "at most f report a binding" only means something when a
+            # quorum answered; silent witnesses might be the ones holding it.
+            answers = [st for w in self.network.witnesses(p["home"]) if (st := _status(w, s)) is not None]
+            if len(answers) < quorum(self._size(p["home"])):
+                raise InvalidDossier("too few of the parcel's witnesses answered to confirm it is unspent")
+            bound = sum(1 for st in answers if st.get("tid") is not None)
             if bound > faults(self._size(p["home"])):
                 raise InvalidDossier("parcel's sigil is already consumed")
             # Only the verified ancestry, and never over entries we already hold.
@@ -494,6 +505,7 @@ class Wallet:
             if only is not None and s not in only:
                 continue
             p = self.dossier.output(r)
+            self._represent_release(s, p["home"], _g)
             req = {"sigil": s, "header": header, "home": p["home"], "lock": p["lock"],
                    "salt": p["salt"], "unlock": unlocks.get(s, locks.empty_unlock())}
             seals.append(request_seal(self.network, req, self._stamp_for))
@@ -505,6 +517,8 @@ class Wallet:
         """Record a sealed transition and update holdings."""
         tid = self.dossier.add_transition(header, body, unlocks)
         self.pending.pop(tid, None)
+        for s, _g in header["inputs"]:
+            self.aborted.pop(s, None)
         homes = {o["home"] for o in body["outputs"]} | {self.dossier.output(r)["home"] for r in body["inputs"]}
         self.dossier.add_charters(self.network.registry, homes)
         for r in body["inputs"]:
@@ -576,11 +590,20 @@ class Wallet:
             pledge = self.pledged.get(s)
             if pledge is None or pledge[1] != tid:
                 continue
-            for w in self.network.witnesses(h["parcel"]["home"]):
+            home = h["parcel"]["home"]
+            for w in self.network.witnesses(home):
+                self._share_charters(w, proof)  # a witness can only verify evidence from charters it knows
                 try:
                     w.release(s, proof)
                 except Rejected:
-                    pass  # not bound to tid (or unreachable): it accepts g + 1 anyway
+                    pass  # not bound to tid, or unreachable: counted below
+            # Drop the pledge only once the input is really spendable at g + 1: a
+            # quorum of the home answers unbound at a generation <= g + 1. Otherwise
+            # keep the pledge and the pending transition so abort can be retried.
+            free = sum(1 for w in self.network.witnesses(home)
+                       if (st := _status(w, s)) is not None and st["tid"] is None and st["gen"] <= pledge[0] + 1)
+            if free < quorum(self._size(home)):
+                continue
             # Best effort: tell the home's successor committee too, so a successor
             # sees the binding died instead of finding the sigil contested (SPEC §5.5).
             for m in (self.network.committee(h["parcel"]["home"]) if hasattr(self.network, "committee") else []):
@@ -591,9 +614,41 @@ class Wallet:
                     pass
             h["gen"] = pledge[0] + 1
             del self.pledged[s]
+            self.aborted[s] = {"gen": pledge[0], "tid": tid, "proof": proof}
             released.append(s)
-        self.pending.pop(tid, None)
+        if not any(p[1] == tid for p in self.pledged.values()):
+            self.pending.pop(tid, None)
         return released
+
+    def _represent_release(self, sigil: str, home: str, gen: int) -> None:
+        """Before spending ``sigil`` at ``gen``, release it again at every witness that
+        still holds the binding we aborted below ``gen``."""
+        a = self.aborted.get(sigil)
+        if a is None or a["gen"] >= gen:
+            return
+        for w in self.network.witnesses(home):
+            st = _status(w, sigil)
+            if st is None or st["tid"] is None or st["gen"] >= gen:
+                continue
+            self._share_charters(w, a["proof"])
+            try:
+                w.release(sigil, a["proof"])
+            except Rejected:
+                pass
+
+    def _share_charters(self, w, proof: dict) -> None:
+        """Hand a witness the charter chains a death proof's evidence comes from (gossip)."""
+        if not hasattr(w, "gossip"):
+            return  # in-process witnesses share our registry
+        cids = {proof.get("parcel", {}).get("home")}
+        cids |= {proof.get("seal", {}).get("constellation")}
+        cids |= {v.get("constellation") for v in proof.get("votes", []) if isinstance(v, dict)}
+        chains = {c: self.network.registry.chain(c) for c in cids if c and self.network.registry.chain(c)}
+        if chains:
+            try:
+                w.gossip({"charters": chains})
+            except (Rejected, ValueError, KeyError, TypeError):
+                pass
 
     def kill_switch(self, home: str | None = None) -> dict:
         """A fresh one-unit parcel to add to a multi-party transition as a kill switch.

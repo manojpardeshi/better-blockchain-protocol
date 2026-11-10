@@ -99,12 +99,8 @@ jobs:
         run: python bench/interop.py
 
   integration:
-    # Soak (short) and compatibility integration tests: Rust and Python witness processes,
-    # wire twins generated from docs/WIRE.md, store and wallet formats, daemon operability
-    # (tests/integration/__init__.py lists the knobs). A long soak, locally:
-    #   SIGIL_SOAK_SECONDS=1800 python -m unittest tests.integration.test_soak
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 50
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -120,12 +116,19 @@ jobs:
           python-version: "3.12"
       - run: pip install cryptography
       - run: cargo build --release --locked --manifest-path rust/Cargo.toml
-      - name: Soak (3 minutes) and compatibility
+      # End-to-end user flows against multi-process constellations of Rust and Python
+      # witnesses, driven through the CLI wallet, RemoteNetwork and the daemons' HTTP
+      # endpoints (tests/integration). Fails rather than skips if the binary is missing.
+      # Also the soak (3 minutes here; SIGIL_SOAK_SECONDS=1800 for a long run) and the
+      # compatibility tests: wire twins generated from docs/WIRE.md, store and wallet
+      # formats, daemon operability (tests/integration/__init__.py lists the knobs).
+      - name: End-to-end, soak and compatibility integration tests
+        run: python -m unittest discover -v -s tests/integration -t .
         env:
+          SIGIL_REQUIRE_RUST: "1"
           SIGIL_SOAK_SECONDS: "180"
           SIGIL_SOAK_OUT: soak.json
           SIGIL_WIRE_OUT: wire.json
-        run: python -m unittest discover -s tests/integration -t . -v
       - uses: actions/upload-artifact@v4
         if: always()
         with:
