@@ -358,9 +358,8 @@ class NonVacuity(ChaosCase):
 
 
 class Findings(ChaosCase):
-    """Product bugs the chaos harness found. Each asserts the property that should hold."""
+    """Product bugs the chaos harness found, all fixed since. Each asserts the property that now holds."""
 
-    @unittest.expectedFailure
     def test_byzantine_malformed_status_crashes_honest_wallets(self):
         """FINDING (Medium, liveness / robustness; found by seeds 2 and 3 of
         ``python -m tests.integration.chaos.run --seeds 2-4``, reproduced here deterministically).
@@ -399,7 +398,6 @@ class Findings(ChaosCase):
                 errors.append(repr(e))
         self.assertEqual(errors, [], "a malformed STATUS from one Byzantine witness crashed an honest wallet")
 
-    @unittest.expectedFailure
     def test_released_pledge_resurrected_by_succession(self):
         """FINDING (Medium, liveness / owner intent; SPEC §4 rule 3 vs §5.5; found while
         analysing delayed-request + succession interleavings of the seeded runs, reproduced
@@ -446,12 +444,17 @@ class Findings(ChaosCase):
         t1 = next(iter(alice.pending))
         time.sleep(run.cfg.pledge_ttl + run.cfg.max_skew + 1.5)
         alice.release_expired_pledges()
-        self.assertTrue(any(r[:3] == (sigil, 0, t1) for r in run.released), "rule 3 released the pledge")
+        # Fixed: rule 3 also asks the committee, which mirrored T1, so the pledge is not
+        # released; alice completes T1 instead (re-authorising the same tid, rule 1).
+        self.assertFalse(any(r[:3] == (sigil, 0, t1) for r in run.released),
+                         "rule 3 released a pledge the committee holds in its mirror log")
+        self.assertIn(t1, alice.dossier.transitions, "alice completed the payment she authorised")
         self.assertEqual(run.op_succession(random.Random(3)), "ok")
+        # The successor's members may be bound to T1 now: alice's wallet agrees, the coin is spent.
         bound = [RemoteWitness(u).status(sigil)["tid"] for u in run.directory[cid]]
-        self.assertNotIn(t1, bound, "the successor's members are bound to the released transition")
+        self.assertTrue(set(bound) <= {t1, None}, bound)
+        self.assertNotIn(sigil, {h["sigil"] for h in alice.holdings.values()})
 
-    @unittest.expectedFailure
     def test_released_pledge_completed_by_replay_after_succession(self):
         """FINDING (same root cause as ``test_released_pledge_resurrected_by_succession``):
         the network adversary that held alice's lost T1 requests replays them after the
@@ -492,7 +495,6 @@ class Findings(ChaosCase):
                 pass
         found = kinds_of(self.check(run))
         self.assertNotIn("S4-holding-already-consumed", found)
-    @unittest.expectedFailure
     def test_swap_interrupted_after_kill_switches_never_settles(self):
         """FINDING (Medium-High, liveness: honest funds locked for good by a transient fault;
         found by the long run, e.g. ``--seeds 13,33,47,68,69`` with ``--ops 30``: their stuck
@@ -537,9 +539,13 @@ class Findings(ChaosCase):
         tid = model.transition_id(header)
         sigils = {s for s, _ in header["inputs"]}
         unlocks = {**a.authorise(header, body), **b.authorise(header, body)}
+        for w in (a, b):
+            w.cosign(header, unlocks)    # the parties exchange unlocks, as atomic_swap does
         kills = (a.kill_switches | b.kill_switches) & sigils
         a.seal(header, body, unlocks, only=sigils - kills)
         unlocks.update({**a.authorise(header, body, release_kill=True), **b.authorise(header, body, release_kill=True)})
+        for w in (a, b):
+            w.cosign(header, unlocks)
         for p in run.c.proxies.values():
             p.faults.only, p.faults.p_lose_reply = ("spend",), 1.0
         with self.assertRaises(SealFailed):
@@ -554,7 +560,6 @@ class Findings(ChaosCase):
         self.assertIn(tid, a.dossier.transitions)
         self.assertIn(tid, b.dossier.transitions)
 
-    @unittest.expectedFailure
     def test_failed_succession_attempt_halts_a_live_home(self):
         """FINDING (Medium, liveness; found by seed 39 of the long run, ``--seeds 39 --ops 30``,
         whose succession attempt failed and whose home then never voted again; reproduced
@@ -602,7 +607,8 @@ class Findings(ChaosCase):
             net.succeed(cid, new_urls, TOKEN)
         for i in home:
             c.probes[i].faults.partition = None
-        self.assertEqual(sum(RemoteStandby(u).info()["fenced"] for u in run.committees[cid]), 2)
+        # Succession is two-phase: with only two members agreeing, nobody was asked to sign.
+        self.assertEqual(sum(RemoteStandby(u).info()["fenced"] for u in run.committees[cid]), 0)
         time.sleep(1.5)
         try:
             with run._locked("alice", "bob"):

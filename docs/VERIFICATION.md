@@ -573,6 +573,66 @@ reporting `(gen, tid)`, as SPEC §9 says (code inspection, `MC_deep`,
 every input is sealed), but W5 lets a counter-party substitute the body; and
 two protocol-level gaps remain (below).
 
+## 4c. Integration tests on real processes (all bugs fixed)
+
+Three suites in `tests/integration/` run the daemons as separate processes
+(Rust and Python witnesses and standby members, mixed) and drive them with real
+wallets over HTTP. They are not part of the default `unittest discover`; CI's
+`integration` job runs all three (with a 180 s soak), and `chaos.yml` runs a
+60-minute seeded chaos run nightly.
+
+* **End-to-end** (`test_*.py`, fixtures `harness.py`): payments, the CLI,
+  double spends, gossip, persistence, crash recovery, rotation, succession,
+  swaps and admission control, each followed by global end-state invariants.
+* **Soak and compatibility** (`test_soak.py`, `test_store_compat.py`,
+  `test_wire_compat.py`, `test_daemon_ops.py`): four constellations under
+  load with rotations every 60 s and a dead-man takeover mid-run, recording
+  memory, file descriptors, store growth and latency (30- and 45-minute runs:
+  no leaks, flat witness latency); restarts on SQLite and redb stores, legacy
+  store and wallet formats; Rust and Python twins answering the same 470-odd
+  wire cases identically for every WIRE.md endpoint; daemon signals and bad
+  configurations.
+* **Fault injection** (`chaos/`): a fault-injecting proxy in front of every
+  process (drops, lost replies, delays past the timeout, duplicates, held
+  requests, partitions, SIGKILL before, during and after a request), clock
+  skew through an LD_PRELOAD shim, disk-full episodes, Byzantine witnesses
+  within *f*, interrupted rotations and successions. Safety invariants are
+  checked over every vote seen (no sigil consumed twice, one sealed tid per
+  `(sigil, gen)`, no honest equivocation, no vote lost by a restart, no vote
+  after a released pledge's expiry), plus wallet-level conservation. In about
+  2.1 hours of seeded runs (1,660 SIGKILLs, 705,000 proxied requests) there
+  was **no safety violation**. Mutated witnesses (Python and Rust: not
+  persisting before answering, not checking expiry) and Byzantine faults
+  beyond *f* are caught, which shows the invariants are not vacuous.
+
+They found eighteen bugs, none of them a safety violation of the witness
+protocol; each was pinned as an expected failure, shown to fail on the old
+code, and now runs as a regression test.
+
+| Suite | Bug | Fix |
+|---|---|---|
+| e2e | `abort` dropped a pledge when no witness had released | gossips the proof's charters first; frees the input only once a quorum answers unbound at ≤ *g*+1 |
+| e2e | a spent payment was re-credited while most of its home was down | `receive` fails closed: a quorum must answer, and a parcel the dossier shows consumed is refused |
+| e2e | the CLI could not spend in a home with a committee, or buy stamps | the directory takes a `committees` map; `buy-stamps` command |
+| e2e | a payment completed by a retry was never handed out | `pay` writes its payment file and lists it under `completed` |
+| e2e | an abort was lost across a succession when the committee missed the release | the wallet keeps the death proof and presents it again to members still bound below the new generation |
+| e2e | `address --home` accepted untrusted constellations | refused; `trust` command |
+| soak | FREEZE froze for good for a malformed successor body | FREEZE checks the body can become a valid version *v*+1 (Python and Rust) |
+| soak | the Rust daemons answered `GET /v0/<name>` with an empty 405 | a JSON 404 `bad_request` |
+| soak | a negative or NaN `--rate-limit` turned admission control off | refused at argument parsing (0 still disables it) |
+| soak | the Python daemon reported bad configurations with a traceback | one line naming the problem |
+| soak | a wallet saved before `issued` existed rejected payments to addresses it gave out earlier | on legacy load, `sig(pk)` for a key no parcel uses yet is accepted once |
+| soak | every swap left a new one-unit kill-switch asset behind | the unit a swap returns is the next kill switch |
+| soak | a wallet's dossier kept the history of everything it ever spent | `Wallet.prune` after a payment is handed over; consumed sigils are remembered in `spent` |
+| chaos | a malformed STATUS reply from one Byzantine witness crashed honest wallets | `RemoteWitness.status` checks the shape; a bad reply counts as no answer |
+| chaos | a pledge released under §4 rule 3 came back after a succession (the committee had mirrored it) | rule 3 also asks every standby member (new `POST /v0/status` on standby members); the pledge stays and the wallet completes the transition |
+| chaos | a swap interrupted after its kill switches were released never settled | each party keeps the others' unlocks (`Wallet.cosign`); a kill switch already pledged to the same tid is re-signed; a settling transition is retried with the unlocks held |
+| chaos | a failed succession attempt fenced a minority and halted a live home | two-phase succession: `dead` in standby info is read first, SUCCEED sent only once a quorum agrees |
+
+The last two chaos fixes make the code stricter than the models (rule 3 asks
+more members before releasing; succession asks before signing), so the
+verified properties still cover it.
+
 ## 5. What is **not** verified (the honest gaps)
 
 The results above concern the **witness protocol and its abstract model** under
@@ -658,6 +718,12 @@ SIGIL_CONFORMANCE_SEEDS=120 SIGIL_CONFORMANCE_STEPS=150 \
 # the wallet: conformance of the real Wallet, and the open bugs (expected failures)
 python -m unittest tests.test_wallet_conformance tests.test_wallet_findings
 SIGIL_WALLET_SEEDS=80 SIGIL_WALLET_STEPS=80 python -m unittest tests.test_wallet_conformance
+
+# integration suites on real processes (needs the Rust binary; ~20 min with the 180 s soak):
+cargo build --release --locked --manifest-path rust/Cargo.toml
+python -m unittest discover -s tests/integration -t .
+SIGIL_SOAK_SECONDS=1800 python -m unittest tests.integration.test_soak     # a long soak
+python -m tests.integration.chaos.run --seeds 1-70                        # a long chaos run
 ```
 
 Tooling: TLAPS (tlapm 1.6.0-pre, bundling Zenon/Z3/Isabelle) and TLC

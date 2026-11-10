@@ -369,9 +369,19 @@ class Wallet:
         can never complete, abort it with a death proof (rule 2).
         """
         now = int(self.clock())
-        freed = []
+        freed, retried = [], set()
         for s, (_g, tid, exp) in list(self.pledged.items()):
-            if s not in self.pledged or now <= exp + self.max_skew:
+            if s not in self.pledged:
+                continue
+            if now <= exp + self.max_skew:
+                # A transition we are already settling: retry it with the unlocks we hold, so
+                # it completes as soon as it can (e.g. once a counter-party finished it),
+                # without signing again (which would push the expiry out once more).
+                if tid in self.pending and self.pending[tid].get("settling") and tid not in retried:
+                    retried.add(tid)
+                    self._reseal(tid)
+                    if s not in self.pledged:
+                        freed.append(s)
                 continue
             if self.unpledge_if_unbound(s):
                 self.pending.pop(tid, None)
@@ -385,6 +395,7 @@ class Wallet:
     def _settle(self, tid: str) -> None:
         """Complete a pending transition, or abort it if it is provably dead."""
         p = self.pending[tid]
+        p["settling"] = True
         header, body = p["header"], p["body"]
         try:
             self.abort(header)
@@ -399,6 +410,17 @@ class Wallet:
         except (SealFailed, ValueError):
             return  # still in limbo (or refused for now); a later call tries again
         self.finalise(header, body, unlocks)
+        self.completed.append(tid)
+
+    def _reseal(self, tid: str) -> None:
+        """Seal a pending transition again with the unlocks already signed (no new pledge)."""
+        p = self.pending[tid]
+        unlocks = {**p.get("others", {}), **p.get("mine", {})}
+        try:
+            self.seal(p["header"], p["body"], unlocks)
+        except (SealFailed, ValueError):
+            return
+        self.finalise(p["header"], p["body"], unlocks)
         self.completed.append(tid)
 
     def cosign(self, header: dict, unlocks: dict) -> None:
@@ -536,10 +558,12 @@ class Wallet:
             keep = prior[2] if prior is not None and prior[:2] == (g, tid) else expires
             self.pledged[s] = (g, tid, max(keep, expires))
         if ours:
-            others = self.pending.get(tid, {}).get("others")
-            self.pending[tid] = {"header": header, "body": body, "extra": extra}
-            if others:
-                self.pending[tid]["others"] = others
+            prev = self.pending.get(tid, {})
+            self.pending[tid] = {"header": header, "body": body, "extra": extra,
+                                 "mine": {**prev.get("mine", {}), **unlocks}}
+            for k in ("others", "settling"):
+                if k in prev:
+                    self.pending[tid][k] = prev[k]
             if self.on_pledge is not None:
                 self.on_pledge(self)
         return unlocks
