@@ -517,6 +517,10 @@ class Findings(ChaosCase):
 
         Impact: both parties' coins (and their kill switches) are locked permanently by a
         transient network fault, with no adversary; the other party's outputs are lost to it.
+        The same root cause strands the transaction ``abort`` builds to spend a kill switch
+        elsewhere (``Wallet._pull_kill_switch``, ``release_kill=True``) when only some witnesses
+        bound it before a fault: ``_settle`` re-authorises it without the kill switch's unlock,
+        forever (long-run seeds 209 and 225).
 
         Suggested fix: persist the whole multi-party authorisation in each party's ``pending``
         (pass every party's unlocks as ``extra``), let ``_settle`` re-authorise a kill switch

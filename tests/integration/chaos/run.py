@@ -1056,7 +1056,10 @@ class ChaosRun:
             for s, (g, tid, exp) in self._live_pledges(w).items():
                 # An interrupted swap whose kill switches were already released can never be
                 # finished or aborted by the wallet (test_chaos.Findings): known, reported apart.
-                kind = "known:swap-unfinishable" if any(t == tid for *_, t in self.swaps) else "pledge-unsettled"
+                # The same root cause strands the transaction ``abort`` uses to spend a kill switch
+                # elsewhere (``_pull_kill_switch``) when only some witnesses bound it.
+                swap = any(t == tid for *_, t in self.swaps) or s in w.kill_switches
+                kind = "known:swap-unfinishable" if swap else "pledge-unsettled"
                 self.liveness.append({"kind": kind, "wallet": name, "sigil": s, "gen": g, "tid": tid,
                                       **self._diagnose(w, s, g, tid)})
         for payer, payee, tid, refs in self.undelivered:
