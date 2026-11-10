@@ -45,10 +45,11 @@ A standby member of a successor committee (SPEC §5.5) is served like a witness 
 
 | Method | Path | Body | `ok` result |
 |---|---|---|---|
-| GET | `/v0/info` | — | `{pk, role: "standby", constellation, version, fenced, frozen: false, stamps: null}` |
+| GET | `/v0/info` | — | `{pk, role: "standby", constellation, version, fenced, dead, frozen: false, stamps: null}` |
 | GET | `/v0/charters`, `/v0/proofs`; POST `/v0/gossip` | as for a witness | as for a witness |
 | POST | `/v0/mirror` | `{request}`: a SPEND request plus the `version` it is for | mirror ack `{constellation, version, member, sigil, gen, tid, sig}` |
 | POST | `/v0/note_release` | `{sigil, entry}`: a release entry `{kind: "release", gen, tid, header, proof}` for a binding it holds | `true` if new, `false` if held already |
+| POST | `/v0/status` | `{sigil}` | `{bindings: [[gen, tid], …]}`: every binding of the sigil in its mirror log (holders ask before releasing a pledge, SPEC §4 rule 3) |
 | POST | `/v0/standby` (admin) | `{constellation, version, snapshots: [snapshot, …]}`: the handover of a later version | `{constellation, version}` |
 | POST | `/v0/succeed` (admin) | `{charter, sigs?}`: the next charter's body, and the members' signatures on it for a cooperative rotation | `{sig, snapshot}`: its signature and whole mirror log |
 | POST | `/v0/probe` (admin) | `{urls?}`: member URLs to challenge now (default: `--members`) | `{answered}`: how many valid heartbeats came back |
@@ -57,7 +58,7 @@ A standby member of a successor committee (SPEC §5.5) is served like a witness 
 * `--members URL …` and `--probe-every S` make the standby member challenge the members of its version for heartbeats in the background (`--probe-every` 60 in a deployment). It signs a successor only cooperatively (`sigs` holds a quorum of the version's members' signatures on it) or once fewer than a quorum of members answered during the last `dead_man` seconds and it has stood by that long; a restart starts a new observation window.
 * A standby member signs one successor per version and fences for it (also after a restart): asked again for the same body it answers the same, for any other `rejected`; once fenced it acknowledges and stores nothing for that version. A fresh store stands by for version 0 at once; for a later version start it with `--wait` and send the handover with `/v0/standby`. `standby`, `succeed` and `probe` are operator calls (`--admin-token FILE`), never rate limited.
 
-`RemoteNetwork(directory, committees={cid: [standby URL, …]})` sends acks with every payment. `RemoteNetwork.succeed(cid, new_urls, admin_token, committee_urls=…, dead_man=…)` drives a dead-man takeover: each standby member signs the next charter only if the dead-man condition holds for it; with a quorum, the new chain is gossiped, the new members adopt the signers' mirror logs, and the new committee (if any) enters standby with the same handover. `RemoteNetwork.rotate` of a version with a committee also asks the committee to co-sign, passing the members' signatures as the request. A charter's `successor` clause is set at genesis with `witnessd genesis --committee K … --dead-man S` (both daemons).
+`RemoteNetwork(directory, committees={cid: [standby URL, …]})` sends acks with every payment. `RemoteNetwork.succeed(cid, new_urls, admin_token, committee_urls=…, dead_man=…)` drives a dead-man takeover in two phases: it first reads `dead` from each standby member's `/v0/info` and sends SUCCEED only if a quorum reports the version dead (a member that signs fences at once, so a minority must never be asked alone; a successor body some member signed must be completed, never abandoned); then each standby member signs the next charter only if the dead-man condition holds for it; with a quorum, the new chain is gossiped, the new members adopt the signers' mirror logs, and the new committee (if any) enters standby with the same handover. `RemoteNetwork.rotate` of a version with a committee also asks the committee to co-sign, passing the members' signatures as the request. A charter's `successor` clause is set at genesis with `witnessd genesis --committee K … --dead-man S` (both daemons).
 
 ## Admission control
 

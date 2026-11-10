@@ -116,6 +116,7 @@ class Standby:
         self.version: int | None = None
         self.mirror: dict[str, list] = {}      # sigil -> log entries (handover evidence + mirrored)
         self.mirrored: set[tuple] = set()      # (sigil, gen, tid) of every verified binding stored
+        self._by_sigil: dict[str, set] = {}     # sigil -> {(gen, tid)} of self.mirrored
         self._tids: dict[tuple, int] = {}      # (sigil, gen) -> how many of them
         self.fenced_for: str | None = None     # hash of the one successor we signed
         self.heard: dict[str, int] = {}        # member pk -> when it last answered our challenge
@@ -150,7 +151,7 @@ class Standby:
             self.store.append(list(entries))
 
     def _set_mirrored(self, binds: set) -> None:
-        self.mirrored, self._tids = set(), {}
+        self.mirrored, self._tids, self._by_sigil = set(), {}, {}
         for b in binds:
             self._add_mirrored(*b)
 
@@ -158,6 +159,7 @@ class Standby:
         if (sigil, gen, tid) not in self.mirrored:
             self.mirrored.add((sigil, gen, tid))
             self._tids[(sigil, gen)] = self._tids.get((sigil, gen), 0) + 1
+            self._by_sigil.setdefault(sigil, set()).add((gen, tid))
 
     # ------------------------------------------------------------ standing by
 
@@ -356,10 +358,20 @@ class Standby:
 
     # ----------------------------------------------------------------- query
 
+    def status(self, sigil) -> dict:
+        """STATUS: the ``[gen, tid]`` of every binding of ``sigil`` in our mirror log.
+
+        A holder asks before it concludes an expired pledge bound nothing (SPEC §4 rule 3):
+        a binding we mirrored is inherited by a successor if the home is taken over.
+        """
+        if isinstance(sigil, (list, dict)):
+            raise TypeError("unhashable sigil")
+        return {"bindings": sorted([g, t] for g, t in self._by_sigil.get(sigil, ()))}
+
     def snapshot(self) -> dict:
         """Our mirror log, in FREEZE snapshot format (SPEC §5.4)."""
         return {s: list(log) for s, log in self.mirror.items()}
 
     def info(self) -> dict:
         return {"pk": self.pk, "role": "standby", "constellation": self.cid, "version": self.version,
-                "fenced": self.fenced_for is not None}
+                "fenced": self.fenced_for is not None, "dead": self.dead()}

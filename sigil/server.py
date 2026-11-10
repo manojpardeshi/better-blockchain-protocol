@@ -300,6 +300,8 @@ class StandbyServer(WitnessServer):
                 return s.mirror_bind(body["request"])
             if method == "note_release":
                 return s.note_release(body["sigil"], body["entry"])
+            if method == "status":
+                return s.status(body["sigil"])
             if method == "gossip":
                 return self.gossip.merge(body)
             if method == "standby":
@@ -362,6 +364,16 @@ class _RemoteStamps:
         self.public = public
 
 
+def _is_int(x) -> bool:
+    return isinstance(x, int) and not isinstance(x, bool)
+
+
+def _vote_shaped(v) -> bool:
+    """A vote object with the fields of the right types (its signature is checked elsewhere)."""
+    return (isinstance(v, dict) and _is_int(v.get("gen")) and _is_int(v.get("version")) and _is_int(v.get("time"))
+            and all(isinstance(v.get(k), str) for k in ("constellation", "witness", "sigil", "tid", "sig")))
+
+
 class RemoteWitness:
     """A witness reached over HTTP, with the same interface as ``Witness``."""
 
@@ -413,7 +425,16 @@ class RemoteWitness:
         return self._call("release", {"sigil": sigil, "proof": proof})
 
     def status(self, sigil: str) -> dict:
-        return self._call("status", {"sigil": sigil})
+        # Nothing a witness sends is trusted (WIRE.md): a reply of the wrong shape counts as
+        # no answer, and votes that are not well-formed vote objects are dropped (the rest
+        # are still verified by whoever uses them).
+        st = self._call("status", {"sigil": sigil})
+        if not (isinstance(st, dict) and _is_int(st.get("gen")) and st["gen"] >= 0
+                and (st.get("tid") is None or isinstance(st.get("tid"), str))
+                and isinstance(st.get("votes"), list)):
+            raise Unreachable(f"{self.url}: malformed STATUS reply")
+        votes = [v for v in st["votes"] if _vote_shaped(v)]
+        return dict(st, votes=votes)
 
     def heartbeat(self, challenge: str) -> dict:
         return self._call("heartbeat", {"challenge": challenge})
@@ -499,6 +520,15 @@ class RemoteStandby(RemoteWitness):
 
     def probe(self, urls: list) -> int:
         return self._call("probe", {"urls": list(urls)})["answered"]
+
+    def status(self, sigil: str) -> dict:
+        """The ``{bindings: [[gen, tid], ...]}`` of ``sigil`` in the member's mirror log."""
+        st = self._call("status", {"sigil": sigil})
+        if not (isinstance(st, dict) and isinstance(st.get("bindings"), list)
+                and all(isinstance(b, list) and len(b) == 2 and _is_int(b[0]) and isinstance(b[1], str)
+                        for b in st["bindings"])):
+            raise Unreachable(f"{self.url}: malformed STATUS reply")
+        return st
 
     def info(self) -> dict:
         return self._get("info")
@@ -633,9 +663,27 @@ class RemoteNetwork:
         new = [RemoteWitness(u, self.timeout, admin_token=token(u)) for u in new_urls]
         standbys, succ = self._new_committee(committee_urls, dead_man, token)
         nxt = charter_body(cur["name"], cur["version"] + 1, [w.pk for w in new], charter_hash(cur), succ)
+        # Two phases: a member that signs fences at once (SPEC §5.5), so asking members one by
+        # one could fence a minority and leave a live home unable to collect an ack quorum.
+        # First ask each (read-only) whether it considers the version dead; send SUCCEED only
+        # if a quorum does. (A member's view can still change in between; a successor body
+        # some member signed must then be completed, never abandoned.)
+        committee = cur["successor"]["committee"]
+        agree = set()
+        for url in self.committees.get(cid, []):
+            try:
+                m = RemoteStandby(url, self.timeout)
+                info = m.info()
+            except Rejected:
+                continue
+            if (m.pk in committee and isinstance(info, dict) and info.get("dead") is True
+                    and info.get("version") == cur["version"]):
+                agree.add(m.pk)
+        if len(agree) < quorum(len(committee)):
+            raise RuntimeError("not enough standby members agree the version is dead")
         snapshots: list = []
         sigs = self._committee_sign(cid, cur, nxt, {}, snapshots, token)
-        if len(sigs) < quorum(len(cur["successor"]["committee"])):
+        if len(sigs) < quorum(len(committee)):
             raise RuntimeError("not enough standby members agree the version is dead")
         return self._install(cid, chain, cur, nxt, sigs, snapshots, new, set(), standbys,
                              list(new_urls), list(committee_urls or []))

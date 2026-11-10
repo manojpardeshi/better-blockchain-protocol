@@ -58,6 +58,8 @@ struct State {
     mirrored: HashSet<(String, i128, String)>,
     /// `(sigil, gen)` -> how many of them.
     tids: HashMap<(String, i128), usize>,
+    /// sigil -> `(gen, tid)` of its mirrored bindings, for STATUS.
+    by_sigil: HashMap<String, HashSet<(i128, String)>>,
     /// The hash of the one successor we signed (we fenced for it).
     fenced_for: Option<String>,
     /// member pk -> when it last answered one of our challenges.
@@ -70,6 +72,7 @@ impl State {
     fn set_mirrored(&mut self, binds: HashSet<(String, i128, String)>) {
         self.mirrored.clear();
         self.tids.clear();
+        self.by_sigil.clear();
         for (s, g, t) in binds {
             self.add_mirrored(s, g, t);
         }
@@ -77,8 +80,9 @@ impl State {
 
     fn add_mirrored(&mut self, sigil: String, gen: i128, tid: String) {
         let key = (sigil.clone(), gen);
-        if self.mirrored.insert((sigil, gen, tid)) {
+        if self.mirrored.insert((sigil.clone(), gen, tid.clone())) {
             *self.tids.entry(key).or_insert(0) += 1;
+            self.by_sigil.entry(sigil).or_default().insert((gen, tid));
         }
     }
 }
@@ -187,6 +191,7 @@ impl Standby {
             mirror: HashMap::new(),
             mirrored: HashSet::new(),
             tids: HashMap::new(),
+            by_sigil: HashMap::new(),
             fenced_for: None,
             heard: HashMap::new(),
             since: now,
@@ -567,6 +572,25 @@ impl Standby {
         self.gossip.lock().expect("gossip lock").snapshot_json()
     }
 
+    /// STATUS: the `[gen, tid]` of every binding of `sigil` in our mirror log, so a holder can
+    /// see a binding a successor would inherit before it concludes an expired pledge bound
+    /// nothing (SPEC §4 rule 3).
+    pub fn status(&self, sigil: &Json) -> Outcome {
+        if matches!(sigil, Json::Arr(_) | Json::Obj(_)) {
+            return (Err(Error::BadRequest("unhashable sigil".into())), 0);
+        }
+        let st = self.state.lock().expect("state lock");
+        let mut binds: Vec<(i128, String)> =
+            sigil.as_str().and_then(|s| st.by_sigil.get(s)).map(|b| b.iter().cloned().collect()).unwrap_or_default();
+        binds.sort();
+        let out = obj([(
+            "bindings",
+            Json::Arr(binds.into_iter().map(|(g, t)| Json::Arr(vec![Json::Int(g), Json::str(&t)])).collect()),
+        )]);
+        let seq = self.store.last_submitted();
+        (Ok(out), seq)
+    }
+
     /// `/v0/info`, as the reference's `StandbyServer.info`.
     pub fn info(&self) -> Json {
         let st = self.state.lock().expect("state lock");
@@ -580,6 +604,7 @@ impl Standby {
             ("constellation", cid),
             ("version", version),
             ("fenced", Json::Bool(st.fenced_for.is_some())),
+            ("dead", Json::Bool(self.dead_locked(&st))),
             ("frozen", Json::Bool(false)),
             ("stamps", Json::Null),
         ])

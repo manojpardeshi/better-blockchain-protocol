@@ -266,7 +266,7 @@ class WireCompatTests(unittest.TestCase):
         for path, fields in (("/v0/freeze", ["charter"]), ("/v0/adopt", ["constellation", "version", "snapshots"])):
             r.generic(P, W, path, fields, self.token, admin=True)
         for path, fields in (("/v0/mirror", ["request"]), ("/v0/note_release", ["sigil", "entry"]),
-                             ("/v0/gossip", ["charters", "proofs", "forks"])):
+                             ("/v0/status", ["sigil"]), ("/v0/gossip", ["charters", "proofs", "forks"])):
             r.generic(SB, S, path, fields)
         for path, fields in (("/v0/standby", ["constellation", "version", "snapshots"]),
                              ("/v0/succeed", ["charter", "sigs"]), ("/v0/probe", ["urls"])):
@@ -444,6 +444,11 @@ class WireCompatTests(unittest.TestCase):
         r.send("note_release unknown binding", SB, S, "/v0/note_release", {"sigil": "00" * 32, "entry": entry})
         r.send("note_release valid", SB, S, "/v0/note_release", {"sigil": sh, "entry": entry})
         r.send("note_release again", SB, S, "/v0/note_release", {"sigil": sh, "entry": entry})
+        # status: the bindings of a sigil in the mirror log (several transitions at gen 0), none, junk.
+        r.send("standby status mirrored", SB, S, "/v0/status", {"sigil": sh}, expect=200)
+        r.send("standby status unknown", SB, S, "/v0/status", {"sigil": "00" * 32}, expect=200)
+        for v in TYPE_FUZZ:
+            r.send(f"standby status sigil {v!r:.20}", SB, S, "/v0/status", {"sigil": v})
         # probe: no URLs, a dead URL, the heir witnesses (alive).
         r.send("probe no urls", SB, S, "/v0/probe", {"urls": []}, headers=tok, expect=200)
         r.send("probe urls not strings", SB, S, "/v0/probe", {"urls": [5]}, headers=tok)

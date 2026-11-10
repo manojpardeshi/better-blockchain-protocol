@@ -138,6 +138,9 @@ class Network:
             raise ValueError("this version names no successor committee")
         ckeys, succ = self._committee_keys(successor)
         nxt = charter_body(cur["name"], cur["version"] + 1, [k.pk for k in new_keys], charter_hash(cur), succ)
+        # Two phases (as RemoteNetwork.succeed): ask first, so a minority never fences alone.
+        if sum(1 for m in self.committee(cid) if m.dead()) < quorum(len(cur["successor"]["committee"])):
+            raise RuntimeError("not enough standby members agree the version is dead")
         snapshots: list = []
         sigs = self._committee_signatures(cid, nxt, {}, snapshots)
         if len(sigs) < quorum(len(cur["successor"]["committee"])):

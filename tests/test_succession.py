@@ -439,6 +439,9 @@ class AckWithoutStoring(Standby):
     def succeed(self, next_charter, sigs=None):
         return sign_charter(self.kp, next_charter), {}
 
+    def dead(self):
+        return True  # and says so when asked first (two-phase succession)
+
 
 class AdversarialTests(unittest.TestCase):
     def assert_no_double_seal(self, h, sigils):

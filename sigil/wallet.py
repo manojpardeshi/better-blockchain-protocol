@@ -392,12 +392,32 @@ class Wallet:
         except ValueError:
             pass  # not provably dead: try to complete it
         try:
-            unlocks = self.authorise(header, body, p.get("extra"))
+            # The other parties' unlocks of a multi-party transition (cosign) re-seal their
+            # inputs: a witness already bound to this tid votes again on them even once expired.
+            unlocks = {**p.get("others", {}), **self.authorise(header, body, p.get("extra"))}
             self.seal(header, body, unlocks)
         except (SealFailed, ValueError):
             return  # still in limbo (or refused for now); a later call tries again
         self.finalise(header, body, unlocks)
         self.completed.append(tid)
+
+    def cosign(self, header: dict, unlocks: dict) -> None:
+        """Keep the other parties' unlocks of a multi-party transition we authorised.
+
+        Without them a transition interrupted after every input was bound could never be
+        re-sealed by us (only the owner of an input can unlock it), and with no death proof
+        possible it could never be aborted either: our inputs would stay pledged for good.
+        """
+        tid = model.transition_id(header)
+        p = self.pending.get(tid)
+        if p is None:
+            return
+        mine = {h["sigil"] for h in self.holdings.values()}
+        others = dict(p.get("others", {}))
+        others.update({s: u for s, u in unlocks.items() if s not in mine})
+        p["others"] = others
+        if self.on_pledge is not None:
+            self.on_pledge(self)
 
     def select(self, asset: str, amount: int) -> tuple[list, int]:
         self.release_expired_pledges()
@@ -502,8 +522,10 @@ class Wallet:
             ours.append((r, s, g, h))
         unlocks = {}
         for r, s, g, h in ours:
-            if s in self.kill_switches and not release_kill:
+            if s in self.kill_switches and not release_kill and (prior := self.pledged.get(s)) is None:
                 continue  # withheld: no unlock and no pledge yet
+            if s in self.kill_switches and not release_kill and prior[1] != tid:
+                continue  # pledged elsewhere: never signed for this transition
             prior = self.pledged.get(s)
             u = locks.empty_unlock(expires)
             for pk in keys_in(h["parcel"]["lock"]) & set(self.keys):
@@ -514,7 +536,10 @@ class Wallet:
             keep = prior[2] if prior is not None and prior[:2] == (g, tid) else expires
             self.pledged[s] = (g, tid, max(keep, expires))
         if ours:
+            others = self.pending.get(tid, {}).get("others")
             self.pending[tid] = {"header": header, "body": body, "extra": extra}
+            if others:
+                self.pending[tid]["others"] = others
             if self.on_pledge is not None:
                 self.on_pledge(self)
         return unlocks
@@ -590,7 +615,8 @@ class Wallet:
         That needs both: our authorisation has expired with margin for clock
         skew (``now > expires + max_skew``), so no delayed request can still
         newly bind the sigil; and every member of the home answered and
-        none holds a binding or vote for it.
+        none holds a binding or vote for it, nor (with a successor committee)
+        does any standby member hold it in its mirror log.
         """
         pledge = self.pledged.get(sigil)
         h = next((h for h in self.holdings.values() if h["sigil"] == sigil), None)
@@ -611,6 +637,22 @@ class Wallet:
             answered += 1
         if answered < self._size(home):
             return False  # some member could not even be contacted
+        # A binding the successor committee mirrored is inherited by the members of a
+        # successor if the home is taken over (SPEC §5.4/§5.5): it is not dead either.
+        charter = self.network.registry.latest(home)
+        committee = (charter or {}).get("successor")
+        if committee is not None:
+            members = {m.pk: m for m in self.network.committee(home)}
+            for pk in committee["committee"]:
+                m = members.get(pk)
+                try:
+                    st = m.status(sigil) if m is not None else None
+                except Rejected:
+                    st = None
+                if st is None:
+                    return False  # unreachable: it might hold the binding
+                if [gen, tid] in st["bindings"]:
+                    return False
         del self.pledged[sigil]
         return True
 

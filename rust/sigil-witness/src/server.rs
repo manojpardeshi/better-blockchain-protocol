@@ -335,6 +335,7 @@ async fn sb_call(State(app): State<StandbyApp>, Path(method): Path<String>, head
             (Err(r), _) | (_, Err(r)) => Err(r),
         },
         "gossip" => blocking(move || s.gossip(&body)).await,
+        "status" => field(&body, "sigil").map(|x| s.status(x)),
         "standby" => {
             let checked = field(&body, "constellation")
                 .and_then(|_| field(&body, "version"))

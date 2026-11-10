@@ -370,7 +370,7 @@ class Witness:
         if self.cid is None:
             raise Rejected("witness not active")
         cur = self.registry.charter(self.cid, self.version)
-        if not isinstance(next_charter, dict) or next_charter.get("prev") != charter_hash(cur):
+        if next_charter["prev"] != charter_hash(cur):  # not an object, or no prev: bad_request
             raise Rejected("charter does not extend ours")
         # Freezing is irreversible, so only for a body that can become a valid version v+1:
         # the same name, the next version, a well-formed witness list and successor clause
