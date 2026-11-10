@@ -15,7 +15,18 @@ for what is checked.
 * ``NonVacuity`` shows the checks have teeth: a witness that votes without persisting, one
   that skips the expiry check, Byzantine witnesses beyond *f* and clocks beyond the skew
   bound must each be reported as violations.
-* ``Findings`` are product bugs found by the harness, as ``expectedFailure`` tests.
+* ``Findings`` are product bugs found by the harness, as ``expectedFailure`` tests: a
+  malformed STATUS from one Byzantine witness crashes honest wallets; a pledge released under
+  rule 3 is resurrected (and can be completed) after a succession; an atomic swap interrupted
+  after its kill switches were released can never be finished or aborted; a failed succession
+  attempt fences standby members and halts a live home. The seeded runs report the last three
+  as ``known:`` liveness entries instead of failing.
+
+Environment: ``SIGIL_CHAOS_SEEDS`` (default 101,102,103), ``SIGIL_CHAOS_OPS`` (18),
+``SIGIL_CHAOS_STRICT_LIVENESS`` (1), ``SIGIL_CHAOS_VERBOSE``, ``SIGIL_CHAOS_TRACE`` (Python
+witnesses log the traceback behind every HTTP 500), ``SIGIL_CHAOS_KEEP_FAILED`` (keep the
+directories of failed runs), ``SIGIL_CHAOS_RUST_MUTANTS=1`` (build and check mutated Rust
+witnesses).
 """
 
 import os
