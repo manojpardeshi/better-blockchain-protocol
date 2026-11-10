@@ -81,16 +81,12 @@ class _FreezeValidation:
 class PythonFreezeValidation(_FreezeValidation, unittest.TestCase):
     __doc__ = _FreezeValidation.__doc__
     KIND = "python"
-    test_freeze_refuses_a_malformed_successor = unittest.expectedFailure(
-        _FreezeValidation.test_freeze_refuses_a_malformed_successor)
 
 
 @requires_rust
 class RustFreezeValidation(_FreezeValidation, unittest.TestCase):
     __doc__ = _FreezeValidation.__doc__
     KIND = "rust"
-    test_freeze_refuses_a_malformed_successor = unittest.expectedFailure(
-        _FreezeValidation.test_freeze_refuses_a_malformed_successor)
 
 
 @requires_rust
@@ -113,7 +109,6 @@ class RustGetUnknownPath(unittest.TestCase):
     for both ``router_with_limits`` and ``standby_router``.
     """
 
-    @unittest.expectedFailure
     def test_get_unknown_path_is_json(self):
         d = make_tmpdir(self, "get405")
         c = new_constellation(d, "g", 4)
@@ -148,7 +143,6 @@ class LegacyWalletPreUpgradeAddress(unittest.TestCase):
     wallet issued), or record ``issued`` lazily from ``keys.json`` on first load.
     """
 
-    @unittest.expectedFailure
     def test_address_issued_before_upgrade_still_receives(self):
         d = make_tmpdir(self, "legacy-issued")
         c = Cluster(d)
@@ -196,7 +190,6 @@ class KillSwitchDust(unittest.TestCase):
     from ``kill_switches`` once they are spent or no longer held.
     """
 
-    @unittest.expectedFailure
     def test_swaps_do_not_accumulate_kill_switch_parcels(self):
         from sigil import Network
         from sigil.swap import atomic_swap
@@ -233,7 +226,6 @@ class WalletDossierNeverPruned(unittest.TestCase):
     problem: dossier growth.)
     """
 
-    @unittest.expectedFailure
     def test_dossier_drops_history_of_spent_parcels(self):
         from sigil import Network
         net = Network()

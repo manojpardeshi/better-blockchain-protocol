@@ -12,6 +12,7 @@ class DeepConfirmationTests(unittest.TestCase):
         self.net = Network()
         self.X = self.net.create_constellation("orion")
         self.alice = Wallet("alice", self.net, self.X)
+        self.alice.auto_prune = False   # the forger re-spends a parcel it paid away in full
         self.bob = Wallet("bob", self.net, self.X)
         self.usd = self.alice.issue("USD", 1_000)
 

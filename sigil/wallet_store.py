@@ -78,6 +78,8 @@ def save(wallet: Wallet, wallet_dir: str) -> None:
         "completed": wallet.completed,
         "issued": sorted(wallet.issued),
         "kill_switches": sorted(wallet.kill_switches),
+        "legacy_keys": sorted(wallet.legacy_keys),
+        "spent": sorted(wallet.spent),
         "aborted": wallet.aborted,
         "stamps": {pk: list(v) for pk, v in wallet.stamps.items() if v},
         "confirmed": sorted(list(c) for c in wallet._confirmed),
@@ -118,8 +120,29 @@ def load(wallet_dir: str, network) -> Wallet:
                  for s, v in state["pledged"].items()}
     w.pending = state.get("pending", {})
     w.completed = state.get("completed", [])
-    # Older wallets did not record issued addresses: accept the ones we hold.
-    w.issued = set(state.get("issued", [h["sigil"] for h in w.holdings.values()]))
+    if "issued" in state:
+        w.issued = set(state["issued"])
+        w.legacy_keys = set(state.get("legacy_keys", []))
+    else:
+        # Older wallets did not record issued addresses: accept the ones we hold, and any
+        # address given out before (one fresh key each): sig(pk) for a key no parcel uses yet.
+        w.issued = {h["sigil"] for h in w.holdings.values()}
+        used = set()
+
+        def walk(x):
+            if isinstance(x, str):
+                used.add(x)
+            elif isinstance(x, dict):
+                for v in x.values():
+                    walk(v)
+            elif isinstance(x, list):
+                for v in x:
+                    walk(v)
+
+        for tx in dossier.transitions.values():
+            walk([o.get("lock") for o in tx["body"]["outputs"]])
+        w.legacy_keys = set(w.keys) - used
+    w.spent = set(state.get("spent", []))
     w.kill_switches = set(state.get("kill_switches", []))
     w.aborted = state.get("aborted", {})
     w.stamps = defaultdict(list, {pk: list(v) for pk, v in state["stamps"].items()})

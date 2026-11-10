@@ -237,7 +237,6 @@ class DaemonConfigFindings(BadConfigTests):
 
     test_bad_configs_exit_with_a_clear_error = None
 
-    @unittest.expectedFailure
     def test_python_config_errors_without_traceback(self):
         """The Python daemon reports most bad configurations with a raw traceback.
 
@@ -286,7 +285,6 @@ class DaemonConfigFindings(BadConfigTests):
                 unlimited.append(value)
         self.assertEqual(unlimited, [], f"{kind} served without a rate limit on 0.0.0.0 for --rate-limit {unlimited}")
 
-    @unittest.expectedFailure
     def test_python_refuses_negative_or_nan_rate_limit(self):
         """A negative or NaN ``--rate-limit`` silently turns admission control off.
 
@@ -306,7 +304,6 @@ class DaemonConfigFindings(BadConfigTests):
         self._rate_case("python")
 
     @requires_rust
-    @unittest.expectedFailure
     def test_rust_refuses_negative_or_nan_rate_limit(self):
         """As ``test_python_refuses_negative_or_nan_rate_limit``, for ``sigil-witness run``."""
         self._rate_case("rust")

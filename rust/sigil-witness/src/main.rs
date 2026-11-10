@@ -100,7 +100,7 @@ enum Cmd {
         #[arg(long)]
         probe_every: Option<f64>,
         /// Requests per second per client (0: no limit; default 20 on a non-loopback host, none on loopback).
-        #[arg(long, value_name = "R")]
+        #[arg(long, value_name = "R", value_parser = parse_rate)]
         rate_limit: Option<f64>,
         /// Requests a client may burst above the rate.
         #[arg(long, value_name = "B", default_value_t = ratelimit::DEFAULT_BURST)]
@@ -130,7 +130,7 @@ enum Cmd {
         #[arg(long)]
         adopt: bool,
         /// Requests per second per client (0: no limit; default 20 on a non-loopback host, none on loopback).
-        #[arg(long, value_name = "R")]
+        #[arg(long, value_name = "R", value_parser = parse_rate)]
         rate_limit: Option<f64>,
         /// Requests a client may burst above the rate.
         #[arg(long, value_name = "B", default_value_t = ratelimit::DEFAULT_BURST)]
@@ -440,5 +440,14 @@ async fn shutdown_signal() {
     #[cfg(not(unix))]
     {
         let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+/// A `--rate-limit`: a finite number of requests per second, at least 0 (0 means no limit). A
+/// negative or non-finite value is refused, so a typo cannot silently turn admission control off.
+fn parse_rate(v: &str) -> Result<f64, String> {
+    match v.trim().parse::<f64>() {
+        Ok(r) if r.is_finite() && r >= 0.0 => Ok(r),
+        _ => Err(format!("must be a finite number >= 0 (0 disables the limit), not {v:?}")),
     }
 }

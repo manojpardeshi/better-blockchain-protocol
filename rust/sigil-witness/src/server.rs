@@ -116,7 +116,7 @@ pub fn router_with_limits(w: Arc<Witness>, admin_token: Option<String>, limiter:
         .route("/v0/info", get(info))
         .route("/v0/charters", get(charters))
         .route("/v0/proofs", get(proofs))
-        .route("/v0/:method", post(call))
+        .route("/v0/:method", post(call).fallback(|| async { error(StatusCode::NOT_FOUND, "bad_request", "unknown path", None) }))
         .fallback(|| async { error(StatusCode::NOT_FOUND, "bad_request", "unknown path", None) })
         .with_state(App { w, admin_token: admin_token.map(Arc::from) });
     limited(r, limiter, &ADMIN_METHODS)
@@ -294,7 +294,7 @@ pub fn standby_router(s: Arc<Standby>, admin_token: Option<String>, limiter: Opt
         .route("/v0/info", get(sb_info))
         .route("/v0/charters", get(sb_charters))
         .route("/v0/proofs", get(sb_proofs))
-        .route("/v0/:method", post(sb_call))
+        .route("/v0/:method", post(sb_call).fallback(|| async { error(StatusCode::NOT_FOUND, "bad_request", "unknown path", None) }))
         .fallback(|| async { error(StatusCode::NOT_FOUND, "bad_request", "unknown path", None) })
         .with_state(StandbyApp { s, admin_token: admin_token.map(Arc::from), members: Arc::new(members) });
     limited(r, limiter, &STANDBY_ADMIN_METHODS)

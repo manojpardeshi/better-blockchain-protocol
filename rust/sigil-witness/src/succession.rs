@@ -125,7 +125,7 @@ fn bindings(mirror: &HashMap<String, Vec<Json>>, batch: bool) -> HashSet<(String
 /// The reference's `next_charter == charter_body(...)` with string witness keys: exactly the
 /// keys `name, version, witnesses, prev` and an optional valid `successor`, and a non-empty list
 /// of at most [`MAX_WITNESSES`] distinct string keys.
-fn well_formed_body(b: &Json) -> bool {
+pub(crate) fn well_formed_body(b: &Json) -> bool {
     let Some(m) = b.as_obj() else { return false };
     const KEYS: [&str; 4] = ["name", "version", "witnesses", "prev"];
     if !KEYS.iter().all(|k| m.contains_key(*k)) {

@@ -18,7 +18,7 @@ so a crash can never make it forget a vote and equivocate.
 
 from dataclasses import asdict, dataclass, field
 
-from .charter import Registry, charter_hash, quorum, sign_charter
+from .charter import MAX_CHARTER_BYTES, Registry, charter_body, charter_hash, quorum, sign_charter
 from .crypto import KeyPair
 from .encoding import canonical
 from .locks import evaluate
@@ -369,8 +369,23 @@ class Witness:
         """
         if self.cid is None:
             raise Rejected("witness not active")
-        if next_charter["prev"] != charter_hash(self.registry.charter(self.cid, self.version)):
+        cur = self.registry.charter(self.cid, self.version)
+        if not isinstance(next_charter, dict) or next_charter.get("prev") != charter_hash(cur):
             raise Rejected("charter does not extend ours")
+        # Freezing is irreversible, so only for a body that can become a valid version v+1:
+        # the same name, the next version, a well-formed witness list and successor clause
+        # (charter_body applies the size and uniqueness rules) and a charter within the cap.
+        try:
+            well_formed = (next_charter == charter_body(next_charter["name"], next_charter["version"],
+                                                        next_charter["witnesses"], next_charter["prev"],
+                                                        next_charter.get("successor"))
+                           and all(isinstance(k, str) for k in next_charter["witnesses"])
+                           and len(canonical({"body": next_charter, "sigs": {}})) <= MAX_CHARTER_BYTES)
+        except (KeyError, TypeError, ValueError, AttributeError):
+            well_formed = False
+        if (not well_formed or next_charter["name"] != cur["name"] or not isinstance(next_charter["version"], int)
+                or isinstance(next_charter["version"], bool) or next_charter["version"] != self.version + 1):
+            raise Rejected("not a valid next version of our charter")
         # We sign exactly one successor: signing two lets a quorum of honest
         # witnesses certify two conflicting version v+1 charters (a fork).
         h = charter_hash(next_charter)

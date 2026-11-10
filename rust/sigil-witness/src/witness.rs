@@ -18,7 +18,8 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, RwLock};
 
-use crate::charter::{charter_hash, quorum, short, Registry};
+use crate::charter::{charter_hash, quorum, short, Registry, MAX_CHARTER_BYTES};
+use crate::succession::well_formed_body;
 use crate::crypto::KeyPair;
 use crate::gossip::{check_message, CowRegistry, GossipStore};
 use crate::json::{obj, Json};
@@ -685,6 +686,17 @@ impl Witness {
         let ours = registry.charter(&cid, version).map(|c| c.body.clone()).unwrap_or(Json::Null);
         if prev.as_str() != Some(charter_hash(&ours).as_str()) {
             return rejected("charter does not extend ours");
+        }
+        // Freezing is irreversible, so only for a body that can become a valid version v+1: the
+        // same name, the next version, a well-formed witness list and successor clause, within
+        // the charter size cap.
+        let well_formed = well_formed_body(next_charter)
+            && next_charter.get("name") == ours.get("name")
+            && matches!(next_charter.get("version"), Some(Json::Int(v)) if *v == version + 1)
+            && obj([("body", next_charter.clone()), ("sigs", Json::Obj(Default::default()))]).canonical().len()
+                <= MAX_CHARTER_BYTES;
+        if !well_formed {
+            return rejected("not a valid next version of our charter");
         }
         // Signing two successors lets a quorum of honest witnesses certify two conflicting
         // version v+1 charters (a fork).

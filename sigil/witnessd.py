@@ -43,8 +43,10 @@ killed at any moment, even with SIGKILL, and restarted on the same store.
 
 import argparse
 import json
+import math
 import os
 import signal
+import sqlite3
 import sys
 import threading
 import time
@@ -249,6 +251,18 @@ def run(args) -> None:
 
 # --------------------------------------------------------------------- cli
 
+def _rate(v: str) -> float:
+    """A ``--rate-limit``: finite and at least 0 (0 disables the limit). A negative or non-finite
+    value is refused, so a typo cannot silently turn admission control off."""
+    try:
+        r = float(v)
+    except ValueError:
+        r = math.nan
+    if not math.isfinite(r) or r < 0:
+        raise argparse.ArgumentTypeError(f"must be a finite number >= 0 (0 disables the limit), not {v!r}")
+    return r
+
+
 def main(argv=None) -> None:
     p = argparse.ArgumentParser(prog="python -m sigil.witnessd", description="Sigil witness daemon")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -276,7 +290,7 @@ def main(argv=None) -> None:
                     help="on a fresh store, wait for /v0/standby into a later charter version")
     sb.add_argument("--members", nargs="*", default=[], help="member URLs to probe for heartbeats")
     sb.add_argument("--probe-every", type=float, help="probe the members every this many seconds")
-    sb.add_argument("--rate-limit", type=float, metavar="R", default=None,
+    sb.add_argument("--rate-limit", type=_rate, metavar="R", default=None,
                     help=f"requests per second per client (0: no limit; default {DEFAULT_RATE:g} on a "
                          "non-loopback host, none on loopback)")
     sb.add_argument("--rate-burst", type=int, metavar="B", default=DEFAULT_BURST,
@@ -294,7 +308,7 @@ def main(argv=None) -> None:
                    help="file holding the operator token that authorises /v0/freeze and /v0/adopt")
     r.add_argument("--adopt", action="store_true",
                    help="on a fresh store, do not join: wait for /v0/adopt into a later charter version")
-    r.add_argument("--rate-limit", type=float, metavar="R", default=None,
+    r.add_argument("--rate-limit", type=_rate, metavar="R", default=None,
                    help=f"requests per second per client (0: no limit; default {DEFAULT_RATE:g} on a "
                         "non-loopback host, none on loopback)")
     r.add_argument("--rate-burst", type=int, metavar="B", default=DEFAULT_BURST,
@@ -315,10 +329,13 @@ def main(argv=None) -> None:
         reg[cid] = chain
         _write_json(args.out, reg)
         print(cid)
-    elif args.cmd == "standby":
-        standby(args)
     else:
-        run(args)
+        try:
+            standby(args) if args.cmd == "standby" else run(args)
+        except (OSError, ValueError, KeyError, TypeError, sqlite3.Error) as e:
+            # One line naming the problem, as the Rust daemon prints, not a traceback.
+            what = f"store {args.store}: " if isinstance(e, sqlite3.Error) else ""
+            raise SystemExit(f"sigil.witnessd: {what}{type(e).__name__}: {e}") from None
 
 
 if __name__ == "__main__":

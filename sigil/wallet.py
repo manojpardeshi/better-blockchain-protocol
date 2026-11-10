@@ -162,6 +162,11 @@ class Wallet:
         self.pending: dict[str, dict] = {}    # tid -> {"header", "body", "extra"} authorised, not yet final
         self.completed: list = []             # tids completed by a retry: hand their dossiers to the payees
         self.issued: set[str] = set()         # sigils of addresses we handed out: the only ones we accept
+        # Keys of addresses handed out by a wallet saved before ``issued`` existed: a parcel
+        # locked to exactly sig(pk) for one of them is ours (each address had its own key).
+        self.legacy_keys: set[str] = set()
+        self.spent: set[str] = set()          # sigils we held and consumed: never credited again
+        self.auto_prune = True                # pay() drops history it no longer needs (see prune)
         self.kill_switches: set[str] = set()  # sigils of kill-switch parcels (multi-party transitions)
         # sigil -> {"gen", "tid", "proof"} of each transition we aborted: re-presented to
         # any witness that still holds the old binding (it missed the RELEASE, or a
@@ -223,12 +228,14 @@ class Wallet:
             s = model.sigil_of(p)
             # Only an address we issued, exactly (home, lock and salt): a lock
             # that merely mentions our key may still be spendable by the payer.
-            if s not in self.issued:
+            legacy = (p["lock"].get("op") == "sig" and set(p["lock"]) == {"op", "pk"}
+                      and p["lock"]["pk"] in self.legacy_keys)
+            if s not in self.issued and not legacy:
                 raise InvalidDossier("parcel is not addressed to us")
             if any(h["sigil"] == s for h in self.holdings.values()):
                 raise InvalidDossier("address already used: one sigil can only ever be spent once")
             # A parcel the wallet itself already saw consumed is never credited again.
-            if any(r in tx["body"]["inputs"] for tx in self.dossier.transitions.values()):
+            if s in self.spent or any(r in tx["body"]["inputs"] for tx in self.dossier.transitions.values()):
                 raise InvalidDossier("parcel was already spent")
             # Fail closed: "at most f report a binding" only means something when a
             # quorum answered; silent witnesses might be the ones holding it.
@@ -241,6 +248,9 @@ class Wallet:
             # Only the verified ancestry, and never over entries we already hold.
             self.dossier.merge(dossier.ancestry([r["tx"]]))
             self.holdings[model.parcel_id(r)] = {"ref": r, "parcel": p, "sigil": s, "gen": 0}
+            if legacy:
+                self.legacy_keys.discard(p["lock"]["pk"])
+                self.issued.add(s)
             received.append(p)
         return received
 
@@ -414,7 +424,30 @@ class Wallet:
         refs, outputs = self.payment_outputs(asset, amount, addr)
         tid = self.transact(refs, outputs)
         to.receive(self.dossier.ancestry([tid]), [model.ref(tid, 0)])
+        if self.auto_prune:
+            self.prune()
         return tid
+
+    def prune(self) -> int:
+        """Drop history no longer needed: keep only the ancestry of what we hold, of pending
+        and aborted transitions and of completed ones not yet handed out (and every charter).
+
+        Call it after a payment's dossier was handed over: a transition paid away in full
+        leaves no holding, so its own history goes. Returns how many transitions went.
+        """
+        keep = {h["ref"]["tx"] for h in self.holdings.values()}
+        keep |= {r["tx"] for p in self.pending.values() for r in p["body"]["inputs"]}
+        keep |= set(self.completed)
+        keep = {t for t in keep if t in self.dossier.transitions}
+        kept = self.dossier.ancestry(keep)
+        kept.charters = self.dossier.charters
+        # Seals of transitions we still hold (e.g. abort evidence for pending ones) stay too.
+        for key, seal in self.dossier.seals.items():
+            if seal["tid"] in kept.transitions or seal["tid"] in self.pending:
+                kept.seals.setdefault(key, seal)
+        dropped = len(self.dossier) - len(kept)
+        self.dossier = kept
+        return dropped
 
     def prepare(self, refs: list, outputs: list, memo: str = "", gens: dict | None = None) -> tuple[dict, dict, str]:
         """Build a transition. ``gens`` gives generations of inputs we do not hold."""
@@ -521,13 +554,23 @@ class Wallet:
             self.aborted.pop(s, None)
         homes = {o["home"] for o in body["outputs"]} | {self.dossier.output(r)["home"] for r in body["inputs"]}
         self.dossier.add_charters(self.network.registry, homes)
-        for r in body["inputs"]:
+        # A kill switch we spend comes back as a unit of the same asset: that unit is the kill
+        # switch from now on, and the spent one is forgotten.
+        kill_assets = set()
+        for r, (s, _g) in zip(body["inputs"], header["inputs"]):
+            if s in self.kill_switches:
+                kill_assets.add(self.dossier.output(r)["asset"])
+                self.kill_switches.discard(s)
+        for r, (s, _g) in zip(body["inputs"], header["inputs"]):
             self.holdings.pop(model.parcel_id(r), None)
+            self.spent.add(s)
         for i, o in enumerate(body["outputs"]):
             if model.sigil_of(o) in self.issued:
                 r = model.ref(tid, i)
                 p = self.dossier.output(r)
                 self.holdings[model.parcel_id(r)] = {"ref": r, "parcel": p, "sigil": model.sigil_of(p), "gen": 0}
+                if p["asset"] in kill_assets and p["amount"] == 1:
+                    self.kill_switches.add(model.sigil_of(p))
         return tid
 
     def transact(self, refs: list, outputs: list, *, extra_unlocks: dict | None = None, memo: str = "") -> str:
@@ -657,6 +700,12 @@ class Wallet:
         the transition's outputs, and its unlock is withheld until the other
         parties' inputs are bound. Returns its holding.
         """
+        home = home or self.home
+        busy = set(self.pledged) | {s for p in self.pending.values() for s, _g in p["header"]["inputs"]}
+        for h in self.holdings.values():
+            # Reuse the unit an earlier swap returned, rather than issue a new asset each time.
+            if h["sigil"] in self.kill_switches and h["sigil"] not in busy and h["parcel"]["home"] == home:
+                return h
         tid = self.issue("kill-switch", 1, home)
         h = self.holdings[model.parcel_id(model.ref(tid, 0))]
         self.kill_switches.add(h["sigil"])

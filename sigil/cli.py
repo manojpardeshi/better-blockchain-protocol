@@ -169,6 +169,8 @@ def cmd_pay(args):
     payment = {"dossier": json.loads(w.dossier.ancestry([tid]).to_json()), "refs": [model.ref(tid, 0)]}
     with open(args.out, "w") as f:
         json.dump(payment, f, sort_keys=True)
+    w.prune()  # the payment file carries its history now
+    wallet_store.save(w, args.wallet)
     return {"tid": tid, "out": args.out, "asset": args.asset, "amount": args.amount,
             "balance": w.balance(args.asset), "completed": completed}
 
