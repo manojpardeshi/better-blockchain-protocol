@@ -1,24 +1,33 @@
-"""Multi-process integration suites (real witness processes over HTTP).
+"""Integration tests: real Rust and Python witness processes over HTTP.
 
-They take minutes and need the Rust witness binary, so they are kept out of the default
-``python3 -m unittest discover`` and run on their own:
-
+    cargo build --release --locked --manifest-path rust/Cargo.toml
     python -m unittest discover -s tests/integration -t .
 
-``load_tests`` below makes that split: when discovery merely passes through this package
-on its way down from the repository root it contributes nothing, and when discovery
-*starts* here (``-s tests/integration``, or below) it loads the suites as usual. A module
-can always be run directly, e.g. ``python -m unittest tests.integration.chaos.test_chaos``.
-Set ``SIGIL_INTEGRATION=1`` to include the suites in a root-level discovery too.
+These tests start dozens of processes and take minutes, so the default
+``python -m unittest discover`` does not run them: this package's
+``load_tests`` returns nothing unless the run asks for the integration suite,
+by naming ``tests/integration`` (or ``tests.integration``) on the command line,
+by starting discovery in this directory, or by setting ``SIGIL_INTEGRATION=1``.
+``SIGIL_INTEGRATION=0`` turns them off even when named. Without the Rust
+witness binary (``rust/target/release/sigil-witness``, or
+``$SIGIL_WITNESS_BIN``) every test is skipped.
+
+* the end-to-end flows: ``tests/integration/test_*.py``, with the fixtures and
+  end-state invariants of ``tests/integration/harness.py``;
+* the fault-injection (chaos) suite: ``tests/integration/chaos/`` (see its
+  ``test_chaos.py`` and ``run.py``).
 """
 
 import inspect
 import os
+import sys
+import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 
 def _discovery_started_here() -> bool:
+    """Did ``unittest`` discovery start in this directory (not merely pass through it)?"""
     for frame in inspect.stack():
         if frame.function == "_find_tests":
             start = frame.frame.f_locals.get("start_dir")
@@ -28,8 +37,17 @@ def _discovery_started_here() -> bool:
     return False
 
 
+def enabled() -> bool:
+    env = os.environ.get("SIGIL_INTEGRATION")
+    if env is not None:
+        return env.strip() not in ("", "0", "false", "no")
+    return (any("tests/integration" in a.replace(os.sep, "/") or "tests.integration" in a for a in sys.argv)
+            or _discovery_started_here())
+
+
 def load_tests(loader, standard_tests, pattern):
-    if os.environ.get("SIGIL_INTEGRATION") == "1" or _discovery_started_here():
-        standard_tests.addTests(loader.discover(start_dir=HERE, pattern=pattern or "test*.py",
-                                                top_level_dir=os.path.dirname(os.path.dirname(HERE))))
+    if not enabled():
+        return unittest.TestSuite()
+    top = os.path.dirname(os.path.dirname(HERE))
+    standard_tests.addTests(loader.discover(start_dir=HERE, pattern=pattern or "test*.py", top_level_dir=top))
     return standard_tests

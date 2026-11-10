@@ -73,7 +73,11 @@ $S --wallet bob   address > bob-addr.json         # bob gives this to alice
 $S --wallet alice pay bob-addr.json <id> 300 --out payment.json
 $S --wallet bob   receive payment.json [--deep]   # verifies, then takes custody
 $S --wallet bob   balance; $S --wallet bob assets; $S --wallet bob export-dossier
+$S --wallet bob   trust <other-cid>               # accept parcels homed there too
+$S --wallet alice buy-stamps <cid> 10             # for homes whose witnesses require stamps
 ```
+
+If a `pay` completes an earlier payment that had been left pending (for example after a witness outage), it writes that payment's file next to `--out` and lists it under `completed` in its output: hand it to the payee.
 
 Payments are handed from holder to holder as files; no server stores them. Receiving the same payment twice is a no-op; a tampered or already-spent payment is rejected. **Back up the wallet directory**: it holds your key seeds and your dossier, and in Sigil the dossier is the money. There is no ledger to recover it from.
 

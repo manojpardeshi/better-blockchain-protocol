@@ -114,10 +114,12 @@ A wallet builds its store as `GossipStore(network.registry)`, so newly learned c
 
 ## Files
 
-**Network directory**: how a wallet finds witnesses.
+**Network directory**: how a wallet finds witnesses, and the standby members of a home that has a successor committee (SPEC §5.5), from which a wallet collects mirror acks before witnesses will vote.
 ```json
-{"constellations": {"<cid>": ["http://host:port", "..."]}}
+{"constellations": {"<cid>": ["http://host:port", "..."]},
+ "committees":     {"<cid>": ["http://host:port", "..."]}}
 ```
+`committees` is optional.
 
 **Charter registry**: the verified charter chains a participant starts from.
 ```json

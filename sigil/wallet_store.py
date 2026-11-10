@@ -78,6 +78,7 @@ def save(wallet: Wallet, wallet_dir: str) -> None:
         "completed": wallet.completed,
         "issued": sorted(wallet.issued),
         "kill_switches": sorted(wallet.kill_switches),
+        "aborted": wallet.aborted,
         "stamps": {pk: list(v) for pk, v in wallet.stamps.items() if v},
         "confirmed": sorted(list(c) for c in wallet._confirmed),
     }
@@ -120,6 +121,7 @@ def load(wallet_dir: str, network) -> Wallet:
     # Older wallets did not record issued addresses: accept the ones we hold.
     w.issued = set(state.get("issued", [h["sigil"] for h in w.holdings.values()]))
     w.kill_switches = set(state.get("kill_switches", []))
+    w.aborted = state.get("aborted", {})
     w.stamps = defaultdict(list, {pk: list(v) for pk, v in state["stamps"].items()})
     w._confirmed = {tuple(c) for c in state["confirmed"]}
     return w
