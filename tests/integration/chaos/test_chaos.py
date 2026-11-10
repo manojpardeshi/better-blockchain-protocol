@@ -78,6 +78,20 @@ class ChaosCase(unittest.TestCase):
         return tid
 
 
+    def pay_eventually(self, run: ChaosRun, a: str, b: str, amount: int, within: float = 40) -> str:
+        """Pay once pledges left by faults have settled (expiry + skew), within ``within`` s."""
+        deadline, err = time.monotonic() + within, None
+        while time.monotonic() < deadline:
+            with run._locked(a, b):
+                run.wallets[a].release_expired_pledges()
+                try:
+                    return self.pay(run, a, b, amount)
+                except (ValueError, SealFailed) as e:
+                    err = e
+            time.sleep(1)
+        self.fail(f"{a} could not pay {b} within {within}s: {err!r}")
+
+
 class SeededChaos(ChaosCase):
     """Randomized runs: every fault type, Rust and Python mixed, safety always, liveness after healing."""
 
@@ -191,8 +205,7 @@ class Scenarios(ChaosCase):
         self.assertEqual(outcome, "ok")
         self.assertGreater(len(paid), 0)
         self.assertTrue(all(RemoteStandby(u).info()["fenced"] for u in old_k))
-        with run._locked("alice", "bob"):
-            self.pay(run, "alice", "bob", 1)           # the successor serves
+        self.pay_eventually(run, "alice", "bob", 1)   # the successor serves (once in-flight pledges settled)
         # the old version is alive but can no longer seal anything new
         stale = run.mallory.network
         stale.urls[run.cids[0]], stale.committees[run.cids[0]] = old, old_k
@@ -422,7 +435,7 @@ class Findings(ChaosCase):
         t1 = next(iter(alice.pending))
         time.sleep(run.cfg.pledge_ttl + run.cfg.max_skew + 1.5)
         alice.release_expired_pledges()
-        self.assertIn((sigil, 0, t1), run.released, "rule 3 released the pledge")
+        self.assertTrue(any(r[:3] == (sigil, 0, t1) for r in run.released), "rule 3 released the pledge")
         self.assertEqual(run.op_succession(random.Random(3)), "ok")
         bound = [RemoteWitness(u).status(sigil)["tid"] for u in run.directory[cid]]
         self.assertNotIn(t1, bound, "the successor's members are bound to the released transition")
@@ -468,6 +481,120 @@ class Findings(ChaosCase):
                 pass
         found = kinds_of(self.check(run))
         self.assertNotIn("S4-holding-already-consumed", found)
+    @unittest.expectedFailure
+    def test_swap_interrupted_after_kill_switches_never_settles(self):
+        """FINDING (Medium-High, liveness: honest funds locked for good by a transient fault;
+        found by the long run, e.g. ``--seeds 13,33,47,68,69`` with ``--ops 30``: their stuck
+        pledges all belong to swaps; reproduced here deterministically).
+
+        Scenario: alice (home X) and bob (home Y) run ``sigil.swap.atomic_swap``'s steps. The
+        main inputs are sealed; both release their kill switches (``authorise(...,
+        release_kill=True)``, which pledges them); while the kill switches are being sealed
+        every SPEND *reply* is lost (the witnesses bind and vote, the client sees a dead
+        connection). The swap raises ``SealFailed``. The network heals; both wallets call
+        ``release_expired_pledges`` repeatedly.
+
+        What happens: every input of the swap is bound -- and at the witnesses actually
+        sealed -- to the swap, so no pledge can be released (rule 3) and no death proof
+        exists. ``Wallet._settle`` re-authorises with ``authorise(header, body, extra)``:
+        without ``release_kill`` it withholds the kill switch's unlock, and it never has the
+        counter-party's unlocks (``atomic_swap`` does not pass them as ``extra``), so every
+        re-seal is refused ("lock not satisfied"); ``abort`` finds no death proof and
+        ``_pull_kill_switch`` skips kill switches already pledged. Neither party ever
+        finalises: the swap is complete at the witnesses (the inputs are consumed), yet both
+        wallets keep the inputs pledged and never receive the outputs.
+
+        Impact: both parties' coins (and their kill switches) are locked permanently by a
+        transient network fault, with no adversary; the other party's outputs are lost to it.
+
+        Suggested fix: persist the whole multi-party authorisation in each party's ``pending``
+        (pass every party's unlocks as ``extra``), let ``_settle`` re-authorise a kill switch
+        that is already pledged to the same tid (``release_kill=True`` for it), and when
+        re-sealing fails because a binding exists, assemble the seal from the votes the
+        witnesses report in STATUS (``find_votes``) instead of requiring fresh votes.
+        """
+        from sigil.swap import propose_swap
+        run = self.scenario(kinds="mixed")
+        a, b = run.wallets["alice"], run.wallets["bob"]
+        x = next(z for z in run.assets if a.balance(z) > 0)
+        y = next(z for z in run.assets if b.balance(z) > 0)
+        header, body, _terms = propose_swap(a, x, 10, b, y, 10)
+        tid = model.transition_id(header)
+        sigils = {s for s, _ in header["inputs"]}
+        unlocks = {**a.authorise(header, body), **b.authorise(header, body)}
+        kills = (a.kill_switches | b.kill_switches) & sigils
+        a.seal(header, body, unlocks, only=sigils - kills)
+        unlocks.update({**a.authorise(header, body, release_kill=True), **b.authorise(header, body, release_kill=True)})
+        for p in run.c.proxies.values():
+            p.faults.only, p.faults.p_lose_reply = ("spend",), 1.0
+        with self.assertRaises(SealFailed):
+            a.seal(header, body, unlocks, only=kills)
+        for p in run.c.proxies.values():
+            p.faults.clear()
+        time.sleep(run.cfg.pledge_ttl + run.cfg.max_skew + 1.5)
+        for _ in range(3):
+            for w in (a, b):
+                w.release_expired_pledges()
+        self.assertEqual((run._live_pledges(a), run._live_pledges(b)), ({}, {}), "the swap's pledges never settle")
+        self.assertIn(tid, a.dossier.transitions)
+        self.assertIn(tid, b.dossier.transitions)
+
+    @unittest.expectedFailure
+    def test_failed_succession_attempt_halts_a_live_home(self):
+        """FINDING (Medium, liveness; found by seed 39 of the long run, ``--seeds 39 --ops 30``,
+        whose succession attempt failed and whose home then never voted again; reproduced
+        here deterministically).
+
+        Scenario: a home with a committee of 4 (q_k = 3). Its members are cut off from the
+        committee's heartbeat probes for longer than ``dead_man``, but two standby members
+        restart meanwhile (a restart starts a new observation window, SPEC §5.5), so only
+        two of them consider the home dead. The operator tries ``RemoteNetwork.succeed``:
+        each standby member is asked to SUCCEED on its own, the two that agree sign and
+        *fence* at once, the other two refuse, and the call fails ("not enough standby members
+        agree"). The partition heals; the home is alive.
+
+        What happens: the two fenced members never acknowledge anything for the version
+        again, so at most two acks can be collected and a witness needs three (mirror before
+        vote): the live home can never vote again. It can only be retired by completing *that
+        same* successor body (a cooperative rotation to exactly those new members, which the
+        failed attempt's operator may no longer have), so the failed attempt silently decided
+        the home's fate.
+
+        Impact: one failed or premature succession attempt (a timing mistake, not an attack)
+        halts every payment of a live constellation.
+
+        Suggested fix: make succession two-phase in the client: ask every standby member
+        whether it *would* sign (a read-only ``dead`` flag in ``/v0/info`` or a dry-run SUCCEED)
+        and send SUCCEED only once a quorum would; and document that a successor body some
+        member already signed must be completed, never abandoned (SPEC §5.5 / WIRE.md).
+        """
+        from sigil.server import RemoteNetwork
+        from .cluster import TOKEN
+        run = self.scenario(kinds="mixed", committee=True, dead_man=3)
+        c, cid = run.c, run.cids[0]
+        home = c.indices(cid)
+        for i in home:
+            c.probes[i].faults.partition = "refuse"
+        time.sleep(run.cfg.dead_man + 1.5)
+        ks = c.indices(cid, role="standby")
+        for i in ks[:2]:          # these two start a new observation window
+            c.kill(i)
+            self.assertTrue(c.restart(i))
+        new_urls = run._start_new(c.add_members(cid, ["rust", "python", "rust", "python"]))
+        net = RemoteNetwork({cid: list(run.directory[cid])}, committees={cid: list(run.committees[cid])},
+                            timeout=5)
+        with self.assertRaises(RuntimeError):
+            net.succeed(cid, new_urls, TOKEN)
+        for i in home:
+            c.probes[i].faults.partition = None
+        self.assertEqual(sum(RemoteStandby(u).info()["fenced"] for u in run.committees[cid]), 2)
+        time.sleep(1.5)
+        try:
+            with run._locked("alice", "bob"):
+                self.pay(run, "alice", "bob", 1)     # the home is alive: this should seal
+        except SealFailed as e:
+            self.fail(f"the live home no longer seals after the failed succession attempt: {e}")
+
 
 if __name__ == "__main__":
     unittest.main()

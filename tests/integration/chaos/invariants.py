@@ -14,8 +14,11 @@ can be resolved to the inputs it consumes), and which process emitted which vote
   (constellation, sigil, gen), across processes and versions.
 * **S5 durability**: every vote an honest process sent is still in its STATUS at the end
   (after any number of SIGKILLs and restarts, disk-full episodes included).
-* **S6 expiry**: no honest, correctly clocked witness ever voted for a transition at a
-  generation whose pledge an honest wallet had released (SPEC §4 rule 3, §5.1 step 4).
+* **S6 expiry**: no honest, correctly clocked witness of the version the wallet checked (or a
+  later one) ever voted for a transition at a generation whose pledge an honest wallet had
+  released (SPEC §4 rule 3). **S6b**: no honest witness of version 0 ever created a vote, by
+  its own clock, later than the latest ``expires`` any request for that binding carried
+  (it never newly binds on an expired authorisation, SPEC §5.1 step 4).
 * **S3 conservation** and **S4 fresh verification** are wallet-level and live in run.py.
 """
 
@@ -38,6 +41,7 @@ class Observer:
         self.lock = threading.Lock()
         self.votes: dict[tuple, dict] = {}          # vote key -> vote (verified)
         self.headers: dict[str, dict] = {}          # tid -> header (from SPEND / MIRROR requests)
+        self.expires: dict[tuple, int] = {}         # (sigil, tid) -> latest unlock.expires requested
         self.emitted: dict[str, set] = defaultdict(set)   # proxy name -> vote keys it relayed from its process
         self.pk_of: dict[str, str] = {}             # proxy name -> pk of the process behind it
         self.methods: dict[str, int] = defaultdict(int)
@@ -97,6 +101,14 @@ class Observer:
             r = req.get("request")
             if isinstance(r, dict) and "header" in r:
                 self.add_header(r["header"])
+                try:
+                    tid, exp = transition_id(r["header"]), r["unlock"]["expires"]
+                    if isinstance(exp, int) and not isinstance(exp, bool):
+                        with self.lock:
+                            k = (r["sigil"], tid)
+                            self.expires[k] = max(exp, self.expires.get(k, exp))
+                except (KeyError, TypeError, ValueError, AttributeError):
+                    pass
             found: list = []
             self._scan(req, found)
             for v in found:
@@ -135,7 +147,7 @@ def check(obs: Observer, registry, *, honest: set, clocked: set, released: list,
 
     ``honest``: witness keys that run honest code; ``clocked``: those whose clock stayed
     within the configured skew bound (S6 applies to them only); ``released``: pledges
-    ``(sigil, gen, tid)`` honest wallets released; ``final_status``: ``{proxy name:
+    ``(sigil, gen, tid, version)`` honest wallets released, with the home's version then; ``final_status``: ``{proxy name:
     {sigil: status}}`` read from every honest process at the end.
     """
     violations = []
@@ -188,10 +200,27 @@ def check(obs: Observer, registry, *, honest: set, clocked: set, released: list,
             if k not in held:
                 violations.append({"kind": "S5-vote-forgotten", "process": source, "vote": list(k)})
 
-    # S6: nothing voted (honest, well-clocked) for a released pledge
-    rel = set(released)
+    # S6: nothing voted (honest, well-clocked) for a released pledge, in the version the
+    # wallet checked or a later one. (A straggler of an older version, one that missed the
+    # FREEZE, may still vote: at most f honest stragglers, so never a seal, SPEC §8.)
+    rel = {}
+    for s, g, t, version in released:
+        rel[(s, g, t)] = min(version, rel.get((s, g, t), version))
     for v in votes:
-        if v["witness"] in honest and v["witness"] in clocked and (v["sigil"], v["gen"], v["tid"]) in rel:
+        k = (v["sigil"], v["gen"], v["tid"])
+        if (v["witness"] in honest and v["witness"] in clocked and k in rel
+                and isinstance(v["version"], int) and v["version"] >= rel[k]):
             violations.append({"kind": "S6-vote-after-pledge-release", "witness": v["witness"],
-                               "sigil": v["sigil"], "gen": v["gen"], "tid": v["tid"], "time": v["time"]})
+                               "sigil": v["sigil"], "gen": v["gen"], "tid": v["tid"], "time": v["time"],
+                               "version": v["version"]})
+    # S6b: no honest founding member (version 0: it never inherits a binding by ADOPT) votes,
+    # by its own clock, after the latest expiry any request for that binding carried, so it
+    # never newly bound on an expired authorisation (SPEC §5.1 step 4). One second of slack:
+    # the expiry check and the vote's time are two clock reads.
+    for v in votes:
+        exp = obs.expires.get((v["sigil"], v["tid"]))
+        if (exp is not None and v["witness"] in honest and v["version"] == 0
+                and isinstance(v["time"], int) and v["time"] > exp + 1):
+            violations.append({"kind": "S6b-bound-after-expiry", "witness": v["witness"], "sigil": v["sigil"],
+                               "gen": v["gen"], "tid": v["tid"], "time": v["time"], "expires": exp})
     return violations

@@ -273,7 +273,9 @@ class ChaosRun:
                 pledge = _w.pledged.get(sigil)
                 ok = _real(sigil)
                 if ok and pledge is not None:
-                    self.released.append((sigil, pledge[0], pledge[1]))
+                    home = self._home_of(_w, sigil)
+                    cur = _w.network.registry.latest(home) if home else None
+                    self.released.append((sigil, pledge[0], pledge[1], cur["version"] if cur else 0))
                     self.faults["pledges-released"] += 1
                     hook = getattr(_w, "_chaos_on_release", None)
                     if hook is not None:
@@ -282,6 +284,11 @@ class ChaosRun:
 
             w.unpledge_if_unbound = unpledge
         return w
+
+    @staticmethod
+    def _home_of(w: Wallet, sigil: str):
+        h = next((h for h in w.holdings.values() if h["sigil"] == sigil), None)
+        return h["parcel"]["home"] if h else None
 
     def _split_mallory(self) -> None:
         m = self.mallory
@@ -534,8 +541,8 @@ class ChaosRun:
             asset = r.choice(sorted(assets))
             amount = r.randint(1, min(assets[asset], 20))
             refs, outputs = payer.payment_outputs(asset, amount, p1.address())
-            sigils = {payer.holdings[model.parcel_id(x)]["sigil"] for x in refs}
-            homes = {payer.holdings[model.parcel_id(x)]["parcel"]["home"] for x in refs}
+            sigils = {model.sigil_of(payer.dossier.output(x)) for x in refs}
+            homes = {payer.dossier.output(x)["home"] for x in refs}
             proxies = [self.c.proxies[i] for i in range(len(self.c.witnesses))
                        if self.c.witnesses[i]["cid"] in homes and self.c.witnesses[i].get("role") != "standby"]
 
@@ -735,6 +742,32 @@ class ChaosRun:
                 for i in home:
                     self.c.probes[i].faults.partition = None
             if v is None:
+                fenced = []
+                for u in self.committees[cid]:
+                    try:
+                        fenced.append(RemoteStandby(u, 5).info().get("fenced"))
+                    except Rejected:
+                        pass
+                if any(fenced):
+                    # A member signed (and fenced for) this successor: the home can no longer
+                    # collect an ack quorum (test_chaos.Findings). The only way out is to complete
+                    # this very successor cooperatively: rotate to the same members and committee.
+                    self.log("succession failed with fenced standby members; completing it by rotation")
+                    self.faults["failed-succession-fenced"] += 1
+                    for attempt in range(10):
+                        try:
+                            v = net.rotate(cid, new_urls, TOKEN, committee_urls=new_k, dead_man=self.cfg.dead_man)
+                            break
+                        except RotationIncomplete as e:
+                            v = self._finish_succession(net, cid, e.pending)
+                            break
+                        except (RuntimeError, Rejected) as e:
+                            self.log(f"recovery rotation attempt {attempt}: {e}")
+                            self._restart_down(range(len(self.c.witnesses)))
+                            time.sleep(1)
+                    if v is not None:
+                        self.faults["failed-succession-recovered"] += 1
+            if v is None:
                 for i in new_idx + nk:
                     self.c.kill(i)
                     self.c.retired.add(i)
@@ -756,6 +789,11 @@ class ChaosRun:
                 except Rejected:
                     continue
                 snaps.append(snap)
+            for url in self.directory[cid]:   # a cooperative completion also hands over the members' evidence
+                try:
+                    snaps.append(RemoteWitness(url, 5, admin_token=TOKEN).freeze(nxt)[1])
+                except Rejected:
+                    continue
             for url in pending:
                 try:
                     RemoteWitness(url, 5).gossip({"charters": {cid: chain}})
@@ -1016,7 +1054,10 @@ class ChaosRun:
             time.sleep(1.0)
         for name, w in self.wallets.items():
             for s, (g, tid, exp) in self._live_pledges(w).items():
-                self.liveness.append({"kind": "pledge-unsettled", "wallet": name, "sigil": s, "gen": g, "tid": tid,
+                # An interrupted swap whose kill switches were already released can never be
+                # finished or aborted by the wallet (test_chaos.Findings): known, reported apart.
+                kind = "known:swap-unfinishable" if any(t == tid for *_, t in self.swaps) else "pledge-unsettled"
+                self.liveness.append({"kind": kind, "wallet": name, "sigil": s, "gen": g, "tid": tid,
                                       **self._diagnose(w, s, g, tid)})
         for payer, payee, tid, refs in self.undelivered:
             self.liveness.append({"kind": "payment-undelivered", "payer": payer, "payee": payee, "tid": tid})
@@ -1062,7 +1103,7 @@ class ChaosRun:
         """Coins of ``w`` whose released pledge the home's current members are bound to again
         (the succession finding, test_chaos.Findings): known, reported apart."""
         out = []
-        released = {(s, t) for s, _g, t in self.released}
+        released = {(s, t) for s, _g, t, _v in self.released}
         for h in w.holdings.values():
             for s, t in released:
                 if s != h["sigil"]:
