@@ -26,6 +26,7 @@
 #   MC_rot*    -> MC_rot.tla        MC_expiry* -> SigilExpiry.tla
 #   MC_deep*   -> SigilDeep.tla     MC_wallet* -> MC_wallet.tla (SigilWallet)
 #   MC_rotp_witness* -> MC_rotpw.tla   MC_rotp* -> MC_rotp.tla (SigilRotProofs)
+#   MC_ckpt*   -> MC_ckpt.tla (compaction on SigilRotProofs, three versions)
 #   MC_succ_witness* -> MC_succw.tla   MC_succ_c* -> MC_succ3.tla
 #   MC_succ*   -> MC_succ.tla (SigilSuccProofs)
 #   everything else -> MC.tla
@@ -183,6 +184,7 @@ module_for() {   # map a config name to its TLA module
         MC_proofs*) echo MC_proofs.tla ;;
         MC_rotp_witness*) echo MC_rotpw.tla ;;
         MC_rotp*)   echo MC_rotp.tla ;;
+        MC_ckpt*)   echo MC_ckpt.tla ;;
         MC_succ_witness*) echo MC_succw.tla ;;
         MC_succ_c*) echo MC_succ3.tla ;;
         MC_succ*)   echo MC_succ.tla ;;
@@ -198,9 +200,9 @@ for cfg in "${CONFIGS[@]}"; do
     name="$(basename "$cfg" .cfg)"
     case "$cfg" in /*) cfgpath="$cfg" ;; *) cfgpath="$HERE/$cfg" ;; esac
     module="$(module_for "$name")"
-    # MC_proofs*, MC_rotp* and MC_succ* extend the TLAPS standard library (FiniteSetTheorems, TLAPS).
+    # MC_proofs*, MC_rotp*, MC_ckpt* and MC_succ* extend the TLAPS standard library (FiniteSetTheorems, TLAPS).
     libarg=()
-    if [[ "$name" == MC_proofs* || "$name" == MC_rotp* || "$name" == MC_succ* ]]; then
+    if [[ "$name" == MC_proofs* || "$name" == MC_rotp* || "$name" == MC_succ* || "$name" == MC_ckpt* ]]; then
         if [[ -d "$STDLIB" ]] || ensure_tlapm; then
             libarg=("-DTLA-Library=$STDLIB")
         else
