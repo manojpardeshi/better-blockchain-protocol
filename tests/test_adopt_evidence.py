@@ -10,7 +10,8 @@ bound in the evidence, are kept.
 import unittest
 
 from sigil import KeyPair, Network, locks, model
-from sigil.charter import charter_body, charter_hash
+from sigil.charter import charter_body, charter_hash, successor_clause
+from sigil.succession import Standby
 from sigil.witness import Witness
 
 
@@ -102,6 +103,49 @@ class AdoptEvidenceFilterTests(unittest.TestCase):
                            charter_hash(self.net.registry.latest(self.X)))
         _sig, snap = a.freeze(nxt)
         self.assertEqual([e["kind"] for e in snap[self.s]], ["bind"])
+
+    def test_standby_keeps_what_adopt_keeps(self):
+        """STANDBY filters its handover the same way (SPEC 5.5): a standby member's mirror log
+        is the evidence the next version adopts, so junk there would be forwarded for good."""
+        k = self.net.witnesses(self.X)
+        Ty, Tb = self.hdr([(self.x, 0)], "1"), self.hdr([(self.s, 0), (self.x, 0)], "2")
+        seal_y = model.seal_from_votes([w.spend(self.req(Ty, self.x, self.px)) for w in k])
+        for w in k[:3]:
+            w.spend(self.req(Tb, self.s, self.ps))
+        dp = {"kind": "seal", "sigil": self.x, "gen": 0, "parcel": self.tgt(self.px), "seal": seal_y}
+        for w in k[:3]:
+            w.release(self.s, dp)
+        Tz = self.hdr([(self.s, 0), (self.x, 0)], "9")
+        other = KeyPair.generate()
+        stranger_vote = {"constellation": self.X, "version": 0, "witness": other.pk, "sigil": self.s,
+                         "gen": 0, "tid": "7" * 64, "time": 1}
+        stranger_vote["sig"] = other.sign("vote", model.vote_payload(stranger_vote))
+        junk = {self.s: [
+            {"kind": "release", "gen": 0, "tid": model.transition_id(Tz), "header": Tz, "proof": dp},
+            {"kind": "vote", "vote": stranger_vote},
+            {"kind": "bind", "gen": 0, "auth": None},
+            {"kind": "release", "gen": 0, "tid": "8" * 64, "header": Tz, "proof": {}},
+            {"kind": "seal", "seal": seal_y},          # a real seal, but of another sigil
+            {"kind": "mystery"},
+        ] + [{"kind": "bind", "gen": i, "auth": {"header": Tb}} for i in range(20)],
+            "f" * 64: [{"kind": "mystery"}]}
+        cur = self.net.registry.latest(self.X)
+        ck = KeyPair.generate()
+        nxt = charter_body(cur["name"], 1, [KeyPair.generate().pk], charter_hash(cur), successor_clause([ck.pk], 3600))
+        snaps, sigs = [], {}
+        for w in k[:3]:
+            sig, snap = w.freeze(nxt)
+            sigs[w.pk] = sig
+            snaps.append(snap)
+        self.net.registry.add_chain(self.X, self.net.registry.chain(self.X) + [{"body": nxt, "sigs": sigs}])
+        m = Standby(ck, self.net.registry, self.net.clock)
+        m.enter(self.X, 1, snaps + [junk])
+        log = m.mirror[self.s]
+        self.assertEqual(sorted(e["kind"] for e in log), ["bind", "release"], log)
+        self.assertEqual({e["tid"] for e in log if e["kind"] == "release"}, {model.transition_id(Tb)})
+        self.assertNotIn("f" * 64, m.mirror)
+        # The binding the mirror records is unchanged.
+        self.assertIn((self.s, 0, model.transition_id(Tb)), m.mirrored)
 
 
 if __name__ == "__main__":

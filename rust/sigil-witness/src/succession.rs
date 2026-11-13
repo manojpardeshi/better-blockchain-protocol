@@ -22,7 +22,8 @@
 //! [`MAX_MIRROR_TIDS`] transitions per sigil and generation; a release entry needs a death proof
 //! of at most [`MAX_PROOF_BYTES`] for a binding the member holds. Each refusal only withholds an
 //! ack (no ack, no vote), which costs liveness, never safety. The handover of STANDBY, like
-//! ADOPT, keeps every entry it is given, each distinct one once.
+//! ADOPT, keeps every verifiable entry it is given (verified binds, and verified releases and
+//! seals of transactions bound in it), each distinct one once.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, RwLock};
@@ -34,7 +35,7 @@ use crate::json::{obj, Json};
 use crate::model::{ack_payload, transition_id};
 use crate::proofs::{proves_dead, verify_heartbeat};
 use crate::store::{charter_entries, charter_entry, restore_charters, Entry, Loaded, Store};
-use crate::witness::{authorises, Clock, Error, Outcome, MAX_AUTH_BYTES, MAX_GEN, MAX_PROOF_BYTES};
+use crate::witness::{authorises, verified_evidence, Clock, Error, Outcome, MAX_AUTH_BYTES, MAX_GEN, MAX_PROOF_BYTES};
 
 /// Distinct transitions a member mirrors per (sigil, generation) (`succession.MAX_MIRROR_TIDS`).
 /// Only the owner can authorise its sigil, so the cap only ever limits an owner flooding its own
@@ -295,9 +296,19 @@ impl Standby {
                 return rejected("already standing by for another version");
             }
         }
-        // Like ADOPT, the handover keeps every entry it is given whatever its size: dropping
-        // evidence could lose a sealed binding.
-        let mirror = snapshot_union(snapshots);
+        // Like ADOPT, the handover keeps every verifiable entry whatever its size (dropping
+        // evidence could lose a sealed binding), and only those: verified bind entries and the
+        // verified releases and seals of transactions bound in it (SPEC §5.4, §5.5). Our mirror
+        // log is the evidence a successor adopts, so junk kept here would be forwarded at every
+        // later handover.
+        let mirror: HashMap<String, Vec<Json>> = snapshot_union(snapshots)
+            .into_iter()
+            .map(|(s, log)| {
+                let kept = verified_evidence(&s, log, cid, &registry, self.batch_verify);
+                (s, kept)
+            })
+            .filter(|(_, log)| !log.is_empty())
+            .collect();
         let since = self.now();
         let mut entries: Vec<Entry> = Vec::with_capacity(mirror.len() + 2);
         // The charter chain of the version we stand by for: a restart from an older registry

@@ -107,6 +107,45 @@ def authorises(sigil: str, auth: dict) -> tuple[int, str] | None:
         return None
 
 
+def verified_evidence(sigil: str, log: list, cid: str, registry: Registry) -> list:
+    """The entries of one sigil's handover log that ADOPT keeps in the new record's log (SPEC §5.4).
+
+    Bind entries with a valid owner authorisation, and release and seal entries that
+    verify for a transaction bound in this evidence; everything else (junk, votes,
+    releases or seals of transactions nobody bound) is dropped, in log order otherwise.
+    STANDBY keeps the same entries of its handover (SPEC §5.5).
+    """
+    binds: set = set()
+    releases, seals, keep = [], [], set()
+    for i, e in enumerate(log):
+        if not isinstance(e, dict):
+            continue
+        kind = e.get("kind")
+        if kind == "bind":
+            b = authorises(sigil, e.get("auth", {}))
+            if b is not None:
+                binds.add(b)
+                keep.add(i)
+        elif kind == "seal":
+            sl = e.get("seal")
+            try:
+                if sl["sigil"] == sigil and sl["constellation"] == cid and verify_seal(sl, registry):
+                    seals.append(((sl["gen"], sl["tid"]), i))
+            except (KeyError, TypeError):
+                pass
+        elif kind == "release":
+            h, t = e.get("header"), e.get("tid")
+            try:
+                if transition_id(h) == t and proves_dead(h, t, e.get("proof"), registry):
+                    releases.append((t, i))
+            except (KeyError, TypeError, ValueError):
+                pass
+    bound_tids = {t for (_g, t) in binds}
+    keep |= {i for t, i in releases if t in bound_tids}
+    keep |= {i for b, i in seals if b in binds}
+    return [e for i, e in enumerate(log) if i in keep]
+
+
 class Witness:
     def __init__(self, kp: KeyPair, registry: Registry, clock, *, stamp_mint: StampMint | None = None,
                  store: WitnessStore | None = None):

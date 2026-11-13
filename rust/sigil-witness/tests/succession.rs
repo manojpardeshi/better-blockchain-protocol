@@ -239,6 +239,31 @@ fn standby_member_keeps_its_charter_across_a_restart_with_an_old_registry_file()
     c.store.close();
 }
 
+#[test]
+fn standby_handover_keeps_only_what_adopt_keeps() {
+    // STANDBY keeps the verified binds and the verified releases and seals of bound
+    // transactions (SPEC §5.4/§5.5), each once: junk would be forwarded at every handover.
+    let w = world("rigel");
+    let now = Arc::new(AtomicI64::new(1_700_000_000));
+    let (ra, sa, ta) = spend_request(&w.owner, &w.cid, "aa", 0, 1 << 40, "a");
+    let auth = obj(["home", "lock", "salt", "unlock", "header"].map(|k| (k, ra.get(k).unwrap().clone())));
+    let bind = obj([("kind", "bind".into()), ("gen", Json::Int(0)), ("auth", auth)]);
+    let mut log = vec![bind.clone()];
+    for i in 0..3 {
+        log.push(obj([("kind", "bind".into()), ("gen", Json::Int(i)), ("auth", Json::Null)]));
+    }
+    log.push(obj([("kind", "release".into()), ("gen", Json::Int(0)), ("tid", Json::str(&ta)), ("header", ra.get("header").unwrap().clone()), ("proof", obj([]))]));
+    log.push(obj([("kind", "vote".into()), ("vote", obj([]))]));
+    log.push(obj([("kind", "mystery".into())]));
+    let snap = obj([(sa.as_str(), Json::Arr(log)), ("f".repeat(64).as_str(), Json::Arr(vec![obj([("kind", "mystery".into())])]))]);
+    let k = Standby::open(key("rigelk1"), w.reg.clone(), &w.cid, Store::memory(), Default::default(), clock(&now), true).unwrap();
+    ok(k.enter(&Json::str(&w.cid), &Json::Int(0), &[snap.clone(), snap]), &k.store);
+    let mirror = k.snapshot();
+    assert_eq!(mirror.get(&sa), Some(&Json::Arr(vec![bind])));
+    assert_eq!(mirror.get(&"f".repeat(64)), None);
+    assert_eq!(ok(k.mirror_bind(&with_version(&ra, 0)), &k.store).get("tid"), Some(&Json::str(&ta)), "the binding is mirrored");
+}
+
 async fn http(addr: std::net::SocketAddr, method: &str, path: &str, auth: Option<&str>, body: &str) -> (u16, Json) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();

@@ -964,6 +964,61 @@ impl Witness {
     }
 }
 
+/// `witness.verified_evidence`: the entries of one sigil's handover log that ADOPT keeps in the
+/// new record's log (SPEC §5.4): bind entries with a valid owner authorisation, and release and
+/// seal entries that verify for a transaction bound in this evidence, in log order. STANDBY
+/// keeps the same entries of its handover (SPEC §5.5).
+pub(crate) fn verified_evidence(sigil: &str, log: Vec<Json>, cid: &str, registry: &Registry, batch: bool) -> Vec<Json> {
+    let sigil_j = Json::str(sigil);
+    let null = Json::Null;
+    let mut binds: HashSet<(i128, String)> = HashSet::new();
+    let mut keep = vec![false; log.len()];
+    let mut releases: Vec<(usize, String)> = Vec::new();
+    let mut seals: Vec<(usize, (i128, String))> = Vec::new();
+    for (i, e) in log.iter().enumerate() {
+        match e.get("kind").and_then(Json::as_str) {
+            Some("bind") => {
+                let auth = e.get("auth").cloned().unwrap_or(Json::Obj(Default::default()));
+                if let Ok(Some(b)) = authorises(&sigil_j, &auth, None, batch) {
+                    binds.insert(b);
+                    keep[i] = true;
+                }
+            }
+            Some("seal") => {
+                let Some(sl) = e.get("seal") else { continue };
+                if sl.get("sigil").and_then(Json::as_str) == Some(sigil)
+                    && sl.get("constellation").and_then(Json::as_str) == Some(cid)
+                    && verify_seal(sl, registry, &HashSet::new(), batch)
+                {
+                    if let (Some(g), Some(t)) = (sl.get("gen").and_then(Json::as_int), sl.get("tid").and_then(Json::as_str)) {
+                        seals.push((i, (g, t.to_string())));
+                    }
+                }
+            }
+            Some("release") => {
+                let h = e.get("header").unwrap_or(&null);
+                let Some(t) = e.get("tid").and_then(Json::as_str) else { continue };
+                if transition_id(h) == t && proves_dead(h, t, e.get("proof").unwrap_or(&null), registry, batch) {
+                    releases.push((i, t.to_string()));
+                }
+            }
+            _ => {}
+        }
+    }
+    let bound: HashSet<&String> = binds.iter().map(|(_, t)| t).collect();
+    for (i, t) in &releases {
+        if bound.contains(t) {
+            keep[*i] = true;
+        }
+    }
+    for (i, b) in &seals {
+        if binds.contains(b) {
+            keep[*i] = true;
+        }
+    }
+    log.into_iter().zip(keep).filter_map(|(e, k)| k.then_some(e)).collect()
+}
+
 /// The candidate `proof` shows sealed, if it would be the only one left (witness.py
 /// `_sealed_candidate`). Only when nothing at a higher generation has been passed over
 /// (`gen <= g + 1` once the killed candidates are counted): binding back to `g` must not
