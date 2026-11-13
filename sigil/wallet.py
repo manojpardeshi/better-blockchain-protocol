@@ -384,7 +384,11 @@ class Wallet:
                         freed.append(s)
                 continue
             if self.unpledge_if_unbound(s):
-                self.pending.pop(tid, None)
+                # Only once no input is pledged to it any more: another input of the same
+                # transition may still be bound (e.g. a swap whose kill switch never reached a
+                # witness), and without the pending transition it could never be settled.
+                if not any(p[1] == tid for p in self.pledged.values()):
+                    self.pending.pop(tid, None)
                 freed.append(s)
             elif tid in self.pending:
                 self._settle(tid)
@@ -402,6 +406,12 @@ class Wallet:
             return
         except ValueError:
             pass  # not provably dead: try to complete it
+        if self._missing_unlocks(p):
+            # We could never record this transition (a holder verifies every owner's unlock),
+            # so we do not sign or bind for it again: once our pledges expire it is released
+            # or aborted (our kill switch spent elsewhere is its death proof), and a party
+            # holding every unlock can still finish it and hand it over (accept_completed).
+            return
         try:
             # The other parties' unlocks of a multi-party transition (cosign) re-seal their
             # inputs: a witness already bound to this tid votes again on them even once expired.
@@ -415,6 +425,8 @@ class Wallet:
     def _reseal(self, tid: str) -> None:
         """Seal a pending transition again with the unlocks already signed (no new pledge)."""
         p = self.pending[tid]
+        if self._missing_unlocks(p):
+            return
         unlocks = {**p.get("others", {}), **p.get("mine", {})}
         try:
             self.seal(p["header"], p["body"], unlocks)
@@ -422,6 +434,13 @@ class Wallet:
             return
         self.finalise(p["header"], p["body"], unlocks)
         self.completed.append(tid)
+
+    def _missing_unlocks(self, p: dict) -> bool:
+        """Does a pending transition consume another party's input whose unlock we lack?
+        (Lost, e.g., in a crash before a ``cosign`` was saved.)"""
+        mine = {h["sigil"] for h in self.holdings.values()}
+        others = p.get("others", {})
+        return any(s not in mine and s not in others for s, _g in p["header"]["inputs"])
 
     def cosign(self, header: dict, unlocks: dict) -> None:
         """Keep the other parties' unlocks of a multi-party transition we authorised.
@@ -582,7 +601,7 @@ class Wallet:
 
     def seal(self, header: dict, body: dict, unlocks: dict, only=None) -> list:
         """Seal the inputs of a transition (all of them, or the sigils in ``only``)."""
-        seals = []
+        seals, failed = [], None
         for r, (s, _g) in zip(body["inputs"], header["inputs"]):
             if only is not None and s not in only:
                 continue
@@ -590,10 +609,38 @@ class Wallet:
             self._represent_release(s, p["home"], _g)
             req = {"sigil": s, "header": header, "home": p["home"], "lock": p["lock"],
                    "salt": p["salt"], "unlock": unlocks.get(s, locks.empty_unlock())}
-            seals.append(request_seal(self.network, req, self._stamp_for))
+            try:
+                seals.append(request_seal(self.network, req, self._stamp_for))
+            except SealFailed as e:
+                # Go on with the other inputs, and fail at the end: binding the inputs we can
+                # unlock lets a counter-party finish the transition (e.g. a swap whose other
+                # party lost our kill switch's unlock in a crash), instead of both waiting.
+                if failed is None:
+                    failed = e
         for seal in seals:
             self.dossier.add_seal(seal)
+        if failed is not None:
+            raise failed
         return seals
+
+    def accept_completed(self, dossier: Dossier, tid: str) -> str:
+        """Finish a pending transition from a counter-party's dossier holding it complete.
+
+        A multi-party transition needs every owner's unlock in the dossier. If ours lost one
+        (e.g. a crash before a ``cosign`` was saved), the other party, which holds them all,
+        completes the transition (our ``seal`` still binds our inputs for it) and hands it over:
+        it is verified like any received history before we record it.
+        """
+        if tid not in self.pending:
+            raise ValueError("no such pending transition")
+        anc = dossier.ancestry([tid])
+        view = Dossier()
+        view.merge(self.dossier)
+        view.merge(anc)
+        self.verifier.verify_transition(view, tid)
+        self.dossier.merge(anc)
+        tx = anc.transitions[tid]
+        return self.finalise(tx["header"], tx["body"], tx["unlocks"])
 
     def finalise(self, header: dict, body: dict, unlocks: dict) -> str:
         """Record a sealed transition and update holdings."""

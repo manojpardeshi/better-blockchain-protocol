@@ -107,6 +107,11 @@ def cmd_assets(args):
     return [{"asset": a, "name": _asset_name(w, a), "balance": b} for a, b in _balances(w).items()]
 
 
+def _write_payment(path: str, payment: dict) -> None:
+    """Write a payment file atomically: a crash leaves the whole file or none."""
+    wallet_store._atomic_write(path, json.dumps(payment, sort_keys=True), 0o600)
+
+
 def _hand_out_completed(w: Wallet, args) -> list:
     """Write a payment file for every transition a retry completed (Wallet.completed)."""
     done = []
@@ -114,8 +119,7 @@ def _hand_out_completed(w: Wallet, args) -> list:
         refs = [model.ref(tid, i) for i, o in enumerate(w.dossier.transitions[tid]["body"]["outputs"])
                 if model.sigil_of(o) not in w.issued]
         path = f"{args.out}.{tid[:16]}.json"
-        with open(path, "w") as f:
-            json.dump({"dossier": json.loads(w.dossier.ancestry([tid]).to_json()), "refs": refs}, f, sort_keys=True)
+        _write_payment(path, {"dossier": json.loads(w.dossier.ancestry([tid]).to_json()), "refs": refs})
         done.append({"tid": tid, "out": path})
         w.completed.remove(tid)
     if done:
@@ -165,10 +169,14 @@ def cmd_pay(args):
         wallet_store.save(w, args.wallet)
         raise
     tid = w.finalise(header, body, unlocks)
+    # Until its payment file exists the payment is listed as completed-not-handed-out, so a
+    # crash before (or while) the file is written hands it out on the next run instead of
+    # losing it: the input is consumed either way.
+    w.completed.append(tid)
     wallet_store.save(w, args.wallet)
     payment = {"dossier": json.loads(w.dossier.ancestry([tid]).to_json()), "refs": [model.ref(tid, 0)]}
-    with open(args.out, "w") as f:
-        json.dump(payment, f, sort_keys=True)
+    _write_payment(args.out, payment)
+    w.completed.remove(tid)
     w.prune()  # the payment file carries its history now
     wallet_store.save(w, args.wallet)
     return {"tid": tid, "out": args.out, "asset": args.asset, "amount": args.amount,

@@ -72,6 +72,8 @@ class Config:
     byz: int = 0                    # Byzantine witnesses in constellation 0
     byz_modes: str = "equivocate,lie,withhold,garbage"
     byz_other: int = 0              # Byzantine witnesses in each other constellation (<= f)
+    byz_standby: int = 0            # Byzantine standby members in constellation 0's committee
+    byz_standby_modes: str = "ackonly,lie,signany,junksnap,norelease"
     committee: bool = True          # constellation 0 has a successor committee
     dead_man: int = 4
     probe_every: float = 0.5
@@ -109,6 +111,8 @@ class Config:
                   disk=r.random() < 0.5, delayed_expiry=r.choice([0, 1, 1, 2]),
                   workers=r.choice([1, 2, 2, 3]))
         cfg.succession = cfg.succession and cfg.committee
+        # Drawn last, so the earlier draws (and the shapes of older seeds) stay as they were.
+        cfg.byz_standby = r.choice([0, 0, 1]) if cfg.committee else 0
         for k, v in over.items():
             setattr(cfg, k, v)
         return cfg
@@ -208,6 +212,9 @@ class ChaosRun:
                 m = ("rustm:" + cfg.mutant[5:]) if cfg.mutant.startswith("rust:") else ("mutant:" + cfg.mutant)
                 kinds = [m if k in ("python", "rust") else k for k in kinds]
             committee = self._kinds(4) if (ci == 0 and cfg.committee) else None
+            if committee:
+                for j in range(cfg.byz_standby):
+                    committee[1 + j] = "byzk:" + cfg.byz_standby_modes
             cid = c.create(names[ci], kinds, committee=committee, dead_man=cfg.dead_man if committee else None)
             self.cids.append(cid)
             for i in c.indices(cid):

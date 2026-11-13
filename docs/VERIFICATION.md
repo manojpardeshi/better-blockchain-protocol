@@ -605,7 +605,7 @@ wallets over HTTP. They are not part of the default `unittest discover`; CI's
   persisting before answering, not checking expiry) and Byzantine faults
   beyond *f* are caught, which shows the invariants are not vacuous.
 
-They found eighteen bugs, none of them a safety violation of the witness
+They found eighteen bugs (and a second round eight more, below), none of them a safety violation of the witness
 protocol; each was pinned as an expected failure, shown to fail on the old
 code, and now runs as a regression test.
 
@@ -628,6 +628,31 @@ code, and now runs as a regression test.
 | chaos | a pledge released under §4 rule 3 came back after a succession (the committee had mirrored it) | rule 3 also asks every standby member (new `POST /v0/status` on standby members); the pledge stays and the wallet completes the transition |
 | chaos | a swap interrupted after its kill switches were released never settled | each party keeps the others' unlocks (`Wallet.cosign`); a kill switch already pledged to the same tid is re-signed; a settling transition is retried with the unlocks held |
 | chaos | a failed succession attempt fenced a minority and halted a live home | two-phase succession: `dead` in standby info is read first, SUCCEED sent only once a quorum agrees |
+
+A second round extended the suites to adversaries the first did not cover:
+Byzantine standby members (`chaos/byzantine_standby.py`: acking without storing,
+lying on STATUS and on `dead`, signing any successor, junk and forged SUCCEED
+snapshots, refusing `note_release`, malformed replies; `chaos/test_byzantine_standby.py`,
+within *f*ₖ and, as the non-vacuity check, beyond it, where the lost binding is
+reported as two seals at one generation), malicious ADOPT and STANDBY handovers sent
+to Rust/Python twins (`test_handover_adversary.py`), admission control under a
+multi-threaded flood, connection caps and stamps with restarts
+(`test_admission_load.py`), and wallet crashes at every crash point of pay, receive,
+consolidate, both swap flows, abort and pledge release (`tests/test_wallet_crash.py`,
+in process, every witness call before and after it is served and every file write;
+`test_wallet_kill.py`, the CLI process killed with `os._exit` against real daemons).
+It found eight more bugs, none a safety violation of the witness protocol:
+
+| Suite | Bug | Fix |
+|---|---|---|
+| handover | one Byzantine predecessor's snapshot holding NaN, a >128-bit integer, a lone surrogate or deep nesting made every Rust adopter refuse the whole handover | both daemons refuse non-portable bodies identically (WIRE.md "Portable JSON"); the client drops non-portable snapshot entries |
+| handover | Python bound SPENDs the Rust witness cannot parse (expires ≥ 2¹²⁷) and authorised generations ≥ 2⁶², so the two inherited different records | Python refuses non-portable requests and generations ≥ 2⁶², as Rust |
+| handover | ADOPT made an empty record for every made-up sigil key, carried forward by every FREEZE | no record for a sigil with no verifiable evidence (Python and Rust) |
+| handover | STANDBY kept every junk entry and handed it to every later committee | STANDBY keeps only verifiable evidence (shared `classify_evidence`) |
+| byz standby | a member or witness answering `{}`, `[]` or a wrongly shaped info / FREEZE / SUCCEED / stamp reply crashed every client in the home | malformed replies count as no answer |
+| wallet crash | `release_expired_pledges` dropped a transition's pending entry when one input (a kill switch that never reached a witness) was released, stranding its other, bound inputs | the pending entry stays while any input is pledged to it |
+| wallet crash | a swap interrupted when one party's crash lost the other's kill-switch unlock could never settle | a party lacking another's unlock never signs or binds for the transition again, so its kill switch expires unbound and becomes the death proof both abort with; a party holding every unlock may complete first and hand the swap over (`Wallet.accept_completed`); `seal` binds every input it can before failing |
+| wallet crash | `sigil pay` killed after sealing but before (or while) writing the payment file lost the payment (or left a truncated file) | the payment is listed as completed until its file is written, atomically |
 
 The last two chaos fixes make the code stricter than the models (rule 3 asks
 more members before releasing; succession asks before signing), so the
