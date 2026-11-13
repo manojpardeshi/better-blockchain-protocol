@@ -167,6 +167,7 @@ class Wallet:
         self.legacy_keys: set[str] = set()
         self.spent: set[str] = set()          # sigils we held and consumed: never credited again
         self.auto_prune = True                # pay() drops history it no longer needs (see prune)
+        self.auto_settle = True               # completed transitions are SETTLEd at their homes (SPEC §5.7)
         self.kill_switches: set[str] = set()  # sigils of kill-switch parcels (multi-party transitions)
         # sigil -> {"gen", "tid", "proof"} of each transition we aborted: re-presented to
         # any witness that still holds the old binding (it missed the RELEASE, or a
@@ -212,6 +213,12 @@ class Wallet:
         parcels of at least ``deep_threshold``.
         """
         received = []
+        # A delta dossier (SPEC §6.1) leaves out history we already hold: verify against
+        # the union, our own entries winning, so everything below sees the full ancestry.
+        try:
+            dossier = Dossier().merge(self.dossier).merge(dossier)
+        except (AttributeError, TypeError, KeyError, ValueError) as e:
+            raise InvalidDossier(f"malformed dossier: {type(e).__name__}") from e
         # The threshold applies to the whole payment per asset, so splitting
         # one large payment into many small parcels cannot dodge it.
         parcels = [self.verifier.verify_parcel(dossier, r) for r in refs]
@@ -253,6 +260,11 @@ class Wallet:
                 self.issued.add(s)
             received.append(p)
         return received
+
+    def held_history(self) -> set:
+        """The transitions we hold in our dossier: a payer may leave them out of the dossier
+        it hands us (SPEC §6.1). Only what we still hold, never what we pruned."""
+        return set(self.dossier.transitions)
 
     def sealed_by_succeeded_version(self, dossier: Dossier, tids) -> bool:
         """Does the ancestry of ``tids`` hold a seal by a version that was taken over?
@@ -465,7 +477,7 @@ class Wallet:
         addr = to.address(home)
         refs, outputs = self.payment_outputs(asset, amount, addr)
         tid = self.transact(refs, outputs)
-        to.receive(self.dossier.ancestry([tid]), [model.ref(tid, 0)])
+        to.receive(self.dossier.ancestry([tid], have=to.held_history()), [model.ref(tid, 0)])
         if self.auto_prune:
             self.prune()
         return tid
@@ -620,7 +632,46 @@ class Wallet:
                 self.holdings[model.parcel_id(r)] = {"ref": r, "parcel": p, "sigil": model.sigil_of(p), "gen": 0}
                 if p["asset"] in kill_assets and p["amount"] == 1:
                     self.kill_switches.add(model.sigil_of(p))
+        if self.auto_settle:
+            self.settle(header, body)
         return tid
+
+    def settlement(self, header: dict, body: dict) -> dict | None:
+        """The settlement certificate of a completed transition (SPEC §3.12), or None
+        while some input's seal is missing from our dossier."""
+        tid = model.transition_id(header)
+        inputs = []
+        for r, (s, _g) in zip(body["inputs"], header["inputs"]):
+            seal = self.dossier.seals.get(model.seal_key(s, tid))
+            if seal is None:
+                return None
+            p = self.dossier.output(r)
+            inputs.append({"parcel": {"home": p["home"], "lock": p["lock"], "salt": p["salt"]}, "seal": seal})
+        return {"header": header, "inputs": inputs} if inputs else None
+
+    def settle(self, header: dict, body: dict) -> int:
+        """Show every witness of every input's home that the transition is complete
+        (SPEC §5.7), so they can settle and later checkpoint its inputs. Best effort:
+        a witness that does not answer just keeps the full record. Returns how many
+        witnesses settled something."""
+        cert = self.settlement(header, body)
+        if cert is None:
+            return 0
+        homes = {e["parcel"]["home"] for e in cert["inputs"]}
+        chains = {c: self.network.registry.chain(c) for c in homes if self.network.registry.chain(c)}
+        n = 0
+        for home in homes:
+            for w in self.network.witnesses(home):
+                if len(chains) > 1 and hasattr(w, "gossip"):
+                    try:  # the seals of the other homes verify against their charters
+                        w.gossip({"charters": chains})
+                    except (Rejected, ValueError, KeyError, TypeError):
+                        pass
+                try:
+                    n += bool(w.settle(cert).get("settled"))
+                except (Rejected, AttributeError):
+                    continue
+        return n
 
     def transact(self, refs: list, outputs: list, *, extra_unlocks: dict | None = None, memo: str = "") -> str:
         header, body, _ = self.prepare(refs, outputs, memo)

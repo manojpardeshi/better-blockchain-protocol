@@ -246,7 +246,9 @@ class Finding2InducedEquivocation(unittest.TestCase):
         self.assertEqual(bob.balance(usd), 100)
         s = bob.dossier.transitions[tid]["header"]["inputs"][0][0]
 
-        net.rotate(c, [KeyPair.generate() for _ in range(4)])
+        # Without a checkpoint (SPEC 5.7): with one, the settled payment is simply
+        # checkpointed (tests/test_compaction.py covers that path).
+        net.rotate(c, [KeyPair.generate() for _ in range(4)], compact=False)
         # The induced second binding still makes the record contested ...
         self.assertEqual(net.witnesses(c)[0].status(s)["tid"], "!contested")
         # ... but a deep-confirming recipient settles it with the seal and accepts.

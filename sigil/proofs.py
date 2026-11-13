@@ -12,7 +12,7 @@ These are the only cryptographic facts the protocol relies on:
 
 from .charter import Registry, quorum
 from .crypto import verify
-from .model import ack_payload, heartbeat_payload, sigil_of, vote_payload, votes_of_seal
+from .model import ack_payload, heartbeat_payload, sigil_of, transition_id, vote_payload, votes_of_seal
 
 
 def verify_vote(v: dict) -> bool:
@@ -140,3 +140,45 @@ def proves_dead(header: dict, tid: str, proof: dict, registry: Registry) -> bool
     except (KeyError, TypeError, RecursionError):
         return False
     return False
+
+
+def parse_settlement(cert) -> tuple[str, list] | None:
+    """The shape of a settlement certificate (SPEC §3.12), without its signatures.
+
+    Returns ``(tid, [(sigil, gen, home, seal)])`` in header order, or None if the
+    certificate is malformed: inputs and header disagree, a parcel does not hash to
+    its sigil, or a seal names another sigil, generation, transition or home.
+    """
+    try:
+        h, ins = cert["header"], cert["inputs"]
+        hin = h["inputs"]
+        if not (isinstance(ins, list) and isinstance(hin, list) and ins and len(ins) == len(hin)):
+            return None
+        tid = transition_id(h)
+        out, seen = [], set()
+        for pair, e in zip(hin, ins):
+            s, g = pair
+            p, seal = e["parcel"], e["seal"]
+            if (not isinstance(s, str) or s in seen or not isinstance(g, int) or isinstance(g, bool) or g < 0
+                    or not isinstance(p, dict) or not isinstance(seal, dict) or sigil_of(p) != s):
+                return None
+            if (seal["sigil"] != s or type(seal["gen"]) is not int or seal["gen"] != g or seal["tid"] != tid
+                    or seal["constellation"] != p["home"] or not isinstance(p["home"], str)):
+                return None
+            seen.add(s)
+            out.append((s, g, p["home"], seal))
+        return tid, out
+    except (KeyError, TypeError, ValueError, AttributeError, RecursionError):
+        return None
+
+
+def verify_settlement(cert, registry: Registry) -> tuple[str, list] | None:
+    """A valid settlement certificate shows its transition complete (every input sealed,
+    each by its own home). Returns ``(tid, [(sigil, gen, home)])`` or None."""
+    parsed = parse_settlement(cert)
+    if parsed is None:
+        return None
+    tid, inputs = parsed
+    if not all(verify_seal(seal, registry) for _s, _g, _home, seal in inputs):
+        return None
+    return tid, [(s, g, home) for s, g, home, _seal in inputs]

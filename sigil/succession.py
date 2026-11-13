@@ -31,7 +31,8 @@ entry it is given, each distinct one once.
 import json
 import secrets
 
-from .charter import MAX_CHARTER_BYTES, Registry, charter_body, charter_hash, quorum, sign_charter, signers
+from .charter import (MAX_CHARTER_BYTES, Registry, charter_body, charter_hash, checkpoint_hash, quorum, sign_charter,
+                      signers, valid_checkpoint_set)
 from .crypto import KeyPair
 from .encoding import canonical
 from .model import ack_payload, transition_id
@@ -51,15 +52,18 @@ class StandbyStore(WitnessStore):
 
     Kinds: ``pk``; ``standby`` (``{constellation, version, since}``); ``fenced``
     (``{constellation, version, charter}``: the successor it signed); ``mirror``
-    (key ``"<version>|<sigil>"``, value the mirror log of that sigil).
+    (key ``"<version>|<sigil>"``, value the mirror log of that sigil); ``checkpoint``
+    (key ``"<version>"``, value that version's checkpoint set, SPEC §5.7).
     """
 
     def load(self) -> dict:
-        state = {"pk": None, "standby": None, "fenced": None, "mirror": {}}
+        state = {"pk": None, "standby": None, "fenced": None, "mirror": {}, "checkpoint": {}}
         for kind, key, value in self.db.execute("SELECT kind, key, value FROM log ORDER BY seq"):
             v = json.loads(value)
             if kind == "mirror":
                 state["mirror"][key] = v
+            elif kind == "checkpoint":
+                state["checkpoint"][key] = v
             elif kind in ("pk", "standby", "fenced"):
                 state[kind] = v
         return state
@@ -121,6 +125,7 @@ class Standby:
         self.fenced_for: str | None = None     # hash of the one successor we signed
         self.heard: dict[str, int] = {}        # member pk -> when it last answered our challenge
         self.since: int | None = None          # start of our observation window
+        self.checkpoint: list = []             # our version's checkpoint set (SPEC §5.7)
         self.store = store
         if store is not None:
             self._restore()
@@ -141,6 +146,7 @@ class Standby:
         self.since = max(sb["since"], int(self.clock()))
         prefix = f"{self.version}|"
         self.mirror = {k[len(prefix):]: v for k, v in state["mirror"].items() if k.startswith(prefix)}
+        self.checkpoint = state.get("checkpoint", {}).get(str(self.version), [])
         self._set_mirrored(_bindings(self.mirror))
         f = state["fenced"]
         if isinstance(f, dict) and (f.get("constellation"), f.get("version")) == (self.cid, self.version):
@@ -170,7 +176,19 @@ class Standby:
             raise ValueError("not a member of this version's successor committee")
         return body
 
-    def enter(self, cid: str, version: int, snapshots: list) -> None:
+    @staticmethod
+    def _checkpoint_for(body: dict, entries) -> list:
+        """``entries`` if it is the checkpoint set ``body`` commits to (empty without one)."""
+        ck = body.get("checkpoint")
+        if ck is None:
+            if entries not in (None, []):
+                raise Rejected("this charter carries no checkpoint")
+            return []
+        if not valid_checkpoint_set(entries) or checkpoint_hash(entries) != ck:
+            raise Rejected("checkpoint set does not match the charter")
+        return entries
+
+    def enter(self, cid: str, version: int, snapshots: list, checkpoint: list | None = None) -> None:
         """STANDBY: stand by for ``(cid, version)`` with the evidence its members adopt.
 
         ``snapshots`` are the ones the version's members ADOPT (SPEC §5.4/§5.5): the
@@ -182,7 +200,8 @@ class Standby:
             raise ValueError("snapshots must be a list")
         if not _is_int(version):
             raise ValueError("version must be an integer")
-        self._version_body(cid, version)
+        body = self._version_body(cid, version)
+        ck = self._checkpoint_for(body, checkpoint)
         if self.cid is not None:
             if (self.cid, self.version) == (cid, version):
                 return  # a retried STANDBY
@@ -193,8 +212,9 @@ class Standby:
         mirror = _members_snapshot_union(snapshots)
         since = int(self.clock())
         self._persist(("standby", "", {"constellation": cid, "version": version, "since": since}),
+                      *([("checkpoint", str(version), ck)] if ck else []),
                       *(("mirror", f"{version}|{s}", log) for s, log in mirror.items()))
-        self.cid, self.version, self.since = cid, version, since
+        self.cid, self.version, self.since, self.checkpoint = cid, version, since, ck
         self.mirror, self.fenced_for, self.heard = mirror, None, {}
         self._set_mirrored(_bindings(mirror))
 
@@ -313,7 +333,8 @@ class Standby:
         alive = {pk for pk, t in self.heard.items() if now - t <= d}
         return now - self.since >= d and len(alive) < quorum(len(body["witnesses"]))
 
-    def succeed(self, next_charter: dict, sigs: dict | None = None) -> tuple[str, dict]:
+    def succeed(self, next_charter: dict, sigs: dict | None = None,
+                checkpoint: list | None = None) -> tuple[str, dict]:
         """SUCCEED: sign the next charter version and fence; returns (signature, snapshot).
 
         Signs only a well-formed successor of the version we stand by for, at most
@@ -329,7 +350,7 @@ class Standby:
         try:
             well_formed = (next_charter == charter_body(next_charter["name"], next_charter["version"],
                                                         next_charter["witnesses"], next_charter["prev"],
-                                                        next_charter.get("successor"))
+                                                        next_charter.get("successor"), next_charter.get("checkpoint"))
                            and all(isinstance(k, str) for k in next_charter["witnesses"]))
         except (KeyError, TypeError, ValueError, AttributeError):
             well_formed = False
@@ -341,6 +362,11 @@ class Standby:
         if (next_charter["prev"] != charter_hash(cur) or not _is_int(next_charter["version"])
                 or next_charter["version"] != self.version + 1):
             raise Rejected("charter does not extend the version we stand by for")
+        ck = self._checkpoint_for(next_charter, checkpoint)
+        mine, nxt = {e[0]: tuple(e) for e in self.checkpoint}, {e[0]: tuple(e) for e in ck}
+        if any(nxt.get(s) != e for s, e in mine.items()):
+            # The extension rule (SPEC §5.7): a sigil of our checkpoint has no log here.
+            raise Rejected("checkpoint drops a sigil of our version's checkpoint")
         h = charter_hash(next_charter)
         if self.fenced_for is not None:
             if self.fenced_for != h:
@@ -352,9 +378,13 @@ class Standby:
             if not cooperative and not self.dead():
                 raise Rejected("the version is alive: no quorum of its members asked, "
                                "and the dead-man period has not passed")
+            if not cooperative and len(nxt) != len(mine):
+                # Alone, the committee cannot check settlements: only the version's checkpoint.
+                raise Rejected("a dead-man successor carries exactly the version's checkpoint")
             self._persist(("fenced", "", {"constellation": self.cid, "version": self.version, "charter": h}))
             self.fenced_for = h
-        return sign_charter(self.kp, next_charter), self.snapshot()
+        snap = {s: log for s, log in self.snapshot().items() if s not in nxt}
+        return sign_charter(self.kp, next_charter), snap
 
     # ----------------------------------------------------------------- query
 
@@ -371,6 +401,10 @@ class Standby:
     def snapshot(self) -> dict:
         """Our mirror log, in FREEZE snapshot format (SPEC §5.4)."""
         return {s: list(log) for s, log in self.mirror.items()}
+
+    def settled_records(self) -> dict:
+        """SETTLED (SPEC §5.7): a standby member only knows its version's checkpoint."""
+        return {"settled": [], "checkpointed": [list(e) for e in self.checkpoint]}
 
     def info(self) -> dict:
         return {"pk": self.pk, "role": "standby", "constellation": self.cid, "version": self.version,

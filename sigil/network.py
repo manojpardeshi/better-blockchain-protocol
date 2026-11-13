@@ -8,11 +8,59 @@ A constellation may have a successor committee (SPEC §5.5): ``committees[cid]``
 holds its standby members, and ``succeed`` drives a dead-man takeover.
 """
 
-from .charter import Registry, charter_body, charter_hash, constellation_id, quorum, successor_clause
+from .charter import (Registry, charter_body, charter_hash, checkpoint_hash, constellation_id, quorum,
+                      successor_clause, valid_checkpoint_set)
 from .crypto import KeyPair
 from .stamps import StampMint
 from .succession import Standby
 from .witness import Rejected, Witness
+
+
+def plan_checkpoint(cur: dict, answers: list, compact: bool = True) -> list:
+    """The checkpoint set to offer for the version after ``cur`` (SPEC §5.7).
+
+    ``answers`` are members' SETTLED answers. The current version's own set (checked
+    against ``cur``'s hash) is always kept: members refuse a charter that drops one
+    of its sigils. With ``compact`` it is extended by every entry all answering
+    members hold settled; settled records only accumulate, so each of them accepts.
+    A malformed answer counts as holding nothing settled (it costs compaction only).
+    """
+    prev: list = []
+    ck = cur.get("checkpoint")
+    if ck is not None:
+        for a in answers:
+            c = a.get("checkpointed") if isinstance(a, dict) else None
+            if valid_checkpoint_set(c) and checkpoint_hash(c) == ck:
+                prev = c
+                break
+        else:
+            raise RuntimeError("no member answered with the current checkpoint set")
+    if not compact or not answers:
+        return [list(e) for e in prev]
+    common = None
+    for a in answers:
+        try:
+            got = {(e[0], e[1], e[2]) for e in a["settled"]
+                   if isinstance(e, list) and len(e) == 3 and isinstance(e[0], str) and isinstance(e[2], str)
+                   and isinstance(e[1], int) and not isinstance(e[1], bool) and e[1] >= 0}
+        except (KeyError, TypeError, IndexError):
+            got = set()
+        common = got if common is None else common & got
+    merged = {e[0]: tuple(e) for e in prev}
+    for e in sorted(common or ()):
+        merged.setdefault(e[0], e)
+    return [list(merged[k]) for k in sorted(merged)]
+
+
+def settled_answers(members) -> list:
+    """SETTLED from each of ``members`` that answers."""
+    out = []
+    for m in members:
+        try:
+            out.append(m.settled_records())
+        except (Rejected, AttributeError):
+            continue
+    return out
 
 
 class SimClock:
@@ -68,11 +116,14 @@ class Network:
         return ckeys, successor_clause([k.pk for k in ckeys], successor["dead_man"])
 
     def _stand_by(self, cid: str, version: int, ckeys: list, snapshots: list,
-                  standby_cls=Standby) -> list:
+                  standby_cls=Standby, checkpoint: list | None = None) -> list:
         out = []
         for kp in ckeys:
             m = standby_cls(kp, self.registry, self.clock)
-            m.enter(cid, version, snapshots)
+            if checkpoint:
+                m.enter(cid, version, snapshots, checkpoint)
+            else:
+                m.enter(cid, version, snapshots)
             out.append(m)
         return out
 
@@ -92,7 +143,7 @@ class Network:
             m.probe(self.witnesses(cid))
 
     def rotate(self, cid: str, new_keys: list[KeyPair], witness_cls=Witness, *,
-               successor: dict | None = None) -> int:
+               successor: dict | None = None, compact: bool = True) -> int:
         """Replace a constellation's membership; returns the new version.
 
         Old members freeze and sign the new charter; new members adopt the
@@ -100,16 +151,20 @@ class Network:
         current version has a successor committee, the committee must sign too
         (SPEC §5.5): its members get the members' signatures as the request,
         fence, and hand over their mirror logs as well. ``successor`` gives the
-        new version a committee (``{"n" | "keys", "dead_man"}``).
+        new version a committee (``{"n" | "keys", "dead_man"}``). With ``compact``
+        the new charter checkpoints every sigil all live members hold settled
+        (SPEC §5.7); the current checkpoint is carried over in any case.
         """
         chain = self.registry.chain(cid)
         cur = chain[-1]["body"]
         ckeys, succ = self._committee_keys(successor)
-        nxt = charter_body(cur["name"], cur["version"] + 1, [k.pk for k in new_keys], charter_hash(cur), succ)
+        ck = plan_checkpoint(cur, settled_answers(self.witnesses(cid)), compact)
+        nxt = charter_body(cur["name"], cur["version"] + 1, [k.pk for k in new_keys], charter_hash(cur), succ,
+                           checkpoint_hash(ck) if ck else None)
         sigs, snapshots = {}, []
         for w in self.witnesses(cid):
             try:
-                sig, snap = w.freeze(nxt)
+                sig, snap = w.freeze(nxt, ck) if ck else w.freeze(nxt)
             except Rejected:
                 continue
             sigs[w.pk] = sig
@@ -118,11 +173,11 @@ class Network:
             raise RuntimeError("not enough live witnesses to rotate")
         frozen = set(sigs)
         if cur.get("successor") is not None:
-            csigs = self._committee_signatures(cid, nxt, dict(sigs), snapshots)
+            csigs = self._committee_signatures(cid, nxt, dict(sigs), snapshots, ck)
             if len(csigs) < quorum(len(cur["successor"]["committee"])):
                 raise RuntimeError("not enough live standby members to sign the rotation")
             sigs.update(csigs)
-        return self._install(cid, chain, nxt, sigs, snapshots, new_keys, ckeys, witness_cls, frozen)
+        return self._install(cid, chain, nxt, sigs, snapshots, new_keys, ckeys, witness_cls, frozen, ck)
 
     def succeed(self, cid: str, new_keys: list[KeyPair], witness_cls=Witness, *,
                 successor: dict | None = None) -> int:
@@ -137,28 +192,32 @@ class Network:
         if cur.get("successor") is None:
             raise ValueError("this version names no successor committee")
         ckeys, succ = self._committee_keys(successor)
-        nxt = charter_body(cur["name"], cur["version"] + 1, [k.pk for k in new_keys], charter_hash(cur), succ)
+        # Alone, the committee carries exactly the version's checkpoint (SPEC §5.7).
+        ck = plan_checkpoint(cur, settled_answers(self.committee(cid)), compact=False)
+        nxt = charter_body(cur["name"], cur["version"] + 1, [k.pk for k in new_keys], charter_hash(cur), succ,
+                           checkpoint_hash(ck) if ck else None)
         # Two phases (as RemoteNetwork.succeed): ask first, so a minority never fences alone.
         if sum(1 for m in self.committee(cid) if m.dead()) < quorum(len(cur["successor"]["committee"])):
             raise RuntimeError("not enough standby members agree the version is dead")
         snapshots: list = []
-        sigs = self._committee_signatures(cid, nxt, {}, snapshots)
+        sigs = self._committee_signatures(cid, nxt, {}, snapshots, ck)
         if len(sigs) < quorum(len(cur["successor"]["committee"])):
             raise RuntimeError("not enough standby members agree the version is dead")
-        return self._install(cid, chain, nxt, sigs, snapshots, new_keys, ckeys, witness_cls)
+        return self._install(cid, chain, nxt, sigs, snapshots, new_keys, ckeys, witness_cls, (), ck)
 
-    def _committee_signatures(self, cid: str, nxt: dict, member_sigs: dict, snapshots: list) -> dict:
+    def _committee_signatures(self, cid: str, nxt: dict, member_sigs: dict, snapshots: list,
+                              checkpoint: list | None = None) -> dict:
         out = {}
         for m in self.committee(cid):
             try:
-                sig, snap = m.succeed(nxt, member_sigs)
+                sig, snap = m.succeed(nxt, member_sigs, checkpoint) if checkpoint else m.succeed(nxt, member_sigs)
             except Rejected:
                 continue
             out[m.pk] = sig
             snapshots.append(snap)
         return out
 
-    def _install(self, cid, chain, nxt, sigs, snapshots, new_keys, ckeys, witness_cls, frozen=()) -> int:
+    def _install(self, cid, chain, nxt, sigs, snapshots, new_keys, ckeys, witness_cls, frozen=(), ck=None) -> int:
         self.registry.add_chain(cid, chain + [{"body": nxt, "sigs": sigs}])
         # The latest process of each key (current members win over retired ones).
         old = {w.pk: w for w in self.retired.get(cid, []) + self.all_witnesses(cid)}
@@ -168,12 +227,15 @@ class Network:
             own = []  # a re-used key brings its own votes, even if it did not freeze (SPEC §5.4)
             if kp.pk in old and kp.pk not in frozen:
                 own = [{s: [{"kind": "vote", "vote": v} for v in r.votes] for s, r in old[kp.pk].records.items()}]
-            w.adopt(cid, nxt["version"], snapshots + own)
+            if ck:
+                w.adopt(cid, nxt["version"], snapshots + own, ck)
+            else:
+                w.adopt(cid, nxt["version"], snapshots + own)
             ws.append(w)
         self.retired.setdefault(cid, []).extend(self.members.get(cid, []))
         self.retired_committees.setdefault(cid, []).extend(self.committees.get(cid, []))
         self.members[cid] = ws
-        self.committees[cid] = self._stand_by(cid, nxt["version"], ckeys, snapshots)
+        self.committees[cid] = self._stand_by(cid, nxt["version"], ckeys, snapshots, checkpoint=ck)
         return nxt["version"]
 
     def find_votes(self, sigil: str) -> list:

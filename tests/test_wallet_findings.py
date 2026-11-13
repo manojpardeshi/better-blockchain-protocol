@@ -590,7 +590,9 @@ class RotationFindings(unittest.TestCase):
         self.assertEqual(len(bob.release_expired_pledges()), 1)
         tid = bob.pay(dave, usd, 100)
         Wallet("erin", net, X).deep_confirm(dave.dossier, [tid])   # fine before the rotation
-        net.rotate(X, [KeyPair.generate() for _ in range(4)])
+        # Without a checkpoint (SPEC 5.7): with one, the settled payment is simply
+        # checkpointed (tests/test_compaction.py covers that path).
+        net.rotate(X, [KeyPair.generate() for _ in range(4)], compact=False)
         s = dave.dossier.transitions[tid]["header"]["inputs"][0][0]
         self.assertTrue(all(w.records[s].tid == CONTESTED for w in net.witnesses(X)))
         try:

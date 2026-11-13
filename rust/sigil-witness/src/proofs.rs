@@ -244,3 +244,43 @@ fn proves_dead_inner(header: &Json, tid: &str, proof: &Json, registry: &Registry
         _ => Some(false),
     }
 }
+
+/// One input of a settlement certificate: `(sigil, gen, home, seal)`.
+pub type SettledInput = (String, i128, String, Json);
+
+/// `parse_settlement`: the shape of a settlement certificate (SPEC §3.12), without its
+/// signatures. `(tid, inputs)` in header order, or `None` if malformed: inputs and header
+/// disagree, a parcel does not hash to its sigil, or a seal names another sigil, generation,
+/// transition or home.
+pub fn parse_settlement(cert: &Json) -> Option<(String, Vec<SettledInput>)> {
+    let header = cert.get("header")?;
+    let ins = cert.get("inputs")?.as_arr()?;
+    let hin = header.get("inputs")?.as_arr()?;
+    if ins.is_empty() || ins.len() != hin.len() {
+        return None;
+    }
+    let tid = crate::model::transition_id(header);
+    let mut out = Vec::with_capacity(ins.len());
+    let mut seen: HashSet<&str> = HashSet::new();
+    for (pair, e) in hin.iter().zip(ins) {
+        let [s, g] = <&[Json; 2]>::try_from(pair.as_arr()?.as_slice()).ok()?;
+        let (s, g) = (s.as_str()?, g.as_int()?);
+        let p = e.get("parcel")?;
+        let seal = e.get("seal")?;
+        if seen.contains(s) || g < 0 || p.as_obj().is_none() || seal.as_obj().is_none() {
+            return None;
+        }
+        let home = p.get("home")?;
+        if sigil_of(home, p.get("lock")?, p.get("salt")?) != s {
+            return None;
+        }
+        let home = home.as_str()?;
+        let str_is = |k: &str, want: &str| seal.get(k).and_then(Json::as_str) == Some(want);
+        if !(str_is("sigil", s) && seal.get("gen")?.as_int()? == g && str_is("tid", &tid) && str_is("constellation", home)) {
+            return None;
+        }
+        seen.insert(s);
+        out.push((s.to_string(), g, home.to_string(), seal.clone()));
+    }
+    Some((tid, out))
+}

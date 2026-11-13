@@ -18,12 +18,13 @@ so a crash can never make it forget a vote and equivocate.
 
 from dataclasses import asdict, dataclass, field
 
-from .charter import MAX_CHARTER_BYTES, Registry, charter_body, charter_hash, quorum, sign_charter
+from .charter import (MAX_CHARTER_BYTES, Registry, charter_body, charter_hash, checkpoint_hash, quorum, sign_charter,
+                      valid_checkpoint_set)
 from .crypto import KeyPair
 from .encoding import canonical
 from .locks import evaluate
 from .model import heartbeat_payload, sigil_of, transition_id, vote_payload
-from .proofs import acked_by, proves_dead, verify_seal, verify_vote
+from .proofs import acked_by, parse_settlement, proves_dead, verify_seal, verify_settlement, verify_vote
 from .stamps import StampMint
 from .store import WitnessStore
 
@@ -48,6 +49,10 @@ CONTESTED = "!contested"
 MAX_AUTH_BYTES = 32 << 10    # enc({home, lock, salt, unlock, header}) of a SPEND
 MAX_PROOF_BYTES = 128 << 10  # enc(proof) of a RELEASE (a death proof for 128 witnesses fits)
 MAX_GEN = 16                 # a sigil is newly bound only below this generation (so at most 16 times)
+MAX_SETTLE_BYTES = 512 << 10  # enc(settlement) of a SETTLE (SPEC §5.7)
+
+# Record.settled (SPEC §5, §5.7).
+UNSETTLED, SETTLED, CHECKPOINTED = 0, 1, 2
 
 
 def _encoding(x):
@@ -76,11 +81,14 @@ class Record:
     votes: list = field(default_factory=list)  # every vote we ever cast on this sigil
     abstain: bool = False           # our key already voted another tid at ``gen``: never vote here
     candidates: list = field(default_factory=list)  # CONTESTED: live [gen, tid, header] still to be proven dead
+    # SETTLED: a certificate showed (gen, tid) complete; CHECKPOINTED: in our charter's
+    # checkpoint set (no log). Either way the record never votes or releases again.
+    settled: int = UNSETTLED
 
     def copy(self) -> "Record":
         """A working copy; log entries are never mutated, so the lists are copied shallowly."""
         return Record(self.gen, self.tid, self.header, self.vote, list(self.log), list(self.votes),
-                      self.abstain, list(self.candidates))
+                      self.abstain, list(self.candidates), self.settled)
 
 
 def authorises(sigil: str, auth: dict) -> tuple[int, str] | None:
@@ -203,6 +211,13 @@ class Witness:
             raise Rejected("lock not satisfied now")
 
         old = self.records.get(sigil)
+        if old is not None and old.settled:
+            # Its transition is complete (SPEC §5.7): never a new vote, only the one we hold.
+            if (old.gen, old.tid) == (gen, tid) and old.vote is not None:
+                return old.vote
+            if old.tid != tid:
+                raise Conflict(old.vote)
+            raise Rejected("sigil consumed: its transition is complete")
         rec = old.copy() if old is not None else Record()
         if gen < rec.gen:
             raise Rejected("stale generation")
@@ -264,6 +279,8 @@ class Witness:
         rec = self.records.get(sigil)
         if rec is None or rec.tid is None:
             raise Rejected("nothing to release")
+        if rec.settled:
+            raise Rejected("sigil consumed: its transition is complete")
         big = _too_big(proof, MAX_PROOF_BYTES)
         if big is not False:
             raise Rejected("death proof too large" if big else "invalid death proof")
@@ -332,6 +349,74 @@ class Witness:
         except (KeyError, TypeError, AttributeError):
             return None
 
+    # ------------------------------------------------------------ settlement
+
+    def settle(self, cert) -> dict:
+        """SETTLE (SPEC §5.7): ``cert`` shows a transition complete; settle our inputs.
+
+        Every input of the transition that lives here is marked settled at its
+        generation: from then on we never vote on that sigil again (except to hand
+        back a vote we already hold for exactly that binding) and never release it.
+        That is abstention, safe whatever the certificate says; it is checked so that
+        we never settle a sigil whose transition could still die. The log is kept for
+        the next handover until a checkpoint covers the sigil.
+        """
+        if self.cid is None or self.frozen:
+            raise Rejected("witness not active")
+        big = _too_big(cert, MAX_SETTLE_BYTES)
+        if big is not False:
+            raise Rejected("settlement too large" if big else "invalid settlement certificate")
+        parsed = parse_settlement(cert)
+        if parsed is None:
+            raise Rejected("invalid settlement certificate")
+        tid, inputs = parsed
+        mine = [(s, g) for s, g, home, _seal in inputs if home == self.cid]
+        if not mine:
+            raise Rejected("no input of this transition lives here")
+        if verify_settlement(cert, self.registry) is None:
+            raise Rejected("invalid settlement certificate")
+        changed = {}
+        for s, g in mine:
+            old = self.records.get(s)
+            if old is not None and old.settled:
+                continue  # settled already (at another binding only with > f faults: keep the first)
+            rec = old.copy() if old is not None else Record()
+            rec.gen, rec.tid, rec.header, rec.candidates, rec.abstain = g, tid, cert["header"], [], False
+            rec.vote = next((v for v in rec.votes if v["gen"] == g and v["tid"] == tid), None)
+            rec.settled = SETTLED
+            changed[s] = rec
+        if changed:
+            self._persist(*(self._rec(s, r) for s, r in changed.items()))
+            self.records.update(changed)
+        return {"settled": sorted(s for s, g in mine
+                                  if self.records[s].settled and (self.records[s].gen, self.records[s].tid) == (g, tid))}
+
+    def settled_records(self) -> dict:
+        """SETTLED (SPEC §5.7): our settled and checkpointed records as ``[sigil, gen, tid]``."""
+        out = {"settled": [], "checkpointed": []}
+        for s in sorted(self.records):
+            r = self.records[s]
+            if r.settled == SETTLED:
+                out["settled"].append([s, r.gen, r.tid])
+            elif r.settled == CHECKPOINTED:
+                out["checkpointed"].append([s, r.gen, r.tid])
+        return out
+
+    def _checkpoint_for(self, body: dict, entries) -> dict:
+        """The checkpoint set ``entries`` of charter ``body`` as ``{sigil: (gen, tid)}``.
+
+        Raises Rejected unless it matches the body's ``checkpoint`` hash (a body
+        without one has the empty set).
+        """
+        ck = body.get("checkpoint")
+        if ck is None:
+            if entries not in (None, []):
+                raise Rejected("this charter carries no checkpoint")
+            return {}
+        if not valid_checkpoint_set(entries) or checkpoint_hash(entries) != ck:
+            raise Rejected("checkpoint set does not match the charter")
+        return {e[0]: (e[1], e[2]) for e in entries}
+
     # ----------------------------------------------------------------- query
 
     def status(self, sigil: str) -> dict:
@@ -362,10 +447,13 @@ class Witness:
 
     # -------------------------------------------------------------- rotation
 
-    def freeze(self, next_charter: dict) -> tuple[str, dict]:
+    def freeze(self, next_charter: dict, checkpoint: list | None = None) -> tuple[str, dict]:
         """Stop voting forever and hand over evidence for the next charter.
 
-        Returns our signature on the next charter and our evidence log.
+        Returns our signature on the next charter and our evidence log. If the
+        charter carries a checkpoint, ``checkpoint`` is its set: we freeze only if
+        every entry matches a record we hold settled and every record we hold
+        checkpointed is in it (SPEC §5.7), and the snapshot omits those sigils.
         """
         if self.cid is None:
             raise Rejected("witness not active")
@@ -378,7 +466,7 @@ class Witness:
         try:
             well_formed = (next_charter == charter_body(next_charter["name"], next_charter["version"],
                                                         next_charter["witnesses"], next_charter["prev"],
-                                                        next_charter.get("successor"))
+                                                        next_charter.get("successor"), next_charter.get("checkpoint"))
                            and all(isinstance(k, str) for k in next_charter["witnesses"])
                            and len(canonical({"body": next_charter, "sigs": {}})) <= MAX_CHARTER_BYTES)
         except (KeyError, TypeError, ValueError, AttributeError):
@@ -386,6 +474,14 @@ class Witness:
         if (not well_formed or next_charter["name"] != cur["name"] or not isinstance(next_charter["version"], int)
                 or isinstance(next_charter["version"], bool) or next_charter["version"] != self.version + 1):
             raise Rejected("not a valid next version of our charter")
+        ck = self._checkpoint_for(next_charter, checkpoint)
+        for s, (g, t) in ck.items():
+            r = self.records.get(s)
+            if r is None or not r.settled or (r.gen, r.tid) != (g, t):
+                raise Rejected("checkpoint names a binding this witness does not hold settled")
+        if any(r.settled == CHECKPOINTED and s not in ck for s, r in self.records.items()):
+            # The extension rule: a checkpointed record has no log to hand over.
+            raise Rejected("checkpoint drops a sigil of our own checkpoint")
         # We sign exactly one successor: signing two lets a quorum of honest
         # witnesses certify two conflicting version v+1 charters (a fork).
         h = charter_hash(next_charter)
@@ -397,11 +493,16 @@ class Witness:
         # Our signed votes travel with the evidence so that, if our key is
         # re-used in the next charter, we never vote a different transition
         # at a (sigil, generation) where we already voted.
-        snapshot = {s: list(r.log) + [{"kind": "vote", "vote": v} for v in r.votes] for s, r in self.records.items()}
+        snapshot = {s: list(r.log) + [{"kind": "vote", "vote": v} for v in r.votes]
+                    for s, r in self.records.items() if s not in ck}
         return sign_charter(self.kp, next_charter), snapshot
 
-    def adopt(self, cid: str, version: int, snapshots: list) -> None:
+    def adopt(self, cid: str, version: int, snapshots: list, checkpoint: list | None = None) -> None:
         """Join a new charter version, inheriting predecessors' bindings.
+
+        If the new charter carries a checkpoint, ``checkpoint`` must be its set
+        (SPEC §5.7): each entry becomes a checkpointed record, with no log, and
+        whatever the snapshots say about those sigils is ignored.
 
         Only verifiable evidence is accepted: bindings must carry a valid
         owner authorisation and releases a valid death proof, so a lying
@@ -419,6 +520,7 @@ class Witness:
         sigil's log for every later version.
         """
         self._check_member(cid, version)
+        ck = self._checkpoint_for(self.registry.charter(cid, version), checkpoint)
         records: dict[str, Record] = {}
         evidence: dict[str, list] = {}
         seen: dict[str, set] = {}  # per sigil, the encodings of the entries kept so far
@@ -438,7 +540,23 @@ class Witness:
                         if k not in have:
                             have.add(k)
                             kept.append(e)
+        for sigil, (g, t) in ck.items():
+            # Our own vote for exactly this binding, if our key cast one (a re-used key).
+            prior = self.records.get(sigil)
+            mine = [v for v in (prior.votes if prior else []) if v["gen"] == g and v["tid"] == t]
+            for e in evidence.get(sigil, []):
+                v = e.get("vote") if e.get("kind") == "vote" else None
+                try:
+                    if (not mine and v["witness"] == self.pk and v["sigil"] == sigil and v["constellation"] == cid
+                            and v["gen"] == g and v["tid"] == t and verify_vote(v)):
+                        mine = [v]
+                except (KeyError, TypeError):
+                    pass
+            records[sigil] = Record(gen=g, tid=t, vote=mine[0] if mine else None, votes=mine[:1],
+                                    settled=CHECKPOINTED)
         for sigil, log in evidence.items():
+            if sigil in ck:
+                continue
             binds: dict[tuple, dict] = {}   # (gen, tid) -> header
             dead: set[str] = set()          # tids proven unsealable
             sealed: set[tuple] = set()      # (gen, tid) with a verified seal in the evidence

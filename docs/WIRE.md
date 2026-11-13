@@ -15,8 +15,10 @@ Nothing a witness sends is trusted. Clients verify votes, seals, charters and pr
 | POST | `/v0/status` | `{sigil}` (SPEC §5.3) | `{gen, tid, votes}` |
 | POST | `/v0/sell_stamp` | `{blinded: hex}` | blind signature (hex) |
 | POST | `/v0/heartbeat` | `{challenge}`: a string of 1 to 128 characters (SPEC §5.5) | `{constellation, version, witness, challenge, sig}`; only an active, unfrozen witness answers |
-| POST | `/v0/freeze` (admin) | `{charter}`: the next charter's body (SPEC §5.4) | `{sig, snapshot}` |
-| POST | `/v0/adopt` (admin) | `{constellation, version, snapshots: [snapshot, …]}` (SPEC §5.4) | `{constellation, version}` |
+| POST | `/v0/settle` | `{settlement}`: a settlement certificate `{header, inputs: [{parcel: {home, lock, salt}, seal}]}` (SPEC §3.12, §5.7), at most 512 KiB encoded | `{settled: [sigil, …]}`: the inputs living here that are now settled at the certificate's binding |
+| POST | `/v0/freeze` (admin) | `{charter, checkpoint?}`: the next charter's body (SPEC §5.4) and, if it carries `checkpoint`, its checkpoint set `[[sigil, gen, tid], …]` (§5.7) | `{sig, snapshot}`; the snapshot leaves out the sigils of the checkpoint set |
+| POST | `/v0/adopt` (admin) | `{constellation, version, snapshots: [snapshot, …], checkpoint?}` (SPEC §5.4; `checkpoint` is required when the charter carries one) | `{constellation, version}` |
+| POST | `/v0/settled` (admin) | `{}` | `{settled: [[sigil, gen, tid], …], checkpointed: [[sigil, gen, tid], …]}`, sorted by sigil (SPEC §5.7) |
 
 Every reply is one JSON object:
 
@@ -35,9 +37,10 @@ FREEZE is irreversible, so `/v0/freeze` and `/v0/adopt` are operator calls. They
 
 * `freeze` answers the witness's signature on the charter body and its evidence `{sigil: log ‖ [{kind: "vote", vote}, …]}`. The witness freezes for exactly one successor: asked again for the same body it answers the same, and for any other it answers `rejected`. A frozen witness never votes or releases again, also after a restart.
 * `adopt` runs once, on a witness that has joined no charter version. A retry for the version it adopted answers the same; anything else is `rejected`. The witness must already know the charter `version` (send it by `/v0/gossip` first), and must be a member, else `bad_request`. Malformed parts of a snapshot are skipped, like any other unverifiable evidence.
+* **Checkpoints** (SPEC §5.7). A charter body may carry `checkpoint`: `H("checkpoint", S)` of a checkpoint set `S` (a list of `[sigil, gen, tid]`, sorted by sigil, distinct sigils). `freeze` then needs `S` in the request and answers `rejected` unless every entry matches a record the witness holds settled and every record it holds checkpointed is in `S`; `adopt` needs `S` and answers `rejected` without the exact set. A body without `checkpoint` is hashed as before; `checkpoint` is sent only when the charter has one, so a rotation without settlements reaches older witnesses unchanged.
 * A fresh store joins version 0 directly. A witness for a later version is started with `--adopt` (both daemons): it votes on nothing until ADOPT. A fresh store without `--adopt` refuses to start on a constellation that has rotated.
 
-`RemoteNetwork.rotate(cid, new_urls, admin_token)` drives a rotation like `Network.rotate`: every reachable member freezes for the next charter and signs it; signatures that do not verify are dropped with their evidence; with a quorum, the new chain is gossiped to old and new members, and every new member adopts the union of the signers' evidence. A re-used key whose old process did not sign is left waiting (`RotationIncomplete`), because it must bring its own votes. Operators then add the new chain to their registry files, since gossip state is not persisted.
+`RemoteNetwork.rotate(cid, new_urls, admin_token, compact=True)` drives a rotation like `Network.rotate`: it first asks every member for `/v0/settled` and offers the current checkpoint set plus every entry all answering members hold settled (a member that does not answer, or an older witness without the call, counts as holding nothing settled); every reachable member freezes for the next charter and signs it; signatures that do not verify are dropped with their evidence; with a quorum, the new chain is gossiped to old and new members, and every new member adopts the union of the signers' evidence. A re-used key whose old process did not sign is left waiting (`RotationIncomplete`), because it must bring its own votes. Operators then add the new chain to their registry files, since gossip state is not persisted.
 
 ## Succession
 
@@ -50,8 +53,9 @@ A standby member of a successor committee (SPEC §5.5) is served like a witness 
 | POST | `/v0/mirror` | `{request}`: a SPEND request plus the `version` it is for | mirror ack `{constellation, version, member, sigil, gen, tid, sig}` |
 | POST | `/v0/note_release` | `{sigil, entry}`: a release entry `{kind: "release", gen, tid, header, proof}` for a binding it holds | `true` if new, `false` if held already |
 | POST | `/v0/status` | `{sigil}` | `{bindings: [[gen, tid], …]}`: every binding of the sigil in its mirror log (holders ask before releasing a pledge, SPEC §4 rule 3) |
-| POST | `/v0/standby` (admin) | `{constellation, version, snapshots: [snapshot, …]}`: the handover of a later version | `{constellation, version}` |
-| POST | `/v0/succeed` (admin) | `{charter, sigs?}`: the next charter's body, and the members' signatures on it for a cooperative rotation | `{sig, snapshot}`: its signature and whole mirror log |
+| POST | `/v0/standby` (admin) | `{constellation, version, snapshots: [snapshot, …], checkpoint?}`: the handover of a later version, with its checkpoint set if its charter carries one | `{constellation, version}` |
+| POST | `/v0/succeed` (admin) | `{charter, sigs?, checkpoint?}`: the next charter's body, the members' signatures on it for a cooperative rotation, and its checkpoint set (it must keep every entry of the version's own set, and equal it for a dead-man takeover, SPEC §5.7) | `{sig, snapshot}`: its signature and its mirror log minus the checkpointed sigils |
+| POST | `/v0/settled` (admin) | `{}` | `{settled: [], checkpointed: S}`: the version's checkpoint set |
 | POST | `/v0/probe` (admin) | `{urls?}`: member URLs to challenge now (default: `--members`) | `{answered}`: how many valid heartbeats came back |
 
 * Clients collect acks before they ask witnesses to vote: one ack per standby member for the `(constellation, version, sigil, gen, tid)` of the request, and the acks serve every witness of the version. A witness of a version with a committee refuses to create a vote without acks from a quorum of the committee (`rejected`, nothing stored); it checks at most one ack per member. MIRROR refuses an authorisation over 32 KiB, a new binding at generation 16 or above and a fifth transition of one `(sigil, gen)` (SPEC §5.5).

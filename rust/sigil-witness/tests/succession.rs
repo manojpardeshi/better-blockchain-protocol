@@ -114,12 +114,12 @@ fn standby_survives_restarts() {
     assert_eq!(k.snapshot().get(&sa).and_then(Json::as_arr).map(Vec::len), Some(1));
     assert!(!k.dead(), "it just came back: it has not watched for dead_man seconds yet");
     assert_eq!(
-        k.succeed(&w.next, None).0,
+        k.succeed(&w.next, None, None).0,
         Err(Error::Rejected("the version is alive: no quorum of its members asked, and the dead-man period has not passed".into()))
     );
     now.fetch_add(DEAD as i64, Ordering::SeqCst);
     assert!(k.dead(), "no member answered for dead_man seconds");
-    let signed = ok(k.succeed(&w.next, None), &k.store);
+    let signed = ok(k.succeed(&w.next, None, None), &k.store);
     assert_eq!(signed.get("snapshot"), Some(&k.snapshot()));
     k.store.close();
     drop(k);
@@ -128,12 +128,12 @@ fn standby_survives_restarts() {
     let k = open_standby(&p, "lyrak0", &w, &now);
     assert!(k.fenced());
     assert_eq!(k.mirror_bind(&with_version(&ra, 0)).0, Err(Error::Rejected("fenced: this member signed a successor of the version".into())));
-    assert_eq!(ok(k.succeed(&w.next, None), &k.store), signed, "the same successor: answered again");
+    assert_eq!(ok(k.succeed(&w.next, None, None), &k.store), signed, "the same successor: answered again");
     let mut other = w.next.clone();
     if let Json::Obj(m) = &mut other {
         m.insert("witnesses".into(), Json::Arr(vec![Json::str(key("x").pk)]));
     }
-    assert_eq!(k.succeed(&other, None).0, Err(Error::Rejected("already signed a different successor".into())));
+    assert_eq!(k.succeed(&other, None, None).0, Err(Error::Rejected("already signed a different successor".into())));
     k.store.close();
     drop(k);
 
@@ -194,7 +194,7 @@ fn without_its_own_charter_nothing_is_voted_or_signed() {
     let k = Standby::open(key("cassk0"), w.reg.clone(), &w.cid, Store::memory(), loaded, clock(&now), false).unwrap();
     now.fetch_add(10 * DEAD as i64, Ordering::SeqCst);
     assert!(!k.dead());
-    assert_eq!(k.succeed(&w.next, None).0, Err(Error::Rejected("own charter version unknown".into())));
+    assert_eq!(k.succeed(&w.next, None, None).0, Err(Error::Rejected("own charter version unknown".into())));
 }
 
 async fn http(addr: std::net::SocketAddr, method: &str, path: &str, auth: Option<&str>, body: &str) -> (u16, Json) {

@@ -56,6 +56,8 @@ pub struct Loaded {
     pub fenced: Option<Json>,
     /// A standby member's mirror logs, keyed `"<version>|<sigil>"`.
     pub mirror: HashMap<String, Json>,
+    /// A standby member's checkpoint sets (SPEC §5.7), keyed by version.
+    pub checkpoint: HashMap<String, Json>,
 }
 
 struct Progress {
@@ -280,6 +282,9 @@ fn load(db: &Database) -> Result<Loaded, String> {
             "fenced" => out.fenced = Some(value),
             "mirror" => {
                 out.mirror.insert(key.to_string(), value);
+            }
+            "checkpoint" => {
+                out.checkpoint.insert(key.to_string(), value);
             }
             _ => return Err(format!("unknown store entry kind {kind:?}")),
         }

@@ -68,12 +68,17 @@ class Dossier:
         p["asset"] = resolve_asset(p["asset"], r["tx"])
         return p
 
-    def ancestry(self, tids) -> "Dossier":
-        """The minimal sub-dossier needed to verify outputs of ``tids``."""
+    def ancestry(self, tids, have=None) -> "Dossier":
+        """The minimal sub-dossier needed to verify outputs of ``tids``.
+
+        ``have``: transitions the recipient already holds (SPEC §6.1, delta dossiers);
+        they and their ancestry are left out, unless named in ``tids`` themselves.
+        """
+        have = set(have or ()) - set(tids)
         out, stack = Dossier(), list(tids)
         while stack:
             tid = stack.pop()
-            if tid in out.transitions:
+            if tid in out.transitions or tid in have:
                 continue
             tx = self.transitions[tid]
             out.transitions[tid] = tx

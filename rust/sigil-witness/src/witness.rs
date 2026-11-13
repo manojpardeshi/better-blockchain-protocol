@@ -18,14 +18,14 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, RwLock};
 
-use crate::charter::{charter_hash, quorum, short, Registry, MAX_CHARTER_BYTES};
+use crate::charter::{charter_hash, checkpoint_hash, quorum, short, valid_checkpoint_set, Charter, Registry, MAX_CHARTER_BYTES};
 use crate::succession::well_formed_body;
 use crate::crypto::KeyPair;
 use crate::gossip::{check_message, CowRegistry, GossipStore};
 use crate::json::{obj, Json};
 use crate::locks::evaluate;
 use crate::model::{heartbeat_payload, sigil_of, transition_id, vote_payload};
-use crate::proofs::{acked_by, proves_dead, verify_seal, verify_vote};
+use crate::proofs::{acked_by, parse_settlement, proves_dead, verify_seal, verify_vote};
 use crate::stamps::StampKey;
 use crate::store::{Entry, Loaded, Store};
 
@@ -40,6 +40,13 @@ pub const MAX_PROOF_BYTES: usize = 128 << 10;
 /// A sigil is newly bound only below this generation, so at most this many times
 /// (`witness.MAX_GEN`).
 pub const MAX_GEN: i128 = 16;
+/// `enc(settlement)` of a SETTLE (`witness.MAX_SETTLE_BYTES`, SPEC §5.7).
+pub const MAX_SETTLE_BYTES: usize = 512 << 10;
+
+/// `Record.settled` (SPEC §5, §5.7): a certificate showed the binding complete.
+pub const SETTLED: i128 = 1;
+/// `Record.settled`: the sigil is in our charter's checkpoint set (the record has no log).
+pub const CHECKPOINTED: i128 = 2;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Error {
@@ -69,6 +76,8 @@ pub struct Record {
     pub votes: Vec<Json>,
     pub abstain: bool,
     pub candidates: Vec<Candidate>,
+    /// 0, [`SETTLED`] or [`CHECKPOINTED`]: a settled record never votes or releases again.
+    pub settled: i128,
 }
 
 impl Record {
@@ -87,11 +96,13 @@ impl Record {
                     self.candidates.iter().map(|(g, t, h)| Json::Arr(vec![Json::Int(*g), Json::str(t), h.clone()])).collect(),
                 ),
             ),
+            ("settled", Json::Int(self.settled)),
         ])
     }
 
     /// The inverse of [`Record::to_json`]. `candidates` may be missing (stores written before
-    /// rotation was ported): it is then empty.
+    /// rotation was ported): it is then empty. `settled` may be missing (stores written before
+    /// compaction): it is then 0.
     pub fn from_json(v: &Json) -> Option<Record> {
         let opt = |k: &str| v.get(k).filter(|x| !x.is_null()).cloned();
         let mut candidates = Vec::new();
@@ -114,6 +125,10 @@ impl Record {
             votes: v.get("votes")?.as_arr()?.clone(),
             abstain: v.get("abstain")? == &Json::Bool(true),
             candidates,
+            settled: match v.get("settled") {
+                None => 0,
+                Some(x) => x.as_int()?,
+            },
         })
     }
 }
@@ -455,6 +470,18 @@ impl Witness {
                 }
             }
         }
+        if let Some(r) = st.records.get(sigil).filter(|r| r.settled != 0) {
+            // Its transition is complete (SPEC §5.7): never a new vote, only the one we hold.
+            if r.gen == gen && r.tid.as_deref() == Some(tid.as_str()) {
+                if let Some(v) = &r.vote {
+                    return Ok(v.clone());
+                }
+            }
+            if r.tid.as_deref() != Some(tid.as_str()) {
+                return Err(Error::Conflict(r.vote.clone()));
+            }
+            return rejected("sigil consumed: its transition is complete");
+        }
         let mut rec = st.records.get(sigil).cloned().unwrap_or_default();
         if gen < rec.gen {
             return rejected("stale generation");
@@ -523,6 +550,9 @@ impl Witness {
             }
             let Some(s) = sigil.as_str() else { return rejected("nothing to release") };
             match st.records.get(s) {
+                Some(r) if r.tid.is_some() && r.settled != 0 => {
+                    return rejected("sigil consumed: its transition is complete")
+                }
                 Some(r) if r.tid.is_some() => r.clone(),
                 _ => return rejected("nothing to release"),
             }
@@ -559,7 +589,9 @@ impl Witness {
             return rejected("witness not active");
         }
         let mut rec = match st.records.get(sigil) {
-            Some(r) if r.gen == snapshot.gen && r.tid == snapshot.tid && r.candidates == snapshot.candidates => r.clone(),
+            Some(r) if r.gen == snapshot.gen && r.tid == snapshot.tid && r.candidates == snapshot.candidates && r.settled == 0 => {
+                r.clone()
+            }
             _ => return rejected("record changed; retry"),
         };
         if contested {
@@ -607,6 +639,88 @@ impl Witness {
         self.persist(sigil, &rec);
         st.records.insert(sigil.to_string(), rec);
         Ok(Json::Int(gen))
+    }
+
+    /// SETTLE (SPEC §5.7): `cert` shows a transition complete; settle every input that lives
+    /// here. From then on we never vote on those sigils again (except to hand back a vote we
+    /// already hold for exactly that binding) and never release them: abstention, safe whatever
+    /// the certificate says. It is checked so that we never settle a sigil whose transition could
+    /// still die. Logs are kept for the next handover until a checkpoint covers the sigil.
+    pub fn settle(&self, cert: &Json) -> Outcome {
+        let r = self.settle_inner(cert);
+        (r, self.store.last_submitted())
+    }
+
+    fn settle_inner(&self, cert: &Json) -> Result<Json, Error> {
+        let Some((cid, _)) = self.state.lock().expect("state lock").active() else {
+            return rejected("witness not active");
+        };
+        if cert.canonical().len() > MAX_SETTLE_BYTES {
+            return rejected("settlement too large");
+        }
+        let Some((tid, inputs)) = parse_settlement(cert) else { return rejected("invalid settlement certificate") };
+        let mine: Vec<(String, i128)> = inputs.iter().filter(|i| i.2 == cid).map(|i| (i.0.clone(), i.1)).collect();
+        if mine.is_empty() {
+            return rejected("no input of this transition lives here");
+        }
+        let registry = self.registry();
+        if !inputs.iter().all(|(_, _, _, seal)| verify_seal(seal, &registry, &HashSet::new(), self.batch_verify)) {
+            return rejected("invalid settlement certificate");
+        }
+        let header = cert.get("header").cloned();
+        let mut st = self.state.lock().expect("state lock");
+        if st.active().map(|(c, _)| c).as_deref() != Some(cid.as_str()) {
+            return rejected("witness not active");
+        }
+        let mut changed: Vec<(String, Record)> = Vec::new();
+        for (s, g) in &mine {
+            let mut rec = st.records.get(s).cloned().unwrap_or_default();
+            if rec.settled != 0 || changed.iter().any(|(c, _)| c == s) {
+                continue; // settled already (at another binding only with > f faults: keep the first)
+            }
+            rec.gen = *g;
+            rec.tid = Some(tid.clone());
+            rec.header = header.clone();
+            rec.candidates.clear();
+            rec.abstain = false;
+            rec.vote = rec.votes.iter().find(|v| vote_key(v) == Some((*g, tid.clone()))).cloned();
+            rec.settled = SETTLED;
+            changed.push((s.clone(), rec));
+        }
+        if !changed.is_empty() {
+            self.store.submit(changed.iter().map(|(s, r)| ("record".to_string(), s.clone(), r.to_json())).collect());
+            for (s, r) in changed {
+                st.records.insert(s, r);
+            }
+        }
+        let mut out: Vec<String> = mine
+            .iter()
+            .filter(|(s, g)| {
+                st.records.get(s).is_some_and(|r| r.settled != 0 && r.gen == *g && r.tid.as_deref() == Some(tid.as_str()))
+            })
+            .map(|(s, _)| s.clone())
+            .collect();
+        out.sort();
+        Ok(obj([("settled", Json::Arr(out.into_iter().map(Json::Str).collect()))]))
+    }
+
+    /// SETTLED (SPEC §5.7, an operator call): `{settled, checkpointed}`, our settled and
+    /// checkpointed records as `[sigil, gen, tid]`, sorted.
+    pub fn settled_records(&self) -> Json {
+        let st = self.state.lock().expect("state lock");
+        let mut keys: Vec<&String> = st.records.iter().filter(|(_, r)| r.settled != 0).map(|(s, _)| s).collect();
+        keys.sort();
+        let (mut settled, mut checkpointed) = (Vec::new(), Vec::new());
+        for s in keys {
+            let r = &st.records[s];
+            let e = Json::Arr(vec![Json::str(s), Json::Int(r.gen), r.tid.clone().into()]);
+            if r.settled == SETTLED {
+                settled.push(e);
+            } else {
+                checkpointed.push(e);
+            }
+        }
+        obj([("settled", Json::Arr(settled)), ("checkpointed", Json::Arr(checkpointed))])
     }
 
     /// STATUS (SPEC §5.3): `{gen, tid, votes}`.
@@ -667,16 +781,34 @@ impl Witness {
 
     // ------------------------------------------------------------------ rotation (§5.4)
 
+    /// [`Witness::freeze_with`] for a charter without a checkpoint.
+    pub fn freeze(&self, next_charter: &Json) -> Outcome {
+        self.freeze_with(next_charter, None)
+    }
+
+    /// [`Witness::adopt_with`] for a charter without a checkpoint.
+    pub fn adopt(&self, cid: &Json, version: &Json, snapshots: &[Json]) -> Outcome {
+        self.adopt_with(cid, version, snapshots, None)
+    }
+
+    /// [`Witness::adopt_once_with`] for a charter without a checkpoint.
+    pub fn adopt_once(&self, cid: &Json, version: &Json, snapshots: &[Json]) -> Outcome {
+        self.adopt_once_with(cid, version, snapshots, None)
+    }
+
     /// FREEZE: stop voting forever and hand over evidence for `next_charter`, the body of the
     /// next charter version. Returns `{sig, snapshot}`: our signature on it and our evidence
     /// `{sigil: log ‖ [{kind: "vote", vote} for every vote we cast on sigil]}`. We freeze for
     /// exactly one successor: the same one is signed again, any other is refused.
-    pub fn freeze(&self, next_charter: &Json) -> Outcome {
-        let r = self.freeze_inner(next_charter);
+    /// With a checkpoint in `next_charter`, `checkpoint` is its set: we freeze only if every
+    /// entry matches a record we hold settled and every record we hold checkpointed is in it
+    /// (SPEC §5.7), and the snapshot omits those sigils.
+    pub fn freeze_with(&self, next_charter: &Json, checkpoint: Option<&Json>) -> Outcome {
+        let r = self.freeze_inner(next_charter, checkpoint);
         (r, self.store.last_submitted())
     }
 
-    fn freeze_inner(&self, next_charter: &Json) -> Result<Json, Error> {
+    fn freeze_inner(&self, next_charter: &Json, checkpoint: Option<&Json>) -> Result<Json, Error> {
         let mut st = self.state.lock().expect("state lock");
         let Some((cid, version)) = st.member.clone() else { return rejected("witness not active") };
         let Some(prev) = next_charter.as_obj().and_then(|m| m.get("prev")) else {
@@ -698,6 +830,17 @@ impl Witness {
         if !well_formed {
             return rejected("not a valid next version of our charter");
         }
+        let ck = checkpoint_for(next_charter.get("checkpoint"), checkpoint)?;
+        for (s, (g, t)) in &ck {
+            match st.records.get(s) {
+                Some(r) if r.settled != 0 && r.gen == *g && r.tid.as_deref() == Some(t.as_str()) => {}
+                _ => return rejected("checkpoint names a binding this witness does not hold settled"),
+            }
+        }
+        if st.records.iter().any(|(s, r)| r.settled == CHECKPOINTED && !ck.contains_key(s)) {
+            // The extension rule: a checkpointed record has no log to hand over.
+            return rejected("checkpoint drops a sigil of our own checkpoint");
+        }
         // Signing two successors lets a quorum of honest witnesses certify two conflicting
         // version v+1 charters (a fork).
         let h = charter_hash(next_charter);
@@ -714,6 +857,7 @@ impl Witness {
         let snapshot = Json::Obj(
             st.records
                 .iter()
+                .filter(|(s, _)| !ck.contains_key(*s))
                 .map(|(s, r)| {
                     let mut log = r.log.clone();
                     log.extend(r.votes.iter().map(|v| obj([("kind", "vote".into()), ("vote", v.clone())])));
@@ -731,16 +875,18 @@ impl Witness {
     /// owner authorisation and a release a valid death proof, so a lying predecessor can omit
     /// evidence (covered by the union) but never invent it. Malformed parts (a snapshot that is
     /// not an object, a log that is not a list, an entry that is not an object) are skipped.
-    pub fn adopt(&self, cid: &Json, version: &Json, snapshots: &[Json]) -> Outcome {
+    /// With a checkpoint in the new charter, `checkpoint` must be its set (SPEC §5.7): each entry
+    /// becomes a checkpointed record, with no log, whatever the snapshots say about it.
+    pub fn adopt_with(&self, cid: &Json, version: &Json, snapshots: &[Json], checkpoint: Option<&Json>) -> Outcome {
         let mut st = self.state.lock().expect("state lock");
-        let r = self.adopt_locked(&mut st, cid, version, snapshots);
+        let r = self.adopt_locked(&mut st, cid, version, snapshots, checkpoint);
         drop(st);
         (r, self.store.last_submitted())
     }
 
     /// `/v0/adopt`: ADOPT once, on a witness that has not joined any charter version. A retry
     /// for the version already adopted answers the same; anything else is refused.
-    pub fn adopt_once(&self, cid: &Json, version: &Json, snapshots: &[Json]) -> Outcome {
+    pub fn adopt_once_with(&self, cid: &Json, version: &Json, snapshots: &[Json], checkpoint: Option<&Json>) -> Outcome {
         let mut st = self.state.lock().expect("state lock");
         let r = match &st.member {
             Some((c, v)) => {
@@ -750,20 +896,28 @@ impl Witness {
                     rejected("already a member of a charter version: ADOPT runs once, on a fresh witness")
                 }
             }
-            None => self.adopt_locked(&mut st, cid, version, snapshots),
+            None => self.adopt_locked(&mut st, cid, version, snapshots, checkpoint),
         };
         drop(st);
         (r, self.store.last_submitted())
     }
 
-    fn adopt_locked(&self, st: &mut State, cid: &Json, version: &Json, snapshots: &[Json]) -> Result<Json, Error> {
+    fn adopt_locked(
+        &self,
+        st: &mut State,
+        cid: &Json,
+        version: &Json,
+        snapshots: &[Json],
+        checkpoint: Option<&Json>,
+    ) -> Result<Json, Error> {
         let registry = self.registry();
         let not_member = || Error::BadRequest("not a member of this charter".into());
         let (Some(cid), Some(version)) = (cid.as_str(), version.as_int()) else { return Err(not_member()) };
-        match registry.charter(cid, version) {
-            Some(c) if c.is_member(&self.pk) => {}
+        let charter: &Charter = match registry.charter(cid, version) {
+            Some(c) if c.is_member(&self.pk) => c,
             _ => return Err(not_member()),
-        }
+        };
+        let ck = checkpoint_for(charter.body.get("checkpoint"), checkpoint)?;
         let batch = self.batch_verify;
         // Per sigil, the entries kept and the encodings seen. The evidence is a set: honest
         // predecessors hand over the same entries, and without dropping repeats each rotation
@@ -782,8 +936,37 @@ impl Witness {
                 }
             }
         }
-        let mut records: Vec<(String, Record)> = Vec::with_capacity(evidence.items.len());
+        let mut records: Vec<(String, Record)> = Vec::with_capacity(evidence.items.len() + ck.len());
+        let mut ck_sorted: Vec<(&String, &(i128, String))> = ck.iter().collect();
+        ck_sorted.sort();
+        for (sigil, (g, t)) in ck_sorted {
+            // Our own vote for exactly this binding, if our key cast one (a re-used key).
+            let want = Some((*g, t.clone()));
+            let mut mine: Option<Json> = st.records.get(sigil).and_then(|p| p.votes.iter().find(|v| vote_key(v) == want).cloned());
+            if mine.is_none() {
+                if let Some(i) = evidence.keys.get(sigil) {
+                    mine = evidence.items[*i].1 .0.iter().find_map(|e| {
+                        let v = e.get("vote").filter(|_| e.get("kind").and_then(Json::as_str) == Some("vote"))?;
+                        let is = |k: &str, w: &str| v.get(k).and_then(Json::as_str) == Some(w);
+                        (is("witness", &self.pk) && is("sigil", sigil) && is("constellation", cid) && vote_key(v) == want && verify_vote(v))
+                            .then(|| v.clone())
+                    });
+                }
+            }
+            let rec = Record {
+                gen: *g,
+                tid: Some(t.clone()),
+                vote: mine.clone(),
+                votes: mine.into_iter().collect(),
+                settled: CHECKPOINTED,
+                ..Default::default()
+            };
+            records.push((sigil.clone(), rec));
+        }
         for (sigil, (log, _)) in evidence.items {
+            if ck.contains_key(&sigil) {
+                continue;
+            }
             let sigil_j = Json::str(&sigil);
             let mut binds: OrderedMap<(i128, String), Json> = OrderedMap::new(); // (gen, tid) -> header
             let mut dead: HashSet<String> = HashSet::new(); // tids proven unsealable
@@ -1002,4 +1185,29 @@ fn release_entry(gen: i128, tid: &str, header: Json, proof: &Json) -> Json {
 /// `(v["gen"], v["tid"])` of one of our votes.
 fn vote_key(v: &Json) -> Option<(i128, String)> {
     Some((v.get("gen")?.as_int()?, v.get("tid")?.as_str()?.to_string()))
+}
+
+/// The checkpoint set `entries` of a charter whose body's `checkpoint` is `body_ck`, as
+/// `{sigil: (gen, tid)}` (`Witness._checkpoint_for`). A body without one has the empty set.
+pub(crate) fn checkpoint_for(body_ck: Option<&Json>, entries: Option<&Json>) -> Result<HashMap<String, (i128, String)>, Error> {
+    let entries = entries.filter(|e| !e.is_null());
+    let Some(ck) = body_ck else {
+        return match entries {
+            None => Ok(HashMap::new()),
+            Some(Json::Arr(a)) if a.is_empty() => Ok(HashMap::new()),
+            Some(_) => rejected("this charter carries no checkpoint"),
+        };
+    };
+    match entries {
+        Some(e) if valid_checkpoint_set(e) && ck.as_str() == Some(checkpoint_hash(e).as_str()) => Ok(e
+            .as_arr()
+            .expect("checked")
+            .iter()
+            .map(|x| {
+                let a = x.as_arr().expect("checked");
+                (a[0].as_str().expect("checked").to_string(), (a[1].as_int().expect("checked"), a[2].as_str().expect("checked").to_string()))
+            })
+            .collect()),
+        _ => rejected("checkpoint set does not match the charter"),
+    }
 }

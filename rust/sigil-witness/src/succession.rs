@@ -28,6 +28,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, RwLock};
 
 use crate::charter::{charter_hash, quorum, short, Registry, Successor, MAX_CHARTER_BYTES, MAX_WITNESSES};
+use crate::witness::checkpoint_for;
 use crate::crypto::{verify, KeyPair};
 use crate::gossip::{check_message, CowRegistry, GossipStore};
 use crate::json::{obj, Json};
@@ -66,6 +67,8 @@ struct State {
     heard: HashMap<String, i128>,
     /// The start of our observation window.
     since: i128,
+    /// Our version's checkpoint set (SPEC §5.7), as given at STANDBY.
+    checkpoint: Json,
 }
 
 impl State {
@@ -136,7 +139,10 @@ pub(crate) fn well_formed_body(b: &Json) -> bool {
         return false;
     }
     for (k, v) in m {
-        if !KEYS.contains(&k.as_str()) && (k != "successor" || Successor::parse(v).is_err()) {
+        let ok = KEYS.contains(&k.as_str())
+            || (k == "successor" && Successor::parse(v).is_ok())
+            || (k == "checkpoint" && crate::charter::is_hash(v));
+        if !ok {
             return false;
         }
     }
@@ -195,6 +201,7 @@ impl Standby {
             fenced_for: None,
             heard: HashMap::new(),
             since: now,
+            checkpoint: Json::Arr(vec![]),
         };
         if let Some(sb) = &loaded.standby {
             let c = sb.get("constellation").and_then(Json::as_str).ok_or("corrupt standby entry")?;
@@ -217,6 +224,9 @@ impl Standby {
                 if f.get("constellation").and_then(Json::as_str) == Some(c) && f.get("version").and_then(Json::as_int) == Some(v) {
                     st.fenced_for = f.get("charter").and_then(Json::as_str).map(str::to_string);
                 }
+            }
+            if let Some(ck) = loaded.checkpoint.get(&v.to_string()) {
+                st.checkpoint = ck.clone();
             }
             st.member = Some((c.to_string(), v));
         }
@@ -241,7 +251,7 @@ impl Standby {
             if chain.len() > 1 {
                 return Err(format!("{} has rotated past version 0: start with --wait for /v0/standby", short(cid)));
             }
-            let (r, seq) = s.enter(&Json::str(cid), &Json::Int(0), &[]);
+            let (r, seq) = s.enter(&Json::str(cid), &Json::Int(0), &[], None);
             r.map_err(|e| format!("{e:?}"))?;
             s.store.wait(seq);
         }
@@ -270,19 +280,21 @@ impl Standby {
     /// the freezing members' and previous committee's snapshots for a rotation, the signing
     /// standby members' for a succession, none for version 0. A member only moves forward, and
     /// acts for one version at a time; a retry for the version it stands by for changes nothing.
-    pub fn enter(&self, cid: &Json, version: &Json, snapshots: &[Json]) -> Outcome {
-        let r = self.enter_inner(cid, version, snapshots);
+    /// With a checkpoint in the version's charter, `checkpoint` must be its set (SPEC §5.7); it
+    /// is kept for the extension rule and handed on with nothing else.
+    pub fn enter(&self, cid: &Json, version: &Json, snapshots: &[Json], checkpoint: Option<&Json>) -> Outcome {
+        let r = self.enter_inner(cid, version, snapshots, checkpoint);
         (r, self.store.last_submitted())
     }
 
-    fn enter_inner(&self, cid: &Json, version: &Json, snapshots: &[Json]) -> Result<Json, Error> {
+    fn enter_inner(&self, cid: &Json, version: &Json, snapshots: &[Json], checkpoint: Option<&Json>) -> Result<Json, Error> {
         let Json::Int(version) = *version else { return bad("version must be an integer") };
         let Some(cid) = cid.as_str() else { return bad("not a member of this version's successor committee") };
         let registry = self.registry();
-        let in_committee = registry.charter(cid, version).and_then(|c| c.successor.as_ref()).is_some_and(|k| k.is_member(&self.pk));
-        if !in_committee {
-            return bad("not a member of this version's successor committee");
-        }
+        let body = registry.charter(cid, version).filter(|c| c.successor.as_ref().is_some_and(|k| k.is_member(&self.pk)));
+        let Some(body) = body else { return bad("not a member of this version's successor committee") };
+        let ck = checkpoint_for(body.body.get("checkpoint"), checkpoint)?;
+        let ck_json = if ck.is_empty() { Json::Arr(vec![]) } else { checkpoint.cloned().expect("non-empty") };
         let answer = obj([("constellation", Json::str(cid)), ("version", Json::Int(version))]);
         let mut st = self.state.lock().expect("state lock");
         if let Some((c, v)) = &st.member {
@@ -303,6 +315,9 @@ impl Standby {
             String::new(),
             obj([("constellation", Json::str(cid)), ("version", Json::Int(version)), ("since", Json::Int(since))]),
         ));
+        if !ck.is_empty() {
+            entries.push(("checkpoint".into(), version.to_string(), ck_json.clone()));
+        }
         entries.extend(mirror.iter().map(|(s, log)| ("mirror".to_string(), format!("{version}|{s}"), Json::Arr(log.clone()))));
         self.store.submit(entries);
         let binds = bindings(&mirror, self.batch_verify);
@@ -311,6 +326,7 @@ impl Standby {
         st.mirror = mirror;
         st.fenced_for = None;
         st.heard.clear();
+        st.checkpoint = ck_json;
         st.set_mirrored(binds);
         Ok(answer)
     }
@@ -478,12 +494,14 @@ impl Standby {
     /// well-formed successor of the version we stand by for, at most one, and only cooperatively
     /// (`sigs` holds a quorum of the version's members' signatures on it) or once the dead-man
     /// condition holds. Asked again for the same successor, answers the same.
-    pub fn succeed(&self, next: &Json, sigs: Option<&Json>) -> Outcome {
-        let r = self.succeed_inner(next, sigs);
+    /// With a checkpoint in `next`, `checkpoint` is its set: it must keep every entry of our
+    /// version's set (the extension rule, SPEC §5.7), and equal it for a dead-man takeover.
+    pub fn succeed(&self, next: &Json, sigs: Option<&Json>, checkpoint: Option<&Json>) -> Outcome {
+        let r = self.succeed_inner(next, sigs, checkpoint);
         (r, self.store.last_submitted())
     }
 
-    fn succeed_inner(&self, next: &Json, sigs: Option<&Json>) -> Result<Json, Error> {
+    fn succeed_inner(&self, next: &Json, sigs: Option<&Json>, checkpoint: Option<&Json>) -> Result<Json, Error> {
         let mut st = self.state.lock().expect("state lock");
         let Some((cid, version)) = st.member.clone() else { return rejected("not standing by") };
         let registry = self.registry();
@@ -499,6 +517,12 @@ impl Standby {
             || !matches!(next.get("version"), Some(Json::Int(v)) if *v == version + 1)
         {
             return rejected("charter does not extend the version we stand by for");
+        }
+        let nxt = checkpoint_for(next.get("checkpoint"), checkpoint)?;
+        let mine = checkpoint_for(cur.body.get("checkpoint"), Some(&st.checkpoint)).unwrap_or_default();
+        if mine.iter().any(|(s, e)| nxt.get(s) != Some(e)) {
+            // The extension rule (SPEC §5.7): a sigil of our checkpoint has no log here.
+            return rejected("checkpoint drops a sigil of our version's checkpoint");
         }
         let h = charter_hash(next);
         match &st.fenced_for {
@@ -517,6 +541,10 @@ impl Standby {
                 if !cooperative && !self.dead_locked(&st) {
                     return rejected("the version is alive: no quorum of its members asked, and the dead-man period has not passed");
                 }
+                if !cooperative && nxt.len() != mine.len() {
+                    // Alone, the committee cannot check settlements: only the version's checkpoint.
+                    return rejected("a dead-man successor carries exactly the version's checkpoint");
+                }
                 self.store.submit(vec![(
                     "fenced".into(),
                     String::new(),
@@ -525,7 +553,9 @@ impl Standby {
                 st.fenced_for = Some(h);
             }
         }
-        let snapshot = Self::snapshot_locked(&st);
+        let snapshot = Json::Obj(
+            st.mirror.iter().filter(|(s, _)| !nxt.contains_key(*s)).map(|(s, log)| (s.clone(), Json::Arr(log.clone()))).collect(),
+        );
         drop(st);
         Ok(obj([("sig", Json::str(self.kp.sign("charter", next))), ("snapshot", snapshot)]))
     }
@@ -589,6 +619,12 @@ impl Standby {
         )]);
         let seq = self.store.last_submitted();
         (Ok(out), seq)
+    }
+
+    /// SETTLED (SPEC §5.7): a standby member only knows its version's checkpoint.
+    pub fn settled_records(&self) -> Json {
+        let st = self.state.lock().expect("state lock");
+        obj([("settled", Json::Arr(vec![])), ("checkpointed", st.checkpoint.clone())])
     }
 
     /// `/v0/info`, as the reference's `StandbyServer.info`.

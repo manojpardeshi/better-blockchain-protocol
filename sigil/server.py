@@ -24,17 +24,18 @@ import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from .charter import Registry, charter_body, charter_hash, quorum, successor_clause
+from .charter import Registry, charter_body, charter_hash, checkpoint_hash, quorum, successor_clause
 from .crypto import verify
 from .gossip import GossipStore
 from .ratelimit import (DEFAULT_BURST, DEFAULT_RATE, IDLE_TIMEOUT, MAX_CLIENT_CONNECTIONS, MAX_CONNECTIONS,
                         ConnectionLimiter, RateLimiter, client_key, is_loopback)
+from .network import plan_checkpoint, settled_answers
 from .witness import Conflict, Rejected, Witness
 
 MAX_BODY = 1 << 20
 MAX_ADMIN_BODY = 256 << 20  # ADOPT carries every predecessor's evidence; read only once authorised
 MAX_RESPONSE = 16 << 20   # largest gossip snapshot a client reads from one witness
-ADMIN_METHODS = ("freeze", "adopt")
+ADMIN_METHODS = ("freeze", "adopt", "settled")
 
 
 # ------------------------------------------------------------------ server
@@ -207,6 +208,8 @@ class WitnessServer:
                 return w.release(body["sigil"], body["proof"])
             if method == "status":
                 return w.status(body["sigil"])
+            if method == "settle":
+                return w.settle(body["settlement"])
             if method == "heartbeat":
                 return w.heartbeat(body["challenge"])
             if method == "sell_stamp":
@@ -219,8 +222,10 @@ class WitnessServer:
         """Rotation calls (the caller holds the lock and has checked the admin token)."""
         w = self.witness
         if method == "freeze":
-            sig, snapshot = w.freeze(body["charter"])
+            sig, snapshot = w.freeze(body["charter"], body.get("checkpoint"))
             return {"sig": sig, "snapshot": snapshot}
+        if method == "settled":
+            return w.settled_records()
         # adopt: once, on a witness that has not joined any charter version.
         cid, version, snapshots = body["constellation"], body["version"], body["snapshots"]
         if not isinstance(snapshots, list):
@@ -229,7 +234,7 @@ class WitnessServer:
             if (w.cid, w.version) == (cid, version):
                 return {"constellation": w.cid, "version": w.version}  # a retried ADOPT
             raise Rejected("already a member of a charter version: ADOPT runs once, on a fresh witness")
-        w.adopt(cid, version, snapshots)
+        w.adopt(cid, version, snapshots, body.get("checkpoint"))
         return {"constellation": w.cid, "version": w.version}
 
     def start(self) -> "WitnessServer":
@@ -245,7 +250,7 @@ class WitnessServer:
         self.httpd.server_close()
 
 
-STANDBY_ADMIN_METHODS = ("standby", "succeed", "probe")
+STANDBY_ADMIN_METHODS = ("standby", "succeed", "probe", "settled")
 
 
 class StandbyServer(WitnessServer):
@@ -307,11 +312,13 @@ class StandbyServer(WitnessServer):
             if method == "standby":
                 if not isinstance(body["snapshots"], list):
                     raise ValueError("snapshots must be a list")
-                s.enter(body["constellation"], body["version"], body["snapshots"])
+                s.enter(body["constellation"], body["version"], body["snapshots"], body.get("checkpoint"))
                 return {"constellation": s.cid, "version": s.version}
             if method == "succeed":
-                sig, snapshot = s.succeed(body["charter"], body.get("sigs"))
+                sig, snapshot = s.succeed(body["charter"], body.get("sigs"), body.get("checkpoint"))
                 return {"sig": sig, "snapshot": snapshot}
+            if method == "settled":
+                return s.settled_records()
         raise ValueError(f"unknown method {method!r}")
 
     def start(self) -> "StandbyServer":
@@ -447,13 +454,32 @@ class RemoteWitness:
 
     # Rotation (SPEC §5.4): operator calls, authorised by ``admin_token``.
 
-    def freeze(self, next_charter: dict) -> tuple[str, dict]:
-        out = self._call("freeze", {"charter": next_charter})
+    def freeze(self, next_charter: dict, checkpoint: list | None = None) -> tuple[str, dict]:
+        body = {"charter": next_charter}
+        if checkpoint:
+            body["checkpoint"] = checkpoint
+        out = self._call("freeze", body)
         return out["sig"], out["snapshot"]
 
-    def adopt(self, cid: str, version: int, snapshots: list) -> None:
-        out = self._call("adopt", {"constellation": cid, "version": version, "snapshots": snapshots})
+    def adopt(self, cid: str, version: int, snapshots: list, checkpoint: list | None = None) -> None:
+        body = {"constellation": cid, "version": version, "snapshots": snapshots}
+        if checkpoint:
+            body["checkpoint"] = checkpoint
+        out = self._call("adopt", body)
         self.cid, self.version = out["constellation"], out["version"]
+
+    def settled_records(self) -> dict:
+        """SETTLED (SPEC §5.7, operator call): ``{settled, checkpointed}`` lists of ``[sigil, gen, tid]``."""
+        out = self._call("settled", {})
+        if not (isinstance(out, dict) and isinstance(out.get("settled"), list)
+                and isinstance(out.get("checkpointed"), list)):
+            raise Unreachable(f"{self.url}: malformed SETTLED reply")
+        return out
+
+    # Settlement (SPEC §5.7): anyone may present a certificate.
+
+    def settle(self, cert: dict) -> dict:
+        return self._call("settle", {"settlement": cert})
 
     # Gossip (docs/WIRE.md "Gossip"). Nothing pulled is trusted: the caller
     # admits it through a ``GossipStore``, which verifies every item.
@@ -510,12 +536,19 @@ class RemoteStandby(RemoteWitness):
 
     # Operator calls, authorised by ``admin_token``.
 
-    def enter(self, cid: str, version: int, snapshots: list) -> None:
-        out = self._call("standby", {"constellation": cid, "version": version, "snapshots": snapshots})
+    def enter(self, cid: str, version: int, snapshots: list, checkpoint: list | None = None) -> None:
+        body = {"constellation": cid, "version": version, "snapshots": snapshots}
+        if checkpoint:
+            body["checkpoint"] = checkpoint
+        out = self._call("standby", body)
         self.cid, self.version = out["constellation"], out["version"]
 
-    def succeed(self, next_charter: dict, sigs: dict | None = None) -> tuple[str, dict]:
-        out = self._call("succeed", {"charter": next_charter, "sigs": sigs or {}})
+    def succeed(self, next_charter: dict, sigs: dict | None = None,
+                checkpoint: list | None = None) -> tuple[str, dict]:
+        body = {"charter": next_charter, "sigs": sigs or {}}
+        if checkpoint:
+            body["checkpoint"] = checkpoint
+        out = self._call("succeed", body)
         return out["sig"], out["snapshot"]
 
     def probe(self, urls: list) -> int:
@@ -600,7 +633,7 @@ class RemoteNetwork:
         return [w for w in self.all_witnesses(cid) if w.pk not in self.down]
 
     def rotate(self, cid: str, new_urls: list, admin_token, *, committee_urls: list | None = None,
-               dead_man: int | None = None) -> int:
+               dead_man: int | None = None, compact: bool = True) -> int:
         """Rotate ``cid`` to the witnesses serving at ``new_urls``; returns the new version.
 
         As ``Network.rotate``: every reachable current member freezes for the
@@ -615,6 +648,11 @@ class RemoteNetwork:
         with ``witnessd standby --wait``) and ``dead_man`` give the new version a
         committee, which enters standby with the same evidence.
 
+        With ``compact`` (SPEC §5.7) the new charter checkpoints every sigil that all
+        answering members hold settled (SETTLED), plus the current checkpoint; the
+        members omit those sigils from their snapshots and the new members adopt
+        them from the checkpoint set alone.
+
         Nothing a witness answers is trusted: a charter signature that does not
         verify is dropped together with its evidence. Raises ``RuntimeError`` if
         fewer than a quorum signed (the members that did sign stay frozen, as
@@ -625,12 +663,19 @@ class RemoteNetwork:
         chain, cur = self._current(cid)
         new = [RemoteWitness(u, self.timeout, admin_token=token(u)) for u in new_urls]
         standbys, succ = self._new_committee(committee_urls, dead_man, token)
-        nxt = charter_body(cur["name"], cur["version"] + 1, [w.pk for w in new], charter_hash(cur), succ)
-        sigs, snapshots = {}, []
+        olds = []
         for url in self.urls.get(cid, []):
             try:
-                w = RemoteWitness(url, self.timeout, admin_token=token(url))
-                sig, snap = w.freeze(nxt)
+                olds.append(RemoteWitness(url, self.timeout, admin_token=token(url)))
+            except Rejected:
+                continue
+        ck = plan_checkpoint(cur, settled_answers([w for w in olds if w.pk in cur["witnesses"]]), compact)
+        nxt = charter_body(cur["name"], cur["version"] + 1, [w.pk for w in new], charter_hash(cur), succ,
+                           checkpoint_hash(ck) if ck else None)
+        sigs, snapshots = {}, []
+        for w in olds:
+            try:
+                sig, snap = w.freeze(nxt, ck)
             except Rejected:  # includes Unreachable
                 continue
             if (w.pk in cur["witnesses"] and w.pk not in sigs and isinstance(sig, str)
@@ -641,12 +686,12 @@ class RemoteNetwork:
             raise RuntimeError("not enough live witnesses to rotate")
         frozen = set(sigs)
         if cur.get("successor") is not None:
-            csigs = self._committee_sign(cid, cur, nxt, dict(sigs), snapshots, token)
+            csigs = self._committee_sign(cid, cur, nxt, dict(sigs), snapshots, token, ck)
             if len(csigs) < quorum(len(cur["successor"]["committee"])):
                 raise RuntimeError("not enough live standby members to sign the rotation")
             sigs.update(csigs)
         return self._install(cid, chain, cur, nxt, sigs, snapshots, new, frozen, standbys,
-                             list(new_urls), list(committee_urls or []))
+                             list(new_urls), list(committee_urls or []), ck)
 
     def succeed(self, cid: str, new_urls: list, admin_token, *, committee_urls: list | None = None,
                 dead_man: int | None = None) -> int:
@@ -662,7 +707,16 @@ class RemoteNetwork:
             raise ValueError("this version names no successor committee")
         new = [RemoteWitness(u, self.timeout, admin_token=token(u)) for u in new_urls]
         standbys, succ = self._new_committee(committee_urls, dead_man, token)
-        nxt = charter_body(cur["name"], cur["version"] + 1, [w.pk for w in new], charter_hash(cur), succ)
+        # Alone, the committee carries exactly the version's checkpoint (SPEC §5.7).
+        members = []
+        for url in self.committees.get(cid, []):
+            try:
+                members.append(RemoteStandby(url, self.timeout, admin_token=token(url)))
+            except Rejected:
+                continue
+        ck = plan_checkpoint(cur, settled_answers(members), compact=False)
+        nxt = charter_body(cur["name"], cur["version"] + 1, [w.pk for w in new], charter_hash(cur), succ,
+                           checkpoint_hash(ck) if ck else None)
         # Two phases: a member that signs fences at once (SPEC §5.5), so asking members one by
         # one could fence a minority and leave a live home unable to collect an ack quorum.
         # First ask each (read-only) whether it considers the version dead; send SUCCEED only
@@ -682,11 +736,11 @@ class RemoteNetwork:
         if len(agree) < quorum(len(committee)):
             raise RuntimeError("not enough standby members agree the version is dead")
         snapshots: list = []
-        sigs = self._committee_sign(cid, cur, nxt, {}, snapshots, token)
+        sigs = self._committee_sign(cid, cur, nxt, {}, snapshots, token, ck)
         if len(sigs) < quorum(len(committee)):
             raise RuntimeError("not enough standby members agree the version is dead")
         return self._install(cid, chain, cur, nxt, sigs, snapshots, new, set(), standbys,
-                             list(new_urls), list(committee_urls or []))
+                             list(new_urls), list(committee_urls or []), ck)
 
     def probe(self, cid: str, admin_token) -> int:
         """Have every reachable standby member of ``cid`` challenge its members now."""
@@ -714,13 +768,13 @@ class RemoteNetwork:
         standbys = [RemoteStandby(u, self.timeout, admin_token=token(u)) for u in urls]
         return standbys, successor_clause([m.pk for m in standbys], dead_man)
 
-    def _committee_sign(self, cid, cur, nxt, member_sigs, snapshots, token) -> dict:
+    def _committee_sign(self, cid, cur, nxt, member_sigs, snapshots, token, ck=None) -> dict:
         out = {}
         committee = cur["successor"]["committee"]
         for url in self.committees.get(cid, []):
             try:
                 m = RemoteStandby(url, self.timeout, admin_token=token(url))
-                sig, snap = m.succeed(nxt, member_sigs)
+                sig, snap = m.succeed(nxt, member_sigs, ck)
             except Rejected:  # includes Unreachable
                 continue
             if (m.pk in committee and m.pk not in out and isinstance(sig, str)
@@ -730,7 +784,7 @@ class RemoteNetwork:
         return out
 
     def _install(self, cid, chain, cur, nxt, sigs, snapshots, new, frozen, standbys, new_urls,
-                 committee_urls) -> int:
+                 committee_urls, ck=None) -> int:
         new_chain = chain + [{"body": nxt, "sigs": sigs}]
         self.registry.add_chain(cid, new_chain)
         # Everyone involved learns the new version (gossip admits it only if it verifies).
@@ -746,12 +800,12 @@ class RemoteNetwork:
                 pending.append(w.url)  # a re-used key must bring its own votes (SPEC §5.4)
                 continue
             try:
-                w.adopt(cid, nxt["version"], snapshots)
+                w.adopt(cid, nxt["version"], snapshots, ck)
             except Rejected:
                 pending.append(w.url)
         for m in standbys:
             try:
-                m.enter(cid, nxt["version"], snapshots)
+                m.enter(cid, nxt["version"], snapshots, ck)
             except Rejected:
                 pending.append(m.url)
         for url in everyone:
@@ -760,7 +814,9 @@ class RemoteNetwork:
         self.urls[cid] = new_urls
         self.committees[cid] = committee_urls
         if pending:
-            raise RotationIncomplete(nxt["version"], pending)
+            e = RotationIncomplete(nxt["version"], pending)
+            e.checkpoint = ck  # what a late ADOPT must be given with the snapshots
+            raise e
         return nxt["version"]
 
     def find_votes(self, sigil: str) -> list:

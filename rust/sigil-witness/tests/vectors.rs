@@ -170,12 +170,13 @@ fn replay_script(script: &Json, stamp_key: Option<&Json>) -> usize {
         let a = arr(step, "args");
         if let Some(m) = sbs.get(s(step, "who")) {
             let got = match s(step, "op") {
-                "enter" => m.enter(&a[0], &a[1], a[2].as_arr().unwrap()).0,
+                "enter" => m.enter(&a[0], &a[1], a[2].as_arr().unwrap(), a.get(3)).0,
                 "mirror" => m.mirror_bind(&a[0]).0,
                 "note_release" => m.note_release(&a[0], &a[1]).0,
                 "observe" => Ok(Json::Bool(m.observe(&a[0], a[1].as_str().unwrap()))),
                 "dead" => Ok(Json::Bool(m.dead())),
-                "succeed" => m.succeed(&a[0], a.get(1)).0,
+                "succeed" => m.succeed(&a[0], a.get(1), a.get(2)).0,
+                "settled_records" => Ok(m.settled_records()),
                 "snapshot" => Ok(m.snapshot()),
                 "gossip" => m.gossip(&a[0]).0,
                 "charters" => Ok(m.registry().to_json()),
@@ -190,8 +191,10 @@ fn replay_script(script: &Json, stamp_key: Option<&Json>) -> usize {
             "release" => w.release(&a[0], &a[1]).0,
             "status" => w.status(&a[0]).0,
             "heartbeat" => w.heartbeat(&a[0]).0,
-            "freeze" => w.freeze(&a[0]).0,
-            "adopt" => w.adopt(&a[0], &a[1], a[2].as_arr().unwrap()).0,
+            "freeze" => w.freeze_with(&a[0], a.get(1)).0,
+            "adopt" => w.adopt_with(&a[0], &a[1], a[2].as_arr().unwrap(), a.get(3)).0,
+            "settle" => w.settle(&a[0]).0,
+            "settled_records" => Ok(w.settled_records()),
             "record" => Ok(a[0].as_str().and_then(|x| w.record(x)).map(|r| r.to_json()).unwrap_or(Json::Null)),
             "sell_stamp" => w.sell_stamp(&a[0]).0,
             "gossip" => w.gossip(&a[0]).0,
@@ -309,6 +312,19 @@ fn succession_script_matches_reference() {
     let v = vectors();
     let n = replay_script(v.get("succession").unwrap(), None);
     assert!(n > 100, "{n} steps");
+}
+
+/// Compaction (SPEC §5.7): SETTLE and its refusals (partial, forged and misdirected
+/// certificates), settled records refusing new votes and releases, SETTLED, FREEZE with a
+/// checkpoint (wrong, unsorted and live sets refused; checkpointed sigils left out of the
+/// snapshot), ADOPT that needs the exact set and ignores a lying predecessor's evidence for a
+/// checkpointed sigil, the extension rule at FREEZE and SUCCEED, and a dead-man successor that
+/// carries exactly the version's checkpoint.
+#[test]
+fn compaction_script_matches_reference() {
+    let v = vectors();
+    let n = replay_script(v.get("compaction").unwrap(), None);
+    assert!(n > 50, "{n} steps");
 }
 
 #[test]

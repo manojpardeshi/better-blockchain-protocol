@@ -33,6 +33,32 @@ pub fn constellation_id(genesis_body: &Json) -> String {
     digest("constellation", genesis_body)
 }
 
+/// `charter._is_hash`: a 64-character lowercase hex string.
+pub fn is_hash(v: &Json) -> bool {
+    v.as_str().is_some_and(|s| s.len() == 64 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)))
+}
+
+/// `charter.valid_checkpoint_set` (SPEC §3.7, §5.7): a list of `[sigil, gen, tid]` (strings and a
+/// non-negative integer), sorted by sigil, sigils distinct.
+pub fn valid_checkpoint_set(v: &Json) -> bool {
+    let Some(entries) = v.as_arr() else { return false };
+    let mut prev: Option<&str> = None;
+    for e in entries {
+        let Some([s, g, t]) = e.as_arr().and_then(|a| <&[Json; 3]>::try_from(a.as_slice()).ok()) else { return false };
+        let (Some(s), Some(g), Some(_)) = (s.as_str(), g.as_int(), t.as_str()) else { return false };
+        if g < 0 || prev.is_some_and(|p| p >= s) {
+            return false;
+        }
+        prev = Some(s);
+    }
+    true
+}
+
+/// `H("checkpoint", S)`: what a charter body's `checkpoint` commits to.
+pub fn checkpoint_hash(entries: &Json) -> String {
+    digest("checkpoint", entries)
+}
+
 /// A charter's successor committee (SPEC §3.7, §5.5): the authority over the next version.
 #[derive(Debug, Clone)]
 pub struct Successor {
@@ -82,6 +108,8 @@ pub struct Charter {
     pub keys: HashMap<String, VerifyingKey>,
     /// The successor committee, if the charter names one (SPEC §5.5).
     pub successor: Option<Successor>,
+    /// `H("checkpoint", S)` of the version's checkpoint set, if it has one (SPEC §5.7).
+    pub checkpoint: Option<String>,
 }
 
 impl Charter {
@@ -105,8 +133,13 @@ impl Charter {
             None => None,
             Some(s) => Some(Successor::parse(s)?),
         };
+        let checkpoint = match body.get("checkpoint") {
+            None => None,
+            Some(c) if is_hash(c) => c.as_str().map(str::to_string),
+            Some(_) => return Err("malformed checkpoint".into()),
+        };
         let keys = witnesses.iter().filter_map(|w| decode_pk(w).map(|k| (w.clone(), k))).collect();
-        Ok(Charter { body: body.clone(), version, witnesses, keys, successor })
+        Ok(Charter { body: body.clone(), version, witnesses, keys, successor, checkpoint })
     }
 
     pub fn is_member(&self, pk: &str) -> bool {

@@ -60,9 +60,9 @@ use crate::witness::{Error, Outcome, Witness};
 pub const MAX_BODY: usize = 1 << 20;
 /// ADOPT carries every predecessor's evidence.
 pub const MAX_ADMIN_BODY: usize = 256 << 20;
-pub const ADMIN_METHODS: [&str; 2] = ["freeze", "adopt"];
+pub const ADMIN_METHODS: [&str; 3] = ["freeze", "adopt", "settled"];
 /// A standby member's operator calls (SPEC §5.5).
-pub const STANDBY_ADMIN_METHODS: [&str; 3] = ["standby", "succeed", "probe"];
+pub const STANDBY_ADMIN_METHODS: [&str; 4] = ["standby", "succeed", "probe", "settled"];
 
 pub fn reply(code: StatusCode, v: &Json) -> Response {
     (code, [(header::CONTENT_TYPE, "application/json")], v.canonical()).into_response()
@@ -238,13 +238,22 @@ async fn call(State(app): State<App>, Path(method): Path<String>, headers: Heade
             (Err(r), _) | (_, Err(r)) => Err(r),
         },
         "status" => field(&body, "sigil").map(|s| w.status(s)),
+        "settle" => match field(&body, "settlement") {
+            Ok(c) => {
+                let c = c.clone();
+                // A certificate carries a seal per input.
+                blocking(move || w.settle(&c)).await
+            }
+            Err(r) => Err(r),
+        },
+        "settled" => Ok((Ok(w.settled_records()), 0)),
         "heartbeat" => field(&body, "challenge").map(|c| w.heartbeat(c)),
         "sell_stamp" => field(&body, "blinded").map(|b| w.sell_stamp(b)),
         "gossip" => blocking(move || w.gossip(&body)).await,
         "freeze" => match field(&body, "charter") {
             Ok(c) => {
-                let c = c.clone();
-                blocking(move || w.freeze(&c)).await
+                let (c, ck) = (c.clone(), body.get("checkpoint").cloned());
+                blocking(move || w.freeze_with(&c, ck.as_ref())).await
             }
             Err(r) => Err(r),
         },
@@ -259,7 +268,7 @@ async fn call(State(app): State<App>, Path(method): Path<String>, headers: Heade
                         let null = Json::Null;
                         let (c, v) = (body.get("constellation").unwrap_or(&null), body.get("version").unwrap_or(&null));
                         let snaps = body.get("snapshots").and_then(Json::as_arr).map(Vec::as_slice).unwrap_or(&[]);
-                        w.adopt_once(c, v, snaps)
+                        w.adopt_once_with(c, v, snaps, body.get("checkpoint"))
                     })
                     .await
                 }
@@ -336,6 +345,7 @@ async fn sb_call(State(app): State<StandbyApp>, Path(method): Path<String>, head
         },
         "gossip" => blocking(move || s.gossip(&body)).await,
         "status" => field(&body, "sigil").map(|x| s.status(x)),
+        "settled" => Ok((Ok(s.settled_records()), 0)),
         "standby" => {
             let checked = field(&body, "constellation")
                 .and_then(|_| field(&body, "version"))
@@ -347,7 +357,7 @@ async fn sb_call(State(app): State<StandbyApp>, Path(method): Path<String>, head
                         let null = Json::Null;
                         let (c, v) = (body.get("constellation").unwrap_or(&null), body.get("version").unwrap_or(&null));
                         let snaps = body.get("snapshots").and_then(Json::as_arr).map(Vec::as_slice).unwrap_or(&[]);
-                        s.enter(c, v, snaps)
+                        s.enter(c, v, snaps, body.get("checkpoint"))
                     })
                     .await
                 }
@@ -356,8 +366,8 @@ async fn sb_call(State(app): State<StandbyApp>, Path(method): Path<String>, head
         }
         "succeed" => match field(&body, "charter") {
             Ok(c) => {
-                let (c, sigs) = (c.clone(), body.get("sigs").cloned());
-                blocking(move || s.succeed(&c, sigs.as_ref())).await
+                let (c, sigs, ck) = (c.clone(), body.get("sigs").cloned(), body.get("checkpoint").cloned());
+                blocking(move || s.succeed(&c, sigs.as_ref(), ck.as_ref())).await
             }
             Err(r) => Err(r),
         },
