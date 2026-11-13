@@ -1,10 +1,15 @@
 """The witness daemon: one witness, one durable store, served over HTTP.
 
     python -m sigil.witnessd keygen  --out key.json
-    python -m sigil.witnessd genesis --name orion --keys k1.pub k2.pub k3.pub k4.pub --out registry.json
+    python -m sigil.witnessd genesis --name orion --keys k1.pub k2.pub k3.pub k4.pub --out registry.json \\
+                                     [--committee m1.pub m2.pub m3.pub m4.pub --dead-man SECONDS]
     python -m sigil.witnessd run     --key key.json --registry registry.json --constellation <cid> \\
                                      --store data.db [--host 127.0.0.1] [--port 7000] [--stamps] \\
-                                     [--admin-token FILE] [--adopt]
+                                     [--admin-token FILE] [--adopt] [--rate-limit R] [--rate-burst B]
+    python -m sigil.witnessd standby --key key.json --registry registry.json --constellation <cid> \\
+                                     --store standby.db [--host 127.0.0.1] [--port 7100] [--wait] \\
+                                     [--admin-token FILE] [--members URL ...] [--probe-every S] \\
+                                     [--rate-limit R] [--rate-burst B]
 
 ``keygen`` writes the private key (mode 0600) and its public key next to it
 (``key.pub``). ``genesis`` builds charter version 0 from public keys and
@@ -19,25 +24,42 @@ sends ``/v0/adopt`` (``RemoteNetwork.rotate`` does). The rotation calls
 (``/v0/freeze``, ``/v0/adopt``) need the token in ``--admin-token FILE``;
 without it they are disabled.
 
+A witness listening on a non-loopback ``--host`` limits each client to
+``--rate-limit`` requests per second (default 20, bursts of ``--rate-burst``,
+default 100; docs/WIRE.md "Admission control"); ``--rate-limit 0`` disables it.
+On loopback there is no limit unless ``--rate-limit`` asks for one.
+
+``standby`` serves a member of a successor committee (SPEC §5.5): it mirrors
+bindings for clients, probes the version's members for heartbeats
+(``--members``, every ``--probe-every`` seconds) and signs a successor when
+asked cooperatively or once the dead-man period has passed (``/v0/standby``,
+``/v0/succeed`` and ``/v0/probe`` need ``--admin-token``). A fresh store stands
+by for version 0 at once; with ``--wait`` it waits for the handover of a later
+version (docs/WIRE.md "Succession").
+
 Every vote is made durable before it is sent (SPEC §5), so the daemon may be
 killed at any moment, even with SIGKILL, and restarted on the same store.
 """
 
 import argparse
 import json
+import math
 import os
 import signal
+import sqlite3
 import sys
 import threading
 import time
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
-from .charter import Registry, charter_body, constellation_id
+from .charter import Registry, charter_body, constellation_id, successor_clause
 from .crypto import KeyPair
-from .server import WitnessServer
+from .ratelimit import DEFAULT_BURST, DEFAULT_RATE
+from .server import StandbyServer, WitnessServer
 from .stamps import StampMint
 from .store import WitnessStore
+from .succession import Standby, StandbyStore
 from .witness import Witness
 
 
@@ -91,9 +113,14 @@ def read_pk(arg: str) -> str:
     return json.loads(text)["pk"] if text.startswith("{") else text
 
 
-def genesis(name: str, pks: list) -> tuple[str, dict]:
-    """Charter version 0 of a new constellation: returns ``(cid, registry entry)``."""
-    body = charter_body(name, 0, pks, None)
+def genesis(name: str, pks: list, committee: list | None = None, dead_man: int | None = None) -> tuple[str, dict]:
+    """Charter version 0 of a new constellation: returns ``(cid, registry entry)``.
+
+    ``committee`` (public keys) and ``dead_man`` (seconds) give it a successor
+    committee (SPEC §5.5).
+    """
+    succ = successor_clause(committee, dead_man) if committee else None
+    body = charter_body(name, 0, pks, None, succ)
     return constellation_id(body), [{"body": body, "sigs": {}}]
 
 
@@ -159,10 +186,54 @@ def build_witness(key: str, registry: str, cid: str, store: str, stamps: bool = 
     return w
 
 
+def build_standby(key: str, registry: str, cid: str, store: str, wait: bool = False) -> Standby:
+    """A successor-committee member (SPEC §5.5), restored from its store.
+
+    A fresh store stands by for version 0 at once if the key is in version 0's
+    committee and the constellation has not rotated; otherwise (or with ``wait``)
+    it waits for ``/v0/standby`` with the handover of a later version.
+    """
+    kp = load_key(key)
+    reg = load_registry(registry)
+    if cid not in reg:
+        raise SystemExit(f"constellation {cid} is not in {registry}")
+    m = Standby(kp, reg, lambda: int(time.time()), store=StandbyStore(store))
+    if m.cid is None and not wait:
+        chain = reg.chain(cid)
+        succ = chain[0]["body"].get("successor")
+        if succ is None or kp.pk not in succ["committee"]:
+            raise SystemExit(f"{kp.pk[:12]} is not in the successor committee of {cid[:12]} version 0")
+        if len(chain) > 1:
+            raise SystemExit(f"{cid[:12]} has rotated past version 0: start with --wait for /v0/standby")
+        m.enter(cid, 0, [])
+    elif m.cid is not None and m.cid != cid:
+        raise SystemExit(f"store {store} belongs to constellation {m.cid}, not {cid}")
+    return m
+
+
+def standby(args) -> None:
+    token = load_admin_token(args.admin_token)
+    m = build_standby(args.key, args.registry, args.constellation, args.store, args.wait)
+    server = StandbyServer(m, args.host, args.port, admin_token=token, members=args.members,
+                           probe_every=args.probe_every, rate_limit=args.rate_limit,
+                           rate_burst=args.rate_burst).start()
+    stop = threading.Event()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(sig, lambda *_: stop.set())
+    where = f"{m.cid[:12]} v{m.version}" if m.cid else f"(awaiting STANDBY into {args.constellation[:12]})"
+    print(f"standby {m.pk[:12]} for {where} listening on {server.url}", flush=True)
+    stop.wait()
+    server.stop()
+    with server._lock:
+        m.store.close()
+    print("stopped", flush=True)
+
+
 def run(args) -> None:
     token = load_admin_token(args.admin_token)
     w = build_witness(args.key, args.registry, args.constellation, args.store, args.stamps, args.adopt)
-    server = WitnessServer(w, args.host, args.port, admin_token=token).start()
+    server = WitnessServer(w, args.host, args.port, admin_token=token, rate_limit=args.rate_limit,
+                           rate_burst=args.rate_burst).start()
     stop = threading.Event()
     for sig in (signal.SIGTERM, signal.SIGINT):
         signal.signal(sig, lambda *_: stop.set())
@@ -180,6 +251,18 @@ def run(args) -> None:
 
 # --------------------------------------------------------------------- cli
 
+def _rate(v: str) -> float:
+    """A ``--rate-limit``: finite and at least 0 (0 disables the limit). A negative or non-finite
+    value is refused, so a typo cannot silently turn admission control off."""
+    try:
+        r = float(v)
+    except ValueError:
+        r = math.nan
+    if not math.isfinite(r) or r < 0:
+        raise argparse.ArgumentTypeError(f"must be a finite number >= 0 (0 disables the limit), not {v!r}")
+    return r
+
+
 def main(argv=None) -> None:
     p = argparse.ArgumentParser(prog="python -m sigil.witnessd", description="Sigil witness daemon")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -191,6 +274,27 @@ def main(argv=None) -> None:
     g.add_argument("--name", required=True)
     g.add_argument("--keys", nargs="+", required=True, help="public keys: .pub files, key files or hex")
     g.add_argument("--out", required=True, help="registry file (merged into if it exists)")
+    g.add_argument("--committee", nargs="+", help="successor committee public keys (SPEC 5.5)")
+    g.add_argument("--dead-man", type=int, help="dead-man period in seconds (with --committee)")
+
+    sb = sub.add_parser("standby", help="serve a successor-committee member (SPEC 5.5)")
+    sb.add_argument("--key", required=True)
+    sb.add_argument("--registry", required=True)
+    sb.add_argument("--constellation", required=True)
+    sb.add_argument("--store", required=True)
+    sb.add_argument("--host", default="127.0.0.1")
+    sb.add_argument("--port", type=int, default=7100)
+    sb.add_argument("--admin-token", metavar="FILE",
+                    help="file holding the operator token that authorises /v0/standby, /v0/succeed, /v0/probe")
+    sb.add_argument("--wait", action="store_true",
+                    help="on a fresh store, wait for /v0/standby into a later charter version")
+    sb.add_argument("--members", nargs="*", default=[], help="member URLs to probe for heartbeats")
+    sb.add_argument("--probe-every", type=float, help="probe the members every this many seconds")
+    sb.add_argument("--rate-limit", type=_rate, metavar="R", default=None,
+                    help=f"requests per second per client (0: no limit; default {DEFAULT_RATE:g} on a "
+                         "non-loopback host, none on loopback)")
+    sb.add_argument("--rate-burst", type=int, metavar="B", default=DEFAULT_BURST,
+                    help=f"requests a client may burst above the rate (default {DEFAULT_BURST})")
 
     r = sub.add_parser("run", help="serve a witness")
     r.add_argument("--key", required=True)
@@ -204,12 +308,20 @@ def main(argv=None) -> None:
                    help="file holding the operator token that authorises /v0/freeze and /v0/adopt")
     r.add_argument("--adopt", action="store_true",
                    help="on a fresh store, do not join: wait for /v0/adopt into a later charter version")
+    r.add_argument("--rate-limit", type=_rate, metavar="R", default=None,
+                   help=f"requests per second per client (0: no limit; default {DEFAULT_RATE:g} on a "
+                        "non-loopback host, none on loopback)")
+    r.add_argument("--rate-burst", type=int, metavar="B", default=DEFAULT_BURST,
+                   help=f"requests a client may burst above the rate (default {DEFAULT_BURST})")
 
     args = p.parse_args(argv)
     if args.cmd == "keygen":
         print(generate_key(args.out).pk)
     elif args.cmd == "genesis":
-        cid, chain = genesis(args.name, [read_pk(a) for a in args.keys])
+        if bool(args.committee) != (args.dead_man is not None):
+            raise SystemExit("--committee and --dead-man go together")
+        cid, chain = genesis(args.name, [read_pk(a) for a in args.keys],
+                             [read_pk(a) for a in args.committee] if args.committee else None, args.dead_man)
         reg = {}
         if os.path.exists(args.out):
             with open(args.out) as f:
@@ -218,7 +330,12 @@ def main(argv=None) -> None:
         _write_json(args.out, reg)
         print(cid)
     else:
-        run(args)
+        try:
+            standby(args) if args.cmd == "standby" else run(args)
+        except (OSError, ValueError, KeyError, TypeError, sqlite3.Error) as e:
+            # One line naming the problem, as the Rust daemon prints, not a traceback.
+            what = f"store {args.store}: " if isinstance(e, sqlite3.Error) else ""
+            raise SystemExit(f"sigil.witnessd: {what}{type(e).__name__}: {e}") from None
 
 
 if __name__ == "__main__":

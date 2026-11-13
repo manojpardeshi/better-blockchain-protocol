@@ -337,7 +337,10 @@ class Universe:
         self.save()                                  # persist the pledge first
         tid = self.seal_and_finalise(header, body, unlocks)
         if tid is not None:
-            to.receive(self.alice.dossier.ancestry([tid]), [model.ref(tid, 0)])
+            try:
+                to.receive(self.alice.dossier.ancestry([tid]), [model.ref(tid, 0)])
+            except InvalidDossier:
+                pass  # the payee could not reach a quorum of the home to confirm it unspent (fails closed)
 
     def op_swap(self):
         m = self.mallory
@@ -422,7 +425,7 @@ class Universe:
             return
         try:
             src.pay(self.alice, self.usd, 5)
-        except (SealFailed, ValueError):
+        except (SealFailed, ValueError, InvalidDossier):  # InvalidDossier: alice fails closed in a partition
             return
         self.save()
 

@@ -53,10 +53,14 @@ def atomic_swap(a: Wallet, a_asset: str, a_amount: int, b: Wallet, b_asset: str,
             raise ValueError(f"{party.name}: swap does not pay the agreed amount")
     # 1. Main inputs: each party signs everything but its kill switch.
     unlocks = {**a.authorise(header, body), **b.authorise(header, body)}
+    for party in (a, b):
+        party.cosign(header, unlocks)  # either can then finish the swap after a fault
     kills = (a.kill_switches | b.kill_switches) & {s for s, _ in header["inputs"]}
     a.seal(header, body, unlocks, only={s for s, _ in header["inputs"]} - kills)
     # 2. Every main input is bound: now each party releases its kill switch.
     unlocks.update({**a.authorise(header, body, release_kill=True), **b.authorise(header, body, release_kill=True)})
+    for party in (a, b):
+        party.cosign(header, unlocks)
     a.seal(header, body, unlocks, only=kills)  # either party can coordinate sealing
     b.dossier.merge(a.dossier.ancestry({r["tx"] for r in body["inputs"]}))
     for seal in a.dossier.seals.values():

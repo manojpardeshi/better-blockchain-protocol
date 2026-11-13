@@ -68,6 +68,10 @@ def main():
         "spend_cpu": resources.spend_cpu_amplification(),
         "gossip_store": resources.gossip_store_growth(),
         "storage_per_spend": resources.storage_per_spend(),
+        "sigil_log": resources.sigil_log_growth(),
+        "rotation_log": resources.rotation_log_growth(),
+        "rate_limit": resources.rate_limit_burst(),
+        "idle_connections": resources.idle_connections(),
     }
 
     print(json.dumps(out, indent=2))

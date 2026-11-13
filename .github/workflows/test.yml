@@ -31,7 +31,7 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: ~/.cache/sigil-tla
-          key: tla2tools-1.7.4-tlapm-1.6.0-pre-39620b869ed9
+          key: tla2tools-1.7.4-tlapm-1.6.0-pre-6fc2162a8f02
       # Runs the unbounded TLAPS safety proof (SigilProofs.tla) and the
       # bounded TLC models with their mutation tests; see docs/VERIFICATION.md.
       - run: formal/check.sh
@@ -48,11 +48,29 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: ~/.cache/sigil-tla
-          key: tla2tools-1.7.4-tlapm-1.6.0-pre-39620b869ed9
+          key: tla2tools-1.7.4-tlapm-1.6.0-pre-6fc2162a8f02
       # The unbounded TLAPS proof of safety under charter rotation
       # (formal/SigilRotProofs.tla) and its TLC instances MC_rotp*.cfg;
       # see docs/VERIFICATION.md.
       - run: SIGIL_ROT_PROOF=1 formal/check.sh
+
+  succession-proof:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/sigil-tla
+          key: tla2tools-1.7.4-tlapm-1.6.0-pre-6fc2162a8f02
+      # The unbounded TLAPS proof of safety under rotation and constellation
+      # succession (formal/SigilSuccProofs.tla) and its TLC instances
+      # MC_succ*.cfg; see docs/VERIFICATION.md.
+      - run: SIGIL_SUCC_PROOF=1 formal/check.sh
 
   rust:
     runs-on: ubuntu-latest
@@ -79,3 +97,43 @@ jobs:
         run: PYTHONPATH=. python rust/sigil-witness/tests/gen_vectors.py | cmp - rust/sigil-witness/tests/vectors.json
       - name: Interop (Python wallet against Rust witness processes)
         run: python bench/interop.py
+
+  integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/target
+          key: cargo-${{ runner.os }}-${{ hashFiles('rust/Cargo.lock') }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install cryptography
+      - run: cargo build --release --locked --manifest-path rust/Cargo.toml
+      # End-to-end user flows against multi-process constellations of Rust and Python
+      # witnesses, driven through the CLI wallet, RemoteNetwork and the daemons' HTTP
+      # endpoints (tests/integration). Fails rather than skips if the binary is missing.
+      # Also the soak (3 minutes here; SIGIL_SOAK_SECONDS=1800 for a long run) and the
+      # compatibility tests: wire twins generated from docs/WIRE.md, store and wallet
+      # formats, daemon operability (tests/integration/__init__.py lists the knobs).
+      - name: End-to-end, soak and compatibility integration tests
+        run: python -m unittest discover -v -s tests/integration -t .
+        env:
+          SIGIL_REQUIRE_RUST: "1"
+          SIGIL_SOAK_SECONDS: "180"
+          SIGIL_SOAK_OUT: soak.json
+          SIGIL_WIRE_OUT: wire.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: integration-numbers
+          path: |
+            soak.json
+            wire.json
+          if-no-files-found: ignore

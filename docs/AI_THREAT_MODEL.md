@@ -34,6 +34,13 @@ parallel and is now a regression test. Three more attack hypotheses tested here
 and shared-control locks accepted as payment) were also fixed by that wallet work.
 Per the task, nothing in `sigil/` was changed here.
 
+A later pass closed the denial-of-service gaps of [§2.6](#26-resource-exhaustion-t5)
+in both witnesses: admission control by default on open listeners, bounds on what
+one request can make a witness store, charter size caps in gossip, and connection
+caps; it also found and fixed BUG-7 (rotation multiplied evidence logs). Each is a
+regression test (`tests/test_limits.py`, `tests/redteam/test_redteam.py::Resources`,
+`rust/sigil-witness/tests/limits.rs`) and a golden vector.
+
 ---
 
 ## 1. The math / assumption split
@@ -47,7 +54,7 @@ Per the task, nothing in `sigil/` was changed here.
 | Witnesses cannot steal (SPEC §8) | Holder re-checks the owner's unlock (validate §6.4) | **No**: even an all-Byzantine quorum cannot forge the owner's signature |
 | Witnesses cannot inflate | Holder checks conservation (validate §6.5) | **No** — *except* via BUG-1, a cache defect, not a math break ([§3](#3-findings)) |
 | Fees cannot censor; witness cannot discriminate | Blind RSA-FDH stamps | Only by breaking RSA-FDH or the blinding |
-| Safety holds across rotation | ADOPT + evidence logs | Bounded-checked only (not size-free); see [§2.11](#211-rotation-and-succession) |
+| Safety holds across rotation and succession | ADOPT + evidence logs; mirror before vote + fence; `≤ f_k` Byzantine per committee | **No** (TLAPS-proved for all sizes on abstract models, [VERIFICATION §1b, §1c](VERIFICATION.md#1b-safety-under-charter-rotation-unbounded-formalsigilrotproofstla)); see [§2.11](#211-rotation-and-succession) |
 | Liveness / recovery / deep confirmation | **Honest-majority of current operators, honest STATUS answers, cooperative counter-parties** | **Yes, at the assumption**: see BUG-2 (fixed), BUG-4, BUG-5 and [§2.5](#25-timing-partitions-and-gossip-withholding) |
 | Slashing deters a corrupt quorum | Bond economics + who can satisfy the equivocation branch | **Yes, by design flaw**: the equivocator claims its own bond (BUG-6, [§2.9](#29-economic-attacks-t9)) |
 
@@ -72,7 +79,7 @@ column is the rank.
 | 3 (T9) | **Economic attacks** (bond self-claim, stamp pricing, bond sizing) | slashing economics, availability | lock design + unspecified params | **High**: BUG-6 voids slashing against the cheater | **P1** |
 | 4 (T3) | **Operator compromise ≥ f per constellation** (phish / bribe / Sybil) | double-spend safety of that home | `≤ f` honest operators | **High**; AI scales phishing and Sybil | **P1** |
 | 5 (T10) | **Protocol-level attacks** on recovery / swaps | liveness, atomicity | cooperative counter-party | **Medium–High** (BUG-5 swap hostage, [§2.8](#28-multi-party-swaps-and-counter-party-attacks)) | **P1** |
-| 6 (T5) | **Resource exhaustion** (CPU / memory / storage amplification) | availability | rate limiting (stamps) | **Medium**; stamps are opt-in in both witnesses | **P1** |
+| 6 (T5) | **Resource exhaustion** (CPU / memory / storage amplification) | availability | per-client rate limit (default off loopback), stamps, size caps | **Low–Medium**: bounded per request and per address; many-address floods remain ([§2.6](#26-resource-exhaustion-t5)) | **P2** |
 | 7 (T6) | **Long-range forgery** by retired keys | safety of old history | long unbonding + deep confirmation | **Medium** (BUG-4 lets a payer skip deep confirmation) | **P1** |
 | 8 (T7) | **Deanonymisation from dossiers** | privacy | nothing today (ancestry is in the clear) | **High** for privacy, no loss of funds | **P2/P3** |
 | 9 (T4) | **Griefing via lying STATUS / partitions** | liveness | honest STATUS, honest majority | **Low–Medium** (BUG-2 fixed; induced owner equivocation remains) | **P2** |
@@ -136,17 +143,22 @@ charter registry.
   to accept, so Sybil constellations are inert unless someone trusts them.
 
 **Residual risk — Medium.**
-* **Stamps are opt-in.** `Network.create_constellation(..., stamps=False)`, the
-  Python daemon (`sigil.witnessd --stamps`) and, since the merged port, the Rust
-  witness (`sigil-witness --stamps`) all default to *no* stamps. A witness without
-  stamps has **no rate limit**: anyone can create sigils homed there and force
-  unbounded work and storage ([§2.6](#26-resource-exhaustion-t5)). Note also that
-  `/v0/sell_stamp` blind-signs for anyone who asks: the payment step is outside the
-  protocol, so a deployment must put it behind a real payment channel or stamps
-  cost nothing.
-* The gossip constellation cap (10 000) bounds *count*, not *size*: one ~1 MiB
-  message can register a charter listing 14 000 witnesses (measured,
-  `tests/redteam/resources.py::gossip_store_growth`).
+* **Stamps are opt-in (rate limit fixed).** Stamps still default to off in
+  `Network`, `sigil.witnessd` and `sigil-witness`, and `/v0/sell_stamp` still
+  blind-signs for anyone who asks (payment is outside the protocol). But a witness
+  listening on a non-loopback address now limits each client (IPv4 address or
+  IPv6 /64) to 20 requests/s, bursts of 100, in both daemons (SPEC §5.6, WIRE.md
+  "Admission control"); a refused request is HTTP 429 `rejected` and never reaches
+  the witness. Measured: 600 back-to-back requests from one client, before: 600
+  served; after: 113 served, 487 refused (`rate_limit_burst`). What remains is an
+  attacker with many addresses, which only stamps with real payment price out.
+* **Charter size (fixed).** The gossip constellation cap (10 000) bounded *count*,
+  not *size*: one ~1 MiB message registered a charter listing 14 000 witnesses (or
+  a 900 KiB name, or 800 KiB of ignored signatures). A charter now names at most
+  128 witnesses and encodes to at most 64 KiB, in `verify_chain` of both
+  implementations, so in gossip admission and registry files too (SPEC §3.7).
+  Measured: all three messages dropped; the largest charter one message can
+  register is 64 KiB (`gossip_store_growth`).
 * Sybil *trust* is a social problem: an AI that manufactures plausible
   constellation reputations could get a holder to trust a home it controls → then
   [§2.3](#23-corrupting-a-constellation-t3) applies directly.
@@ -160,9 +172,13 @@ constellation it runs, seal a double spend there, and both payees accepted. That
 attack now fails with "untrusted constellation".
 
 **Mitigation:**
-* **P1:** make stamps (or an equivalent proof-of-work / rate limit) the default for
-  any witness exposed to the open network, and gate `/v0/sell_stamp` behind payment.
+* ~~**P1:** make stamps (or an equivalent proof-of-work / rate limit) the default for
+  any witness exposed to the open network~~ **done** (per-client rate limit by
+  default); still open: gate `/v0/sell_stamp` behind payment in deployments.
 * **P2:** bound gossip by *total bytes and total witnesses*, not just item counts.
+  Per charter: **done**. Per store: still open (10 000 constellations × 1024
+  versions × 64 KiB is a bound, not a small one); the rate limit bounds how fast it
+  fills.
 * **P2:** a reputation/stake floor for trust-policy admission, so an AI cannot
   cheaply manufacture a trustworthy-looking home.
 
@@ -297,30 +313,66 @@ timing maximises how often this happens.
 **Property at stake:** availability (CPU, memory, disk per request) and the cost
 asymmetry between attacker and victim.
 
-**What defends it, and why.** Stamps bound request rate when enabled; the 1 MiB body
-cap bounds any single request; gossip caps bound a message; lock evaluation is
-total and linear; and the equivocation-proof memoisation fix (Rust/Python bug 4 of
-[VERIFY_RUST §6](VERIFY_RUST.md)) plus the merged **64-proof cap** per unlock
-(`MAX_EQUIVOCATIONS`) removed the worst amplifier, equivocation locks.
+**What defends it, and why.** A per-client token bucket (default on any
+non-loopback listener; SPEC §5.6) bounds the request rate of one address, and stamps
+price requests when a deployment takes payment; the 1 MiB body cap bounds any single
+request, and the caps below bound what it can make a witness store; gossip caps
+bound a message and the charter caps one charter; connection caps and idle timeouts
+bound what silent clients hold; lock evaluation is total and linear; and the
+equivocation-proof memoisation fix (Rust/Python bug 4 of
+[VERIFY_RUST §6](VERIFY_RUST.md)) plus the **64-proof cap** per unlock
+(`MAX_EQUIVOCATIONS`) and the 64-key cap (`MAX_KEYS`) bound the CPU of one SPEND.
+Every bound is a refusal (a clean `Rejected`, no state change), and refusing to vote
+or release is always safe (abstention), so none of them can affect safety; ADOPT,
+which must not lose evidence, keeps every verifiable entry whatever its size.
 
-**Residual risk — Medium**, measured by `tests/redteam/resources.py`:
-* **CPU (fixed after the review):** the proof cap did not touch `sig`/`multi`
-  locks, so one 272 KiB SPEND forced ~3,780 Ed25519 verifications. A lock may
-  now name at most `MAX_KEYS = 64` keys in all (SPEC §3.5, Python and Rust),
-  and each key's signature is checked once per evaluation, so no SPEND checks
-  more than 64 signatures (`test_spend_cpu_amplification_measured`).
+**Status**, measured by `tests/redteam/resources.py` (before → after; every row is
+an assertion in `tests/redteam/test_redteam.py::Resources` and in `tests/test_limits.py`
+/ `rust/sigil-witness/tests/limits.rs`, and the Rust witness replays the reference's
+verdicts from the golden vectors):
 
-An AI adversary with many cheap IPs and the default (stampless) witness can keep a
-constellation's witnesses CPU-bound and fill their disks.
+| Probe | Before | After | Fix (Python and Rust) |
+|---|---|---|---|
+| CPU per SPEND (`spend_cpu_amplification`) | ~3,780 Ed25519 checks per 272 KiB | ≤ 64 | `MAX_KEYS` (fixed after the review) |
+| Requests one client gets through an open witness (`rate_limit_burst`, 600 back to back) | 600 served | 113 served, 487 × 429 | token bucket, 20/s, bursts of 100, default off loopback (`sigil/ratelimit.py`, `ratelimit.rs`) |
+| Storage one SPEND pins (`storage_per_spend`, ~800 KiB salt) | 802 KB (ratio 1.0) | refused, 0 bytes; the largest accepted SPEND pins 34 KB | `enc(auth)` ≤ `MAX_AUTH_BYTES` = 32 KiB (SPEC §5.1) |
+| One sigil's record after 40 bind/release cycles with junk-padded (~800 KiB) death proofs (`sigil_log_growth`) | 32 MB (rewritten whole on every update; in the append-only SQLite store, the sum of all versions, ~650 MB) | 16 bindings, then refused; padded proofs refused; record 50 KB | new bindings only below generation `MAX_GEN` = 16, `enc(proof)` ≤ `MAX_PROOF_BYTES` = 128 KiB (SPEC §5.2); the Python store keeps one row per key |
+| Evidence log of one bound sigil after six rotations of n = 4 (`rotation_log_growth`) | 8, 32, 128, 512, 2048, 8192 entries (BUG-7) | 5 every time | ADOPT keeps each distinct entry once (SPEC §5.4) |
+| Charter one gossip message registers (`gossip_store_growth`) | 14,000 witnesses / 900 KiB name / 800 KiB junk signatures | all dropped; ≤ 128 witnesses, ≤ 64 KiB | `MAX_WITNESSES`, `MAX_CHARTER_BYTES` in `verify_chain` (SPEC §3.7) |
+| Silent connections held (`idle_connections`, 300 opened) | 300 handler threads, held forever | ≤ 256 open (the rest closed unread), all dropped after the idle timeout | `MAX_CONNECTIONS` = 256, 16 per client with a rate limit, 30 s idle timeout; the Rust witness now runs its own accept loop (axum's set no timeout) |
+
+**Residual risk — Low–Medium.**
+* **Many addresses.** The rate limit is per address (IPv6 per /64). An adversary with
+  thousands of addresses still gets thousands of buckets: CPU (≤ 64 signature checks
+  per SPEND, a few thousand per gossip message) and storage (≤ ~70 KB per accepted
+  SPEND, new sigils are free) scale with the addresses it controls. Pricing that out
+  needs stamps with real payment (`sell_stamp` gated by the deployment) or network
+  filtering; it is an economic parameter (ROADMAP Phase 4), not code.
+* **Total state.** No witness bounds its total storage: sigils are free to create,
+  so the per-request bounds and the rate limit bound the *rate* of growth, not the
+  total. Records are never compacted away (a witness cannot know a sigil is dead
+  for good). The gossip store is bounded only by its counts.
+* **Memory per request.** A 1 MiB body may parse into some tens of MiB of objects;
+  with 256 connections that is a few GiB in the worst case. The Python witness
+  handles calls one at a time but parses concurrently; neither caps concurrent
+  parses separately.
+* **Admin calls** are exempt from the rate limit (an operator token is needed for
+  anything but a cheap refusal), and an authorised ADOPT may send 256 MiB. What
+  ADOPT *stores* is bounded by the evidence that verifies: it keeps only verified
+  binds and the verified releases and seals of bound transactions (SPEC §5.4), so
+  a Byzantine member of a freezing quorum can no longer pad a sigil's log for
+  every later version (`tests/test_adopt_evidence.py`).
 
 **Mitigation:**
-* **P1:** stamps (or PoW) default-on for open witnesses; memoise `has_sig` in
-  `sigil/locks.py` as Rust already does; cap the signature checks one request may
-  trigger (for example 64, which no 64-node lock needs to exceed by much) and the
-  keys in one `multi`; cap the stored authorisation size (salt length, header
-  inputs, unlock contents).
-* **P2:** log compaction (`store.py` notes it is deliberately omitted); bound total
-  gossip bytes and witnesses, not just counts.
+* ~~**P1:** stamps (or PoW) default-on for open witnesses~~ **done** as a default
+  per-client rate limit; stamps remain opt-in because the protocol cannot make them
+  cost anything (WIRE.md "Admission control"). ~~Cap the signature checks one request
+  may trigger and the keys in one `multi`~~ **done** (`MAX_KEYS`). ~~Cap the stored
+  authorisation size~~ **done** (`MAX_AUTH_BYTES`, `MAX_GEN`, `MAX_PROOF_BYTES`).
+  `has_sig` in `sigil/locks.py` is memoised (`checked`).
+* **P2:** ~~log compaction~~ **done** for the Python store (one row per key); a
+  per-store budget for gossip and a total storage budget per witness (with eviction
+  rules that cannot lose a binding) are still open; price stamps against spam cost.
 
 ---
 
@@ -483,17 +535,26 @@ invent (SPEC §5.4). The implemented sibling-contested ADOPT is TLC-checked
 regression tests ([VERIFICATION §4](VERIFICATION.md#4)). FREEZE now binds to one
 successor (no charter fork).
 
-**Residual risk — Medium.** Rotation safety is **bounded-checked only**, never
-size-free ([VERIFICATION §5](VERIFICATION.md#5)): 2 versions, 2 sigils, ≤ 4
-transitions, gens 0..1. Succession (dead-man takeover) is **unimplemented** (ROADMAP
-Phase 4 ⬜), so a constellation that dies strands its parcels — an AI adversary that
-can DoS a small constellation into death permanently freezes its value. BUG-2
-exploited the rotation seam specifically (fixed on main by seal settlement of
-CONTESTED records, in both the Python and the newly ported Rust witness).
+**Residual risk — Medium.** Rotation and succession safety are now TLAPS-proved
+for unbounded sizes ([VERIFICATION §1b, §1c](VERIFICATION.md)), on abstract models
+tied to the code by conformance tests and golden vectors. Succession (dead-man
+takeover, SPEC §5.5) is implemented in Python and Rust: a charter may name a
+successor committee whose quorum stores every binding before a vote is created and
+signs the next version once the home is dead, safely even if it was only
+partitioned. What remains is liveness, and it moves the target: the committee's
+availability gates every vote of its home (an adversary that can DoS a committee
+quorum halts the home, and one that kills it for good halts the home for good),
+and a partition longer than `dead_man` retires a live home (safely). A committee
+with more than `f_k` Byzantine members can sign a successor at will, as a corrupt
+quorum can rotate. Standby members bound what one request can make them store
+(SPEC §5.5) and apply the same admission control as witnesses. BUG-2 exploited
+the rotation seam specifically (fixed on main by seal settlement of CONTESTED
+records, in both the Python and the Rust witness).
 
-**Mitigation:** **P2** extend the rotation proof toward more versions, including the
-new seal-settlement path; implement and model-check succession with partition
-tolerance (whitepaper §10.4).
+**Mitigation:** run committees on other operators and hosting than their home and
+size them for availability; rotate a home onto a new committee while the old one is
+healthy (SPEC §9); `dead_man` well above probe period, delay and clock drift
+(SPEC §5.5 L2).
 
 ---
 
@@ -513,6 +574,7 @@ in `sigil/`, per the task. `python3 -m unittest discover` stays green: 183 tests
 | BUG-5 | Medium–High (protocol: swap hostage) | **fixed** (per-party kill switches, withheld until the other side is bound; `abort` pulls ours) | multi-party flow; `sigil/swap.py`, `Wallet.abort` | A counter-party binds only the honest input and vanishes; no death proof can exist and expiry does not release a bound input, so the honest coin is locked indefinitely. | `Finding5SwapHostage` |
 | BUG-4 | Medium (policy evasion) | **fixed** (threshold on the payment total per asset; per-counter-party windows not done) | `sigil/wallet.py` `receive` | `deep_threshold` is applied per parcel, so splitting a payment into parcels just under it skips deep confirmation entirely. | `Finding4DeepConfirmSplit` |
 | BUG-2 | Medium (liveness / third-party griefing) | **fixed** in `91269ff`/`eca6edd` | `wallet.py` rule-3 release + `deep_confirm`, `witness.py` ADOPT | A witness within *f* lying on STATUS induced an honest owner to bind twice; after rotation the honestly sealed coin was CONTESTED and deep confirmation failed for an innocent holder. Now settled by seal. | `Finding2InducedEquivocation` (regression) |
+| BUG-7 | Medium (availability: storage) | **fixed** (ADOPT keeps each distinct entry once) | `Witness.adopt` (Python and Rust) | ADOPT concatenated the snapshots of every signer, and honest signers hand over the same entries, so each rotation multiplied a sigil's evidence log (and its FREEZE snapshot) by the number of signers: 8 → 8,192 entries after six rotations of n = 4. Found by the resource pass. | `Resources.test_rotation_does_not_multiply_evidence`, `StorageBounds.test_adopt_keeps_each_entry_once` |
 | BUG-3 | Low (robustness / contract) | **fixed** | `sigil/witness.py` `authorises` | A malformed non-dict `unlock` raises `AttributeError` (not caught) instead of `Rejected` from in-process `Witness.spend`; the HTTP server masks it as 400, no state mutated. | `Finding3MalformedLeak` |
 
 **Also reproduced here and fixed on main by the parallel wallet work (`91269ff`):**
@@ -583,9 +645,10 @@ Key results, independent of the exact counts:
 * **No conservation (S4) violation** in the honest payment fuzzer; BUG-1 is reached
   only by the deliberate `cache_attack`, i.e. it is a validator-cache defect, not a
   property of honest flows.
-* **Amplification** (resources): ~14 Ed25519 verifies/KiB of SPEND (≈ 2 s CPU per
-  1 MiB request); ≈ 800 KiB durable storage per SPEND (ratio ≈ 1.0); one ~1 MiB
-  gossip message registers a 14 000-witness charter.
+* **Amplification** (resources), at the time of the review: ~14 Ed25519 verifies/KiB
+  of SPEND (≈ 2 s CPU per 1 MiB request); ≈ 800 KiB durable storage per SPEND
+  (ratio ≈ 1.0); one ~1 MiB gossip message registers a 14 000-witness charter. All
+  three are now bounded ([§2.6](#26-resource-exhaustion-t5)).
 
 ---
 

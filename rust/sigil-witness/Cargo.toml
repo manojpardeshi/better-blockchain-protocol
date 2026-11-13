@@ -26,3 +26,6 @@ clap.workspace = true
 num-bigint-dig.workspace = true
 num-traits.workspace = true
 num-integer.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+tower-service.workspace = true

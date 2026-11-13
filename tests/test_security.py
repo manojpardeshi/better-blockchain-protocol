@@ -227,6 +227,7 @@ class SealFieldOverrideTests(unittest.TestCase):
         self.net = Network()
         self.X = self.net.create_constellation("orion")
         self.alice, self.bob = Wallet("alice", self.net, self.X), Wallet("bob", self.net, self.X)
+        self.alice.auto_prune = False   # the seals examined below belong to payments made in full
         self.usd = self.alice.issue("USD", 10)
 
     def _real_seal(self):
@@ -242,6 +243,7 @@ class SealFieldOverrideTests(unittest.TestCase):
     def test_entries_cannot_move_a_seal_to_another_constellation(self):
         evil = self.net.create_constellation("evil")
         mallory = Wallet("mallory", self.net, evil)
+        mallory.auto_prune = False   # an attacker keeps the history it wants to replay
         coin = mallory.issue("M", 1)
         tid = mallory.pay(Wallet("m2", self.net, evil), coin, 1)
         seal = next(s for s in mallory.dossier.seals.values() if s["tid"] == tid)

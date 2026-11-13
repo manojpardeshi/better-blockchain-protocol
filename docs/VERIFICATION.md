@@ -7,7 +7,8 @@ for a whole system; what follows is the honest decomposition.
 
 Three kinds of evidence, in decreasing order of strength:
 
-1. **Machine-checked proof, no size bounds** (TLAPS) — the core safety theorem.
+1. **Machine-checked proof, no size bounds** (TLAPS) — the core safety theorem,
+   also under charter rotation and constellation succession.
 2. **Exhaustive bounded model checking** (TLC) — features the proof abstracts
    away, on small instances, each with mutation tests that must fail.
 3. **Randomised conformance testing** — the real Python `Witness` is checked,
@@ -115,12 +116,125 @@ constellation whose charter chain is fixed (FREEZE binding one successor makes
 it the only verifiable chain). Not modelled: holder validation, expiry and
 time, the network, and wallets (see §2 and §3b for those).
 
+The resource bounds (SPEC §5.1 step 2a and the generation cap, §5.2 step 1a, §5.6
+admission control) leave the proof unchanged: each is a SPEND or RELEASE the witness
+declines, and in the model SPEND and RELEASE are actions that may simply not be
+taken, so every behaviour of the bounded witness is a behaviour of the spec. ADOPT
+now keeps each distinct log entry once; the model's log and snapshots are already
+sets (`lg`, `ld`, `sb`, `sd`), so the evidence ADOPT reads is the same set. The
+proof was re-run after the change (`SIGIL_ROT_PROOF=1 formal/check.sh`).
+
 TLC instances of the proved spec (`MC_rotp*.cfg`; `MC_rotp_cex.cfg`, the proved rule on
 the Bugs 3/4 instance, is opt-in via `SIGIL_TLC_EXTRA` as it takes over 20 minutes) check that it is non-vacuous
 (recovery after rotation, abstention, contested release, lone inheritance and
 seal settlement are all reachable) and that each condition of the rule is
 needed: removing the own-vote condition, the seal-settlement condition or the
 `top <= g + 1` guard, or using the first sibling rule, is caught.
+
+### 1c. Safety under constellation succession, unbounded (`formal/SigilSuccProofs.tla`)
+
+`SigilSuccProofs.tla` proves the same safety theorems under rotation **and
+constellation succession** (dead-man takeover, [SPEC §5.5](SPEC.md)), for any
+number of charter versions, witnesses per version, successor-committee members,
+sigils, transitions and generations, with keys re-used across versions and
+committees: **4,208 proof obligations, all checked by tlapm 1.6.0-pre with
+`--strict`**, none omitted, in about 16 minutes (970–994 s) from an empty
+fingerprint cache on 4 cores; the whole `SIGIL_SUCC_PROOF=1 formal/check.sh`
+run, with the base proof and the TLC instances, takes about 19 minutes.
+Run it with `SIGIL_SUCC_PROOF=1 formal/check.sh` (CI job `succession-proof`),
+which also runs its TLC instances.
+
+* `SpecSafety`, `SpecOneSealAcrossVersions` (seals of every version count,
+  those of a succeeded version included), `SpecDeathProofsSound` and
+  `SpecHonestNoEquiv`, as in §1b.
+* `OneSuccessor` / `OneSuccessorK`: the honest keys of a version (or of its
+  committee) sign at most one successor each, so two different successors never
+  both collect the authority's quorum, and the chain is the only one a holder
+  can verify, whether its next version came from a rotation or a succession.
+
+What is modelled, on top of §1b: every version may name a committee; MIRROR (an
+unfenced honest standby member stores any owner-authorised binding; anyone may
+push one); **mirror before vote** (an honest witness of a version with a
+committee creates a vote only if a committee quorum's honest members stored the
+binding); FENCE (a standby member signs a successor of its version and never
+mirrors for it again); STANDBY (a committee enters standby with the evidence its
+version's members adopt: a freezing quorum's snapshots, a fenced committee
+quorum's mirror logs, or anything for version 0); and ADOPT after a succession
+(from the mirror logs of a fenced committee quorum, plus anything its Byzantine
+members add). Rotation stays available for every version, and old members are
+never forced to stop: after a succession they keep voting (an old quorum that
+was merely partitioned comes back), subject only to their own discipline. The
+inductive invariant generalises the rotation proof's `Lineage` (the evidence any
+key adopted for a version covers every earlier version, by a freezing quorum's
+snapshots *or* a fenced committee quorum's mirror logs) and adds `MirVotes`
+(behind every honest vote of a version with a committee there is a mirror
+quorum), `StandbyLin` and `FenceShape`. Quorum intersection inside a committee
+is proved (`HonestInBothKQuorums`), not assumed.
+
+**Assumptions:** each version is fault-bounded as in §1b, and so is each
+committee a version names (`q_k = n_k − f_k`, at most `f_k` Byzantine,
+`CommitteesFaultBounded`); idealised cryptography; static corruption; and the
+operator who drives a rotation or succession hands the new members and the new
+committee the snapshots of the keys that signed (`_install` in
+`sigil/network.py` and `sigil/server.py`), as for ADOPT in §1b. **No timing
+assumption:** the dead-man period only decides when an honest standby member
+fences, and FENCE may happen at any time in the model, so a partition mistaken
+for death is covered. The heartbeat and dead-man machinery is liveness only.
+
+**The proved rules match the code** (Python reference and Rust port alike): the
+mirror-ack gate is checked when a vote is created and a refused SPEND stores
+nothing; a standby member stands by for one version at a time, mirrors only
+while unfenced, fences (durably) before it signs, and hands over its whole
+mirror log. The resource bounds of standby members (an authorisation of at most
+32 KiB, generations below 16, at most 4 transitions per sigil and generation,
+release entries only for bindings it holds with death proofs of at most 128
+KiB) are refusals of MIRROR, which the model allows not to happen, and the
+STANDBY handover keeps the evidence as a set, as the model does.
+`tests/test_succession_conformance.py` drives the real Python `Witness`,
+`Standby` and `Network` under randomised adversarial schedules (an owner who
+signs everything, a Byzantine witness, a Byzantine standby member in every
+committee that acknowledges without storing, acks replayed across a
+succession, old quorums coming back, crashes, rotations and takeovers) and
+checks the model's `MirVotes`, the fence, inheritance, `HonestNoEquiv`,
+`OneSealAcrossVersions` and `Safety` after every step: 25 × 45 steps by default
+(182 votes, 24 takeovers, 41 rotations, 4 late votes by old quorums); 60 × 80
+(539 votes, 76 takeovers, 85 rotations, 11 late votes) without violation. A
+witness that ignores mirror acks, and a standby member that stores after it
+fenced, are both caught. The Rust witness and standby member replay a 111-step
+golden-vector script of the reference byte for byte (`succession` in
+`rust/sigil-witness/tests/vectors.json`), and `bench/interop.py` runs a
+dead-man takeover of a mixed Rust+Python home by a mixed committee.
+
+TLC instances of the proved spec (`MC_succ*.cfg`, formal/README.md): instances A
+(5,764 states) and C (three versions: a rotation into a version with a
+committee, then its succession; 8,196 states) hold; removing mirror before vote,
+the fence, the committee quorum of a succession, or the history a committee
+must stand by with, is each caught; and probes show lone inheritance, contested
+records, late votes by the old quorum, successor seals and recovery through a
+succession are reachable. Instance B (`MC_succ.cfg`) is opt-in: it does not
+finish within the CI budget.
+
+The proof found one problem, in itself: the first complete draft stated four
+frame steps as `\A E, v1 \in Vers : ...`, which TLA+ reads as bounding the
+evidence `E` by `Vers` too, so nine obligations failed; quantifying `E`
+unboundedly fixed them. No protocol or code bug was found by the succession
+proof. Reviewing the code against the proved rules found one: the mirror-ack
+gate failed open when a witness's registry lacked its own charter version (a
+member of a version with a committee restarted with a registry file nobody
+updated): it found no committee and voted without acks, which the model does
+not allow. It now creates no vote until it knows its charter (Python and Rust,
+`test_a_witness_without_its_own_charter_votes_on_nothing` and
+`without_its_own_charter_nothing_is_voted_or_signed`).
+
+**Code that stores less than the model.** ADOPT keeps in the new record's log
+only verified bind entries and the verified releases and seals of transactions
+bound in the evidence (SPEC §5.4). The proved spec keeps every entry it
+models, so the code may forward fewer releases or seals than the model. Every
+such entry was either unverifiable (never modelled) or about a transaction no
+binding in that evidence names, which no decision at that ADOPT reads; at a
+later ADOPT its absence is what the model produces when the Byzantine member
+that supplied it omits it, a run the proofs cover. The code therefore still
+refines the proved specs (rotation and succession).
 
 ---
 
@@ -190,7 +304,7 @@ to `FOREVER` (later than every expiry, no new signatures), so liveness
 counterexamples are not artefacts of the time bound.
 
 TLC checks are **bounded**: they establish safety only up to the stated sizes.
-The unbounded guarantee is the TLAPS proof (§1), which does not cover rotation.
+The unbounded guarantees are the TLAPS proofs (§1, and §1b and §1c for rotation and succession).
 
 ---
 
@@ -459,14 +573,78 @@ reporting `(gen, tid)`, as SPEC §9 says (code inspection, `MC_deep`,
 every input is sealed), but W5 lets a counter-party substitute the body; and
 two protocol-level gaps remain (below).
 
+## 4c. Integration tests on real processes (all bugs fixed)
+
+Three suites in `tests/integration/` run the daemons as separate processes
+(Rust and Python witnesses and standby members, mixed) and drive them with real
+wallets over HTTP. They are not part of the default `unittest discover`; CI's
+`integration` job runs all three (with a 180 s soak), and `chaos.yml` runs a
+60-minute seeded chaos run nightly.
+
+* **End-to-end** (`test_*.py`, fixtures `harness.py`): payments, the CLI,
+  double spends, gossip, persistence, crash recovery, rotation, succession,
+  swaps and admission control, each followed by global end-state invariants.
+* **Soak and compatibility** (`test_soak.py`, `test_store_compat.py`,
+  `test_wire_compat.py`, `test_daemon_ops.py`): four constellations under
+  load with rotations every 60 s and a dead-man takeover mid-run, recording
+  memory, file descriptors, store growth and latency (30- and 45-minute runs:
+  no leaks, flat witness latency); restarts on SQLite and redb stores, legacy
+  store and wallet formats; Rust and Python twins answering the same 470-odd
+  wire cases identically for every WIRE.md endpoint; daemon signals and bad
+  configurations.
+* **Fault injection** (`chaos/`): a fault-injecting proxy in front of every
+  process (drops, lost replies, delays past the timeout, duplicates, held
+  requests, partitions, SIGKILL before, during and after a request), clock
+  skew through an LD_PRELOAD shim, disk-full episodes, Byzantine witnesses
+  within *f*, interrupted rotations and successions. Safety invariants are
+  checked over every vote seen (no sigil consumed twice, one sealed tid per
+  `(sigil, gen)`, no honest equivocation, no vote lost by a restart, no vote
+  after a released pledge's expiry), plus wallet-level conservation. In about
+  2.1 hours of seeded runs (1,660 SIGKILLs, 705,000 proxied requests) there
+  was **no safety violation**. Mutated witnesses (Python and Rust: not
+  persisting before answering, not checking expiry) and Byzantine faults
+  beyond *f* are caught, which shows the invariants are not vacuous.
+
+They found eighteen bugs, none of them a safety violation of the witness
+protocol; each was pinned as an expected failure, shown to fail on the old
+code, and now runs as a regression test.
+
+| Suite | Bug | Fix |
+|---|---|---|
+| e2e | `abort` dropped a pledge when no witness had released | gossips the proof's charters first; frees the input only once a quorum answers unbound at ≤ *g*+1 |
+| e2e | a spent payment was re-credited while most of its home was down | `receive` fails closed: a quorum must answer, and a parcel the dossier shows consumed is refused |
+| e2e | the CLI could not spend in a home with a committee, or buy stamps | the directory takes a `committees` map; `buy-stamps` command |
+| e2e | a payment completed by a retry was never handed out | `pay` writes its payment file and lists it under `completed` |
+| e2e | an abort was lost across a succession when the committee missed the release | the wallet keeps the death proof and presents it again to members still bound below the new generation |
+| e2e | `address --home` accepted untrusted constellations | refused; `trust` command |
+| soak | FREEZE froze for good for a malformed successor body | FREEZE checks the body can become a valid version *v*+1 (Python and Rust) |
+| soak | the Rust daemons answered `GET /v0/<name>` with an empty 405 | a JSON 404 `bad_request` |
+| soak | a negative or NaN `--rate-limit` turned admission control off | refused at argument parsing (0 still disables it) |
+| soak | the Python daemon reported bad configurations with a traceback | one line naming the problem |
+| soak | a wallet saved before `issued` existed rejected payments to addresses it gave out earlier | on legacy load, `sig(pk)` for a key no parcel uses yet is accepted once |
+| soak | every swap left a new one-unit kill-switch asset behind | the unit a swap returns is the next kill switch |
+| soak | a wallet's dossier kept the history of everything it ever spent | `Wallet.prune` after a payment is handed over; consumed sigils are remembered in `spent` |
+| chaos | a malformed STATUS reply from one Byzantine witness crashed honest wallets | `RemoteWitness.status` checks the shape; a bad reply counts as no answer |
+| chaos | a pledge released under §4 rule 3 came back after a succession (the committee had mirrored it) | rule 3 also asks every standby member (new `POST /v0/status` on standby members); the pledge stays and the wallet completes the transition |
+| chaos | a swap interrupted after its kill switches were released never settled | each party keeps the others' unlocks (`Wallet.cosign`); a kill switch already pledged to the same tid is re-signed; a settling transition is retried with the unlocks held |
+| chaos | a failed succession attempt fenced a minority and halted a live home | two-phase succession: `dead` in standby info is read first, SUCCEED sent only once a quorum agrees |
+
+The last two chaos fixes make the code stricter than the models (rule 3 asks
+more members before releasing; succession asks before signing), so the
+verified properties still cover it.
+
 ## 5. What is **not** verified (the honest gaps)
 
 The results above concern the **witness protocol and its abstract model** under
 **idealised cryptography**. None of the following is verified:
 
-* **Rotation is proved, but on an abstract model.** `SigilRotProofs.tla`
-  proves rotation safety for unbounded versions and sizes (§1b); the code is
-  linked to it by tests and golden vectors, not by a proof of the code itself.
+* **Rotation and succession are proved, but on abstract models.**
+  `SigilRotProofs.tla` and `SigilSuccProofs.tla` prove safety for unbounded
+  versions and sizes (§1b, §1c); the code is linked to them by conformance
+  tests and golden vectors, not by a proof of the code itself. The liveness of
+  succession (SPEC §5.5 L1–L3: the committee gates progress, no premature
+  takeover under the stated timing, recovery after death) is argued, tested
+  (`tests/test_succession.py`, `bench/interop.py`) and not proved.
 * **Wallet logic** is now model-checked on small instances (one parcel,
   ≤ 4 transitions, generations ≤ 2, `SigilWallet.tla`) and conformance-tested
   (§3b) — not proved for all sizes, and not composed with rotation (W9 was
@@ -492,14 +670,15 @@ The results above concern the **witness protocol and its abstract model** under
 * **Networking, the server, concurrency** (`sigil/server.py`, `sigil/gossip.py`,
   `witnessd.py`, the testnet): out of scope. The models deliver messages
   atomically as honest-witness actions.
-* **The Rust witness** (`rust/`): checked only against the Python reference by
-  golden vectors in its own CI job, not against the formal model.
+* **The Rust witness and standby member** (`rust/`): checked only against the
+  Python reference by golden vectors and interop runs in their own CI job, not
+  against the formal model.
 * **Liveness / availability**: only *safety* is addressed. Nothing here proves
   the protocol makes progress, resists censorship, or recovers funds in bounded
   time.
 * **Bounds are bounds**: the TLC results hold only up to the instance sizes in
-  the table; only the TLAPS theorem (§1) is size-free, and only for the
-  single-version witness.
+  the table; only the TLAPS theorems (§1, §1b, §1c) are size-free, and they
+  are about abstract models of the witness and standby protocols.
 
 "Bug-free" is therefore **not** claimed for any code. What is established is: the
 single-version witness protocol's core safety theorem holds for all sizes under
@@ -518,6 +697,9 @@ wallet bugs reproduced (§4b).
 ```sh
 # TLAPS unbounded proof + all bounded TLC models with mutation tests (~8 min):
 formal/check.sh
+# + the rotation proof and its instances (~40 min), the succession proof and its instances (~20 min):
+SIGIL_ROT_PROOF=1 formal/check.sh
+SIGIL_SUCC_PROOF=1 formal/check.sh
 # just the proof:
 formal/check.sh            # (TLAPS runs only with no config args)
 SIGIL_SKIP_TLAPS=1 formal/check.sh MC_rot.cfg MC_rot_mutant.cfg   # one TLC pair
@@ -527,12 +709,21 @@ SIGIL_TLC_EXTRA=MC_wallet_big.cfg formal/check.sh                # + the 5-min l
 
 # conformance of the real witness, and the rotation regression tests:
 python -m unittest tests.test_conformance
+# succession: conformance of the real Witness/Standby/Network, unit and adversarial tests
+python -m unittest tests.test_succession_conformance tests.test_succession tests.test_succession_wire
+SIGIL_SUCC_SEEDS=60 SIGIL_SUCC_STEPS=80 python -m unittest tests.test_succession_conformance
 SIGIL_CONFORMANCE_SEEDS=120 SIGIL_CONFORMANCE_STEPS=150 \
     python -m unittest tests.test_conformance.ConformanceTests
 
 # the wallet: conformance of the real Wallet, and the open bugs (expected failures)
 python -m unittest tests.test_wallet_conformance tests.test_wallet_findings
 SIGIL_WALLET_SEEDS=80 SIGIL_WALLET_STEPS=80 python -m unittest tests.test_wallet_conformance
+
+# integration suites on real processes (needs the Rust binary; ~20 min with the 180 s soak):
+cargo build --release --locked --manifest-path rust/Cargo.toml
+python -m unittest discover -s tests/integration -t .
+SIGIL_SOAK_SECONDS=1800 python -m unittest tests.integration.test_soak     # a long soak
+python -m tests.integration.chaos.run --seeds 1-70                        # a long chaos run
 ```
 
 Tooling: TLAPS (tlapm 1.6.0-pre, bundling Zenon/Z3/Isabelle) and TLC

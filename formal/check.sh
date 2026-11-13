@@ -5,12 +5,17 @@
 #   formal/check.sh MC.cfg ...      run only the given TLC configs (no TLAPS)
 #   SIGIL_SKIP_TLAPS=1 formal/check.sh      skip the TLAPS proof
 #   SIGIL_TLC_EXTRA="MC_proofs.cfg" formal/check.sh   add slow opt-in configs
+#   SIGIL_ROT_PROOF=1 formal/check.sh       + the rotation proof and its TLC instances
+#   SIGIL_SUCC_PROOF=1 formal/check.sh      + the succession proof and its TLC instances
 #
 # Two tools:
 #   * TLAPS (tlapm) machine-checks formal/SigilProofs.tla: an UNBOUNDED proof
 #     of the SPEC Section 8 safety theorem and both lemmas (Spec => []Safety)
 #     for arbitrary numbers of witnesses, sigils, transitions, generations and
-#     constellations. This is the real safety result.
+#     constellations. This is the real safety result. SigilRotProofs.tla
+#     (SIGIL_ROT_PROOF=1) proves it under charter rotation, and
+#     SigilSuccProofs.tla (SIGIL_SUCC_PROOF=1) under rotation and constellation
+#     succession (dead-man takeover, SPEC 5.5).
 #   * TLC exhaustively checks the bounded models (the original witness model,
 #     the proof's own non-vacuity instance, charter rotation, owner-signed
 #     expiry, deep confirmation and the wallet state machine) on small
@@ -20,6 +25,9 @@
 #   MC_multi*  -> MC_multi.tla      MC_proofs* -> MC_proofs.tla (needs TLAPS libs)
 #   MC_rot*    -> MC_rot.tla        MC_expiry* -> SigilExpiry.tla
 #   MC_deep*   -> SigilDeep.tla     MC_wallet* -> MC_wallet.tla (SigilWallet)
+#   MC_rotp_witness* -> MC_rotpw.tla   MC_rotp* -> MC_rotp.tla (SigilRotProofs)
+#   MC_succ_witness* -> MC_succw.tla   MC_succ_c* -> MC_succ3.tla
+#   MC_succ*   -> MC_succ.tla (SigilSuccProofs)
 #   everything else -> MC.tla
 #
 # Configs named *mutant* or *witness* are EXPECTED to report an invariant
@@ -42,7 +50,7 @@ TLA_URL="https://github.com/tlaplus/tlaplus/releases/download/v${TLA_VERSION}/tl
 # silently skips the proofs). Re-check both proofs with the new build, then
 # update the hash here and the cache key in .github/workflows/test.yml.
 TLAPM_VERSION="1.6.0-pre"
-TLAPM_SHA256="39620b869ed939d991f5e2c4d604d84d16c05c5dd95787a1e5f47da296746b7b"
+TLAPM_SHA256="6fc2162a8f02f6e7e2d8d71dbe0fb0ee4a547018d6e44bc158e26496ecf1a015"
 TLAPM_URL="https://github.com/tlaplus/tlapm/releases/download/${TLAPM_VERSION}/tlapm-${TLAPM_VERSION}-x86_64-linux-gnu.tar.gz"
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -106,14 +114,19 @@ prove() {   # machine-check one TLAPS proof module
 }
 
 # Only run the proofs when invoked with no explicit config list. The rotation
-# proof (SigilRotProofs.tla, ~3,500 obligations) and its TLC instances are long,
-# so they are opt-in: SIGIL_ROT_PROOF=1 runs both instead of the default TLC
-# configs (CI runs it in its own job).
+# proof (SigilRotProofs.tla, ~3,500 obligations), the succession proof
+# (SigilSuccProofs.tla, ~4,200 obligations) and their TLC instances are long,
+# so they are opt-in: SIGIL_ROT_PROOF=1 and SIGIL_SUCC_PROOF=1 each run a proof
+# and its instances instead of the default TLC configs (CI runs each in its own
+# job; both may be set together).
 if [[ $# -eq 0 && "${SIGIL_SKIP_TLAPS:-0}" != "1" ]]; then
     if [[ "$(uname -s)-$(uname -m)" == "Linux-x86_64" ]] && ensure_tlapm; then
         prove SigilProofs.tla
         if [[ "${SIGIL_ROT_PROOF:-0}" == "1" ]]; then
             prove SigilRotProofs.tla
+        fi
+        if [[ "${SIGIL_SUCC_PROOF:-0}" == "1" ]]; then
+            prove SigilSuccProofs.tla
         fi
     elif [[ "$(uname -s)-$(uname -m)" == "Linux-x86_64" ]]; then
         # On the platform tlapm supports, a missing prover is a failure, never
@@ -129,12 +142,27 @@ fi
 # ----------------------------------------------------------------- TLC configs
 if [[ $# -gt 0 ]]; then
     CONFIGS=("$@")
-elif [[ "${SIGIL_ROT_PROOF:-0}" == "1" ]]; then
-    # The rotation proof's TLC instances (slow; CI job rotation-proof).
-    CONFIGS=(MC_rotp.cfg MC_rotp_noown_mutant.cfg MC_rotp_resolve_mutant.cfg
-             MC_rotp_sibling_mutant.cfg MC_rotp_top_mutant.cfg
-             MC_rotp_witness.cfg MC_rotp_witness_abstain.cfg MC_rotp_witness_crel.cfg
-             MC_rotp_witness_lone.cfg MC_rotp_witness_resolve.cfg)
+elif [[ "${SIGIL_ROT_PROOF:-0}" == "1" || "${SIGIL_SUCC_PROOF:-0}" == "1" ]]; then
+    CONFIGS=()
+    if [[ "${SIGIL_ROT_PROOF:-0}" == "1" ]]; then
+        # The rotation proof's TLC instances (slow; CI job rotation-proof).
+        CONFIGS+=(MC_rotp.cfg MC_rotp_noown_mutant.cfg MC_rotp_resolve_mutant.cfg
+                  MC_rotp_sibling_mutant.cfg MC_rotp_top_mutant.cfg
+                  MC_rotp_witness.cfg MC_rotp_witness_abstain.cfg MC_rotp_witness_crel.cfg
+                  MC_rotp_witness_lone.cfg MC_rotp_witness_resolve.cfg)
+    fi
+    if [[ "${SIGIL_SUCC_PROOF:-0}" == "1" ]]; then
+        # The succession proof's TLC instances (CI job succession-proof): the proved
+        # spec on two small instances, one mutant per succession rule, and probes that
+        # its interesting states are reachable. MC_succ.cfg (instance B, which does not
+        # finish within the CI budget) is opt-in via SIGIL_TLC_EXTRA.
+        CONFIGS+=(MC_succ_a.cfg MC_succ_c.cfg
+                  MC_succ_a_nomirror_mutant.cfg MC_succ_a_nofence_mutant.cfg
+                  MC_succ_a_quorum_mutant.cfg MC_succ_c_standby_mutant.cfg
+                  MC_succ_witness_lone.cfg MC_succ_witness_contested.cfg MC_succ_witness_late.cfg
+                  MC_succ_witness_seal.cfg MC_succ_witness_recovery.cfg)
+    fi
+    CONFIGS+=(${SIGIL_TLC_EXTRA:-})
 else
     CONFIGS=(MC.cfg MC_all.cfg MC_lazy.cfg MC_mutant.cfg
              MC_multi.cfg MC_multi_all.cfg MC_multi_mutant.cfg
@@ -155,6 +183,9 @@ module_for() {   # map a config name to its TLA module
         MC_proofs*) echo MC_proofs.tla ;;
         MC_rotp_witness*) echo MC_rotpw.tla ;;
         MC_rotp*)   echo MC_rotp.tla ;;
+        MC_succ_witness*) echo MC_succw.tla ;;
+        MC_succ_c*) echo MC_succ3.tla ;;
+        MC_succ*)   echo MC_succ.tla ;;
         MC_rot*)    echo MC_rot.tla ;;
         MC_expiry*) echo SigilExpiry.tla ;;
         MC_deep*)   echo SigilDeep.tla ;;
@@ -167,9 +198,9 @@ for cfg in "${CONFIGS[@]}"; do
     name="$(basename "$cfg" .cfg)"
     case "$cfg" in /*) cfgpath="$cfg" ;; *) cfgpath="$HERE/$cfg" ;; esac
     module="$(module_for "$name")"
-    # MC_proofs* and MC_rotp* extend the TLAPS standard library (FiniteSetTheorems, TLAPS).
+    # MC_proofs*, MC_rotp* and MC_succ* extend the TLAPS standard library (FiniteSetTheorems, TLAPS).
     libarg=()
-    if [[ "$name" == MC_proofs* || "$name" == MC_rotp* ]]; then
+    if [[ "$name" == MC_proofs* || "$name" == MC_rotp* || "$name" == MC_succ* ]]; then
         if [[ -d "$STDLIB" ]] || ensure_tlapm; then
             libarg=("-DTLA-Library=$STDLIB")
         else

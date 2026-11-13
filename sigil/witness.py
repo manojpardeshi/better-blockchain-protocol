@@ -18,11 +18,12 @@ so a crash can never make it forget a vote and equivocate.
 
 from dataclasses import asdict, dataclass, field
 
-from .charter import Registry, charter_hash, sign_charter
+from .charter import MAX_CHARTER_BYTES, Registry, charter_body, charter_hash, quorum, sign_charter
 from .crypto import KeyPair
+from .encoding import canonical
 from .locks import evaluate
-from .model import sigil_of, transition_id, vote_payload
-from .proofs import proves_dead, verify_seal, verify_vote
+from .model import heartbeat_payload, sigil_of, transition_id, vote_payload
+from .proofs import acked_by, proves_dead, verify_seal, verify_vote
 from .stamps import StampMint
 from .store import WitnessStore
 
@@ -40,6 +41,29 @@ class Conflict(Rejected):
 
 
 CONTESTED = "!contested"
+
+# What one request can make a witness store (SPEC §5.1, §5.2). Each refusal is a
+# clean Rejected that changes nothing: declining to vote or to release is
+# abstention, which is always safe, so these bound storage without touching safety.
+MAX_AUTH_BYTES = 32 << 10    # enc({home, lock, salt, unlock, header}) of a SPEND
+MAX_PROOF_BYTES = 128 << 10  # enc(proof) of a RELEASE (a death proof for 128 witnesses fits)
+MAX_GEN = 16                 # a sigil is newly bound only below this generation (so at most 16 times)
+
+
+def _encoding(x):
+    """``enc(x)``, or a key unique to ``x`` if it has none (in-process callers only)."""
+    try:
+        return canonical(x)
+    except (ValueError, TypeError, RecursionError):
+        return id(x)
+
+
+def _too_big(x, limit: int) -> bool | None:
+    """Is ``enc(x)`` longer than ``limit`` bytes? None if ``x`` has no canonical encoding."""
+    try:
+        return len(canonical(x)) > limit
+    except (ValueError, TypeError, RecursionError):
+        return None
 
 
 @dataclass
@@ -166,7 +190,10 @@ class Witness:
         if req.get("home") != self.cid:
             raise Rejected("sigil does not live here")
         auth = {k: req.get(k) for k in ("home", "lock", "salt", "unlock", "header")}
-        bound = authorises(sigil, auth)
+        big = _too_big(auth, MAX_AUTH_BYTES)
+        if big:
+            raise Rejected("authorisation too large")
+        bound = authorises(sigil, auth) if big is not None else None
         if bound is None:
             raise Rejected("malformed request or lock not satisfied")
         gen, tid = bound
@@ -188,6 +215,13 @@ class Witness:
             # expired, an owner can safely conclude a failed spend is dead.
             if int(self.clock()) > auth["unlock"]["expires"]:
                 raise Rejected("authorisation expired")
+            # Each new binding is at a higher generation than the last (a release
+            # moves past it), so this bounds the bindings one sigil can collect. It
+            # reads our own counter, not the log: ADOPT evidence from a Byzantine
+            # predecessor can hold junk entries, but cannot raise a generation
+            # without the owner's signature or a valid death proof.
+            if gen >= MAX_GEN:
+                raise Rejected("generation limit reached for this sigil")
             rec.tid, rec.header = tid, auth["header"]
             rec.log.append({"kind": "bind", "gen": gen, "auth": auth})
         if rec.tid != tid:
@@ -195,6 +229,17 @@ class Witness:
         if rec.vote is None and rec.abstain:
             raise Rejected("this key already voted for another transition at this generation")
         if rec.vote is None:
+            # Mirror before vote (SPEC §5.5): a version with a successor committee
+            # never creates a vote that a committee quorum has not stored first, so
+            # any succession inherits it. Nothing is persisted on refusal. Without
+            # our own charter (a registry older than our store) we cannot tell
+            # whether acks are needed, so we create no vote at all.
+            if self.registry.charter(self.cid, self.version) is None:
+                raise Rejected("own charter version unknown")
+            committee = self.registry.committee(self.cid, self.version)
+            if committee is not None and len(acked_by(req.get("mirror"), committee, self.cid, self.version,
+                                                      sigil, gen, tid)) < quorum(len(committee)):
+                raise Rejected("needs mirror acks from a quorum of the successor committee")
             rec.vote = self._vote(sigil, gen, tid)
             rec.votes.append(rec.vote)
         if rec != old:
@@ -217,10 +262,13 @@ class Witness:
         if self.cid is None or self.frozen:
             raise Rejected("witness not active")
         rec = self.records.get(sigil)
-        if rec is not None and rec.tid == CONTESTED:
-            return self._release_contested(sigil, rec, proof)
         if rec is None or rec.tid is None:
             raise Rejected("nothing to release")
+        big = _too_big(proof, MAX_PROOF_BYTES)
+        if big is not False:
+            raise Rejected("death proof too large" if big else "invalid death proof")
+        if rec.tid == CONTESTED:
+            return self._release_contested(sigil, rec, proof)
         if not proves_dead(rec.header, rec.tid, proof, self.registry):
             raise Rejected("invalid death proof")
         rec = rec.copy()
@@ -297,6 +345,21 @@ class Witness:
             raise Rejected("this witness does not sell stamps")
         return self.stamps.sign_blinded(blinded)
 
+    def heartbeat(self, challenge) -> dict:
+        """Show a standby member that this witness is alive and voting (SPEC §5.5).
+
+        Only an active, unfrozen witness answers: a frozen one will never vote again.
+        The challenge is the standby member's own fresh string, so an answer cannot
+        be replayed later to fake liveness.
+        """
+        if self.cid is None or self.frozen:
+            raise Rejected("witness not active")
+        if not isinstance(challenge, str) or not 0 < len(challenge) <= 128:
+            raise Rejected("challenge must be a string of 1 to 128 characters")
+        h = {"constellation": self.cid, "version": self.version, "witness": self.pk, "challenge": challenge}
+        h["sig"] = self.kp.sign("heartbeat", heartbeat_payload(h))
+        return h
+
     # -------------------------------------------------------------- rotation
 
     def freeze(self, next_charter: dict) -> tuple[str, dict]:
@@ -306,8 +369,23 @@ class Witness:
         """
         if self.cid is None:
             raise Rejected("witness not active")
-        if next_charter["prev"] != charter_hash(self.registry.charter(self.cid, self.version)):
+        cur = self.registry.charter(self.cid, self.version)
+        if next_charter["prev"] != charter_hash(cur):  # not an object, or no prev: bad_request
             raise Rejected("charter does not extend ours")
+        # Freezing is irreversible, so only for a body that can become a valid version v+1:
+        # the same name, the next version, a well-formed witness list and successor clause
+        # (charter_body applies the size and uniqueness rules) and a charter within the cap.
+        try:
+            well_formed = (next_charter == charter_body(next_charter["name"], next_charter["version"],
+                                                        next_charter["witnesses"], next_charter["prev"],
+                                                        next_charter.get("successor"))
+                           and all(isinstance(k, str) for k in next_charter["witnesses"])
+                           and len(canonical({"body": next_charter, "sigs": {}})) <= MAX_CHARTER_BYTES)
+        except (KeyError, TypeError, ValueError, AttributeError):
+            well_formed = False
+        if (not well_formed or next_charter["name"] != cur["name"] or not isinstance(next_charter["version"], int)
+                or isinstance(next_charter["version"], bool) or next_charter["version"] != self.version + 1):
+            raise Rejected("not a valid next version of our charter")
         # We sign exactly one successor: signing two lets a quorum of honest
         # witnesses certify two conflicting version v+1 charters (a fork).
         h = charter_hash(next_charter)
@@ -332,16 +410,34 @@ class Witness:
         wire, ``/v0/adopt``), so malformed parts are skipped like any other
         unverifiable evidence: a snapshot that is not an object, a log that
         is not a list, and log entries that are not objects.
+
+        The new record's log keeps only the evidence that verified and bears
+        on a binding: bind entries with a valid authorisation, and release and
+        seal entries that verify for a transaction bound in this evidence.
+        Everything else (junk, other keys' votes, releases of transactions
+        nobody bound) is dropped, so a Byzantine predecessor cannot pad a
+        sigil's log for every later version.
         """
         self._check_member(cid, version)
         records: dict[str, Record] = {}
         evidence: dict[str, list] = {}
+        seen: dict[str, set] = {}  # per sigil, the encodings of the entries kept so far
         for snap in snapshots:
             if not isinstance(snap, dict):
                 continue
             for sigil, log in snap.items():
-                if isinstance(log, list):
-                    evidence.setdefault(sigil, []).extend(e for e in log if isinstance(e, dict))
+                if not isinstance(log, list):
+                    continue
+                # The evidence is a set: honest predecessors hand over the same
+                # entries, and without dropping repeats each rotation would
+                # multiply a sigil's log by the number of signers.
+                kept, have = evidence.setdefault(sigil, []), seen.setdefault(sigil, set())
+                for e in log:
+                    if isinstance(e, dict):
+                        k = _encoding(e)
+                        if k not in have:
+                            have.add(k)
+                            kept.append(e)
         for sigil, log in evidence.items():
             binds: dict[tuple, dict] = {}   # (gen, tid) -> header
             dead: set[str] = set()          # tids proven unsealable
@@ -349,6 +445,9 @@ class Witness:
             floor = 0                       # lowest generation still usable
             prior = self.records.get(sigil)
             own = {(v["gen"], v["tid"]): v for v in (prior.votes if prior else [])}  # votes our key cast
+            kept_binds: list = []           # verified entries, in log order
+            releases: list = []             # (tid, entry) whose death proof verified
+            seals: list = []                # ((gen, tid), entry) whose seal verified
             for e in log:
                 if e.get("kind") == "vote":
                     v = e.get("vote")
@@ -362,12 +461,14 @@ class Witness:
                     b = authorises(sigil, e.get("auth", {}))
                     if b is not None:
                         binds[b] = e["auth"]["header"]
+                        kept_binds.append(e)
                 elif e.get("kind") == "seal":
                     sl = e.get("seal")
                     try:
                         if (sl["sigil"] == sigil and sl["constellation"] == cid
                                 and verify_seal(sl, self.registry)):
                             sealed.add((sl["gen"], sl["tid"]))
+                            seals.append(((sl["gen"], sl["tid"]), e))
                     except (KeyError, TypeError):
                         pass
                 elif e.get("kind") == "release":
@@ -375,6 +476,7 @@ class Witness:
                     try:
                         if transition_id(h) == t and proves_dead(h, t, e.get("proof"), self.registry):
                             dead.add(t)
+                            releases.append((t, e))
                     except (KeyError, TypeError, ValueError):
                         pass
             for (g, t) in binds:
@@ -382,7 +484,14 @@ class Witness:
             # A death proof is a timeless fact about a transition, so it
             # retires that binding wherever it was reported.
             alive = {(g, t): h for (g, t), h in binds.items() if t not in dead}
-            rec = Record(gen=floor, log=log, votes=list(own.values()))
+            # Releases and seals only ever bear on bound transactions (they mark
+            # them dead or settled), and an honest witness logs one only for a
+            # transaction it bound, so those of unbound transactions are junk.
+            bound_tids = {t for (_g, t) in binds}
+            useful = {id(e) for e in kept_binds}
+            useful |= {id(e) for t, e in releases if t in bound_tids}
+            useful |= {id(e) for b, e in seals if b in binds}
+            rec = Record(gen=floor, log=[e for e in log if id(e) in useful], votes=list(own.values()))
             # A lone live binding (g, t) is inherited only if it is the top of
             # the evidence: every other binding, dead or alive, is at a LOWER
             # generation, and our own key never voted above g. Otherwise the log

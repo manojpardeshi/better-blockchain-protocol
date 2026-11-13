@@ -2,11 +2,22 @@
 //!
 //! ```text
 //! sigil-witness keygen  --out key.json
-//! sigil-witness genesis --name orion --keys k1.pub k2.pub k3.pub k4.pub --out registry.json
+//! sigil-witness genesis --name orion --keys k1.pub k2.pub k3.pub k4.pub --out registry.json \
+//!                       [--committee m1.pub m2.pub m3.pub m4.pub --dead-man SECONDS]
 //! sigil-witness run     --key key.json --registry registry.json --constellation <cid> \
 //!                       --store data.redb [--host 127.0.0.1] [--port 7000] [--stamps] \
-//!                       [--admin-token FILE] [--adopt]
+//!                       [--admin-token FILE] [--adopt] [--rate-limit R] [--rate-burst B]
+//! sigil-witness standby --key key.json --registry registry.json --constellation <cid> \
+//!                       --store standby.redb [--host 127.0.0.1] [--port 7100] [--wait] \
+//!                       [--admin-token FILE] [--members URL ...] [--probe-every S] \
+//!                       [--rate-limit R] [--rate-burst B]
 //! ```
+//!
+//! `standby` serves a member of a successor committee (SPEC §5.5): it mirrors bindings, probes
+//! the version's members (`--members`, every `--probe-every` seconds) and signs a successor when
+//! asked cooperatively or once the dead-man period has passed. A fresh store stands by for
+//! version 0 at once; with `--wait` it waits for `/v0/standby` with the handover of a later
+//! version. `/v0/standby`, `/v0/succeed` and `/v0/probe` need the token in `--admin-token FILE`.
 //!
 //! Every vote is made durable before it is sent, so the daemon may be killed at any moment,
 //! even with SIGKILL, and restarted on the same store.
@@ -15,17 +26,21 @@
 //! `<store>.stamps.json` (the reference's file and format), created on first use. A fresh
 //! store joins charter version 0; a new member of a later version is started with `--adopt`
 //! and waits for `/v0/adopt`. The rotation calls need the token in `--admin-token FILE`.
+//!
+//! A witness listening on a non-loopback `--host` limits each client to `--rate-limit` requests
+//! per second (default 20, bursts of `--rate-burst`, default 100; docs/WIRE.md "Admission
+//! control"); `--rate-limit 0` disables it. On loopback there is no limit unless asked for.
 
 use std::io::Write;
 use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
-use sigil_witness::charter::{constellation_id, short};
+use sigil_witness::charter::{constellation_id, short, Successor, MAX_WITNESSES};
 use sigil_witness::json::{obj, parse, Json};
 use sigil_witness::stamps::load_mint;
 use sigil_witness::store::Store;
 use sigil_witness::witness::system_clock;
-use sigil_witness::{load_admin_token, load_key, load_registry, server, write_private, KeyPair, Witness};
+use sigil_witness::{load_admin_token, load_key, load_registry, ratelimit, server, write_private, KeyPair, Standby, Witness};
 
 #[derive(Parser)]
 #[command(name = "sigil-witness", about = "Sigil v0 witness (Rust)", version)]
@@ -51,6 +66,45 @@ enum Cmd {
         /// Registry file (merged into if it exists).
         #[arg(long)]
         out: String,
+        /// Successor committee public keys (SPEC 5.5).
+        #[arg(long, num_args = 1..)]
+        committee: Vec<String>,
+        /// Dead-man period in seconds (with --committee).
+        #[arg(long)]
+        dead_man: Option<i64>,
+    },
+    /// Serve a successor-committee member (SPEC 5.5).
+    Standby {
+        #[arg(long)]
+        key: String,
+        #[arg(long)]
+        registry: String,
+        #[arg(long)]
+        constellation: String,
+        #[arg(long)]
+        store: String,
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+        #[arg(long, default_value_t = 7100)]
+        port: u16,
+        /// File holding the operator token that authorises /v0/standby, /v0/succeed, /v0/probe.
+        #[arg(long, value_name = "FILE")]
+        admin_token: Option<String>,
+        /// On a fresh store, wait for /v0/standby into a later charter version.
+        #[arg(long)]
+        wait: bool,
+        /// Member URLs to probe for heartbeats.
+        #[arg(long, num_args = 0..)]
+        members: Vec<String>,
+        /// Probe the members every this many seconds.
+        #[arg(long)]
+        probe_every: Option<f64>,
+        /// Requests per second per client (0: no limit; default 20 on a non-loopback host, none on loopback).
+        #[arg(long, value_name = "R", value_parser = parse_rate)]
+        rate_limit: Option<f64>,
+        /// Requests a client may burst above the rate.
+        #[arg(long, value_name = "B", default_value_t = ratelimit::DEFAULT_BURST)]
+        rate_burst: u32,
     },
     /// Serve a witness.
     Run {
@@ -75,6 +129,12 @@ enum Cmd {
         /// On a fresh store, do not join: wait for /v0/adopt into a later charter version.
         #[arg(long)]
         adopt: bool,
+        /// Requests per second per client (0: no limit; default 20 on a non-loopback host, none on loopback).
+        #[arg(long, value_name = "R", value_parser = parse_rate)]
+        rate_limit: Option<f64>,
+        /// Requests a client may burst above the rate.
+        #[arg(long, value_name = "B", default_value_t = ratelimit::DEFAULT_BURST)]
+        rate_burst: u32,
         /// Verify each signature on its own instead of Ed25519 batch verification.
         #[arg(long)]
         no_batch_verify: bool,
@@ -113,7 +173,34 @@ fn main() {
     let cli = Cli::parse();
     let r = match cli.cmd {
         Cmd::Keygen { out } => keygen(&out),
-        Cmd::Genesis { name, keys, out } => genesis(&name, &keys, &out),
+        Cmd::Genesis { name, keys, out, committee, dead_man } => genesis(&name, &keys, &out, &committee, dead_man),
+        Cmd::Standby {
+            key,
+            registry,
+            constellation,
+            store,
+            host,
+            port,
+            admin_token,
+            wait,
+            members,
+            probe_every,
+            rate_limit,
+            rate_burst,
+        } => standby(StandbyArgs {
+            key,
+            registry,
+            cid: constellation,
+            store,
+            host,
+            port,
+            admin_token,
+            wait,
+            members,
+            probe_every,
+            rate_limit,
+            rate_burst,
+        }),
         Cmd::Run {
             key,
             registry,
@@ -124,6 +211,8 @@ fn main() {
             stamps,
             admin_token,
             adopt,
+            rate_limit,
+            rate_burst,
             no_batch_verify,
             threads,
             unsafe_memory_store,
@@ -137,6 +226,8 @@ fn main() {
             stamps,
             admin_token,
             adopt,
+            rate_limit,
+            rate_burst,
             batch: !no_batch_verify,
             threads,
             memory: unsafe_memory_store,
@@ -157,7 +248,7 @@ fn keygen(out: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn genesis(name: &str, keys: &[String], out: &str) -> Result<(), String> {
+fn genesis(name: &str, keys: &[String], out: &str, committee: &[String], dead_man: Option<i64>) -> Result<(), String> {
     let pks = keys.iter().map(|k| read_pk(k)).collect::<Result<Vec<_>, _>>()?;
     let mut uniq = pks.clone();
     uniq.sort();
@@ -165,12 +256,31 @@ fn genesis(name: &str, keys: &[String], out: &str) -> Result<(), String> {
     if pks.is_empty() || uniq.len() != pks.len() {
         return Err("witness list must be non-empty and unique".into());
     }
-    let body = obj([
+    if pks.len() > MAX_WITNESSES {
+        return Err(format!("a charter names at most {MAX_WITNESSES} witnesses"));
+    }
+    if committee.is_empty() != dead_man.is_none() {
+        return Err("--committee and --dead-man go together".into());
+    }
+    let mut body = obj([
         ("name", Json::str(name)),
         ("version", Json::Int(0)),
         ("witnesses", Json::Arr(pks.into_iter().map(Json::Str).collect())),
         ("prev", Json::Null),
     ]);
+    if let Some(d) = dead_man {
+        let ks = committee.iter().map(|k| read_pk(k)).collect::<Result<Vec<_>, _>>()?;
+        let succ = obj([
+            ("committee", Json::Arr(ks.into_iter().map(Json::Str).collect())),
+            ("dead_man", Json::Int(d as i128)),
+        ]);
+        Successor::parse(&succ).map_err(|_| {
+            format!("a committee is a list of 1..{MAX_WITNESSES} distinct keys and dead_man a positive integer")
+        })?;
+        if let Json::Obj(m) = &mut body {
+            m.insert("successor".into(), succ);
+        }
+    }
     let cid = constellation_id(&body);
     let mut reg = match std::fs::read(out) {
         Ok(b) => parse(&b).map_err(|e| format!("{out}: {e}"))?,
@@ -198,6 +308,8 @@ struct RunArgs {
     stamps: bool,
     admin_token: Option<String>,
     adopt: bool,
+    rate_limit: Option<f64>,
+    rate_burst: u32,
     batch: bool,
     threads: Option<usize>,
     memory: bool,
@@ -224,6 +336,10 @@ fn run(a: RunArgs) -> Result<(), String> {
     }
     w.batch_verify = a.batch;
     let w = Arc::new(w);
+    // Admission control (docs/WIRE.md): on by default unless we only listen on loopback.
+    let rate = a.rate_limit.unwrap_or(if ratelimit::is_loopback(host) { 0.0 } else { ratelimit::DEFAULT_RATE });
+    let limiter = if rate > 0.0 { Some(Arc::new(ratelimit::RateLimiter::new(rate, a.rate_burst)?)) } else { None };
+    let per_client = limiter.is_some().then_some(ratelimit::MAX_CLIENT_CONNECTIONS);
 
     let mut rt = tokio::runtime::Builder::new_multi_thread();
     if let Some(n) = a.threads {
@@ -240,14 +356,73 @@ fn run(a: RunArgs) -> Result<(), String> {
             _ => println!("witness {} awaiting ADOPT into {} listening on http://{}:{}", short(&w.pk), short(cid), addr.ip(), addr.port()),
         }
         let _ = std::io::stdout().flush();
-        axum::serve(listener, server::router_with_admin(w.clone(), token))
-            .tcp_nodelay(true)
-            .with_graceful_shutdown(shutdown_signal())
+        server::serve(listener, server::router_with_limits(w.clone(), token, limiter), per_client, shutdown_signal())
             .await
             .map_err(|e| e.to_string())
     })?;
     drop(rt);
     store.close(); // flush every queued write before exiting
+    println!("stopped");
+    Ok(())
+}
+
+struct StandbyArgs {
+    key: String,
+    registry: String,
+    cid: String,
+    store: String,
+    host: String,
+    port: u16,
+    admin_token: Option<String>,
+    wait: bool,
+    members: Vec<String>,
+    probe_every: Option<f64>,
+    rate_limit: Option<f64>,
+    rate_burst: u32,
+}
+
+fn standby(a: StandbyArgs) -> Result<(), String> {
+    let (cid, host, port) = (a.cid.as_str(), a.host.as_str(), a.port);
+    let kp = load_key(&a.key)?;
+    let reg = load_registry(&a.registry)?;
+    if !reg.contains(cid) {
+        return Err(format!("constellation {cid} is not in {}", a.registry));
+    }
+    let token = a.admin_token.as_deref().map(load_admin_token).transpose()?;
+    let (store, loaded) = Store::open(&a.store)?;
+    let m = Arc::new(Standby::open(kp, reg, cid, store.clone(), loaded, system_clock(), a.wait)?);
+    let rate = a.rate_limit.unwrap_or(if ratelimit::is_loopback(host) { 0.0 } else { ratelimit::DEFAULT_RATE });
+    let limiter = if rate > 0.0 { Some(Arc::new(ratelimit::RateLimiter::new(rate, a.rate_burst)?)) } else { None };
+    let per_client = limiter.is_some().then_some(ratelimit::MAX_CLIENT_CONNECTIONS);
+    // The prober: challenge every member for a heartbeat every `probe_every` seconds.
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    if let (Some(every), false) = (a.probe_every.filter(|e| *e > 0.0), a.members.is_empty()) {
+        let (m, urls, stop) = (m.clone(), a.members.clone(), stop.clone());
+        std::thread::spawn(move || {
+            let tick = std::time::Duration::from_secs_f64(every);
+            while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                std::thread::sleep(tick);
+                m.probe(&urls);
+            }
+        });
+    }
+    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().map_err(|e| e.to_string())?;
+    rt.block_on(async {
+        let listener = tokio::net::TcpListener::bind((host, port)).await.map_err(|e| format!("{host}:{port}: {e}"))?;
+        let addr = listener.local_addr().map_err(|e| e.to_string())?;
+        let where_ = match m.member() {
+            Some((c, v)) => format!("{} v{v}", short(&c)),
+            None => format!("(awaiting STANDBY into {})", short(cid)),
+        };
+        println!("standby {} for {} listening on http://{}:{}", short(&m.pk), where_, addr.ip(), addr.port());
+        let _ = std::io::stdout().flush();
+        server::serve(listener, server::standby_router(m.clone(), token, limiter, a.members.clone()), per_client, shutdown_signal())
+            .await
+            .map_err(|e| e.to_string())
+    })?;
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    drop(rt);
+    store.close();
     println!("stopped");
     Ok(())
 }
@@ -265,5 +440,14 @@ async fn shutdown_signal() {
     #[cfg(not(unix))]
     {
         let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+/// A `--rate-limit`: a finite number of requests per second, at least 0 (0 means no limit). A
+/// negative or non-finite value is refused, so a typo cannot silently turn admission control off.
+fn parse_rate(v: &str) -> Result<f64, String> {
+    match v.trim().parse::<f64>() {
+        Ok(r) if r.is_finite() && r >= 0.0 => Ok(r),
+        _ => Err(format!("must be a finite number >= 0 (0 disables the limit), not {v:?}")),
     }
 }
