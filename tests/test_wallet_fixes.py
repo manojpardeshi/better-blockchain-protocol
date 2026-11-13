@@ -8,7 +8,10 @@ import unittest
 
 from sigil import InvalidDossier, KeyPair, Network, Wallet
 from sigil import model, wallet_store
-from sigil.witness import Witness
+from sigil.swap import propose_swap
+from sigil.wallet import SealFailed, request_seal
+from sigil.witness import MAX_GEN, Witness
+from tests.test_security import manual_spend
 
 
 class PledgePruneTests(unittest.TestCase):
@@ -109,6 +112,64 @@ class CharterMemberAnswerTests(unittest.TestCase):
         self.net.members[self.X] = [self.ws[0], self.ws[0], self.ws[1], self.ws[2]]
         with self.assertRaises(InvalidDossier):
             carol.deep_confirm(self.bob.dossier, [tid])
+
+
+class GenerationLimitTests(unittest.TestCase):
+    """A sigil is newly bound only below MAX_GEN: the wallet moves an aged coin to a fresh
+    address of its own (generation 0) before it gets there."""
+
+    def setUp(self):
+        self.net = Network()
+        self.X = self.net.create_constellation("orion")
+        self.alice = Wallet("alice", self.net, self.X)
+        self.bob = Wallet("bob", self.net, self.X)
+        self.usd = self.alice.issue("USD", 100)
+
+    def coin(self):
+        (h,) = [h for h in self.alice.holdings.values() if h["parcel"]["asset"] == self.usd]
+        return h
+
+    def test_threshold_is_below_the_limit(self):
+        self.assertLess(Wallet.REFRESH_GEN, MAX_GEN)
+
+    def test_aged_coin_is_refreshed_before_it_is_spent(self):
+        h = self.coin()
+        h["gen"] = Wallet.REFRESH_GEN  # as after that many aborts
+        old = h["sigil"]
+        self.alice.select(self.usd, 10)
+        new = self.coin()
+        self.assertNotEqual(new["sigil"], old)
+        self.assertEqual((new["gen"], new["parcel"]["amount"]), (0, 100))
+        self.assertIn(old, self.alice.spent)
+        self.alice.pay(self.bob, self.usd, 10)
+        self.assertEqual((self.alice.balance(self.usd), self.bob.balance(self.usd)), (90, 10))
+
+    def test_coin_one_below_the_limit_is_still_rescued(self):
+        h = self.coin()
+        h["gen"] = MAX_GEN - 1
+        self.alice.pay(self.bob, self.usd, 100)
+        self.assertEqual(self.bob.balance(self.usd), 100)
+
+    def test_abort_that_reaches_the_threshold_refreshes_the_coin(self):
+        Y = self.net.create_constellation("lyra")
+        mal = Wallet("mallory", self.net, Y)
+        gold = mal.issue("GOLD", 10)
+        self.coin()["gen"] = Wallet.REFRESH_GEN - 1
+        old = self.coin()["sigil"]
+        header, body, _ = propose_swap(self.alice, self.usd, 100, mal, gold, 10)
+        unlocks = {**self.alice.authorise(header, body), **mal.authorise(header, body)}
+        me = mal.address()
+        betrayal = manual_spend(mal, [body["inputs"][1]], [model.parcel(Y, gold, 10, me["lock"], me["salt"])])
+        request_seal(self.net, betrayal[3][0])
+        with self.assertRaises(SealFailed):
+            self.alice.seal(header, body, unlocks)
+        self.alice.abort(header)
+        new = self.coin()
+        self.assertNotEqual(new["sigil"], old)
+        self.assertEqual(new["gen"], 0)
+        self.assertNotIn(old, self.alice.pledged)
+        self.alice.pay(self.bob, self.usd, 100)
+        self.assertEqual(self.bob.balance(self.usd), 100)
 
 
 if __name__ == "__main__":

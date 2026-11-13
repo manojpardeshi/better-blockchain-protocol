@@ -17,7 +17,7 @@ from .network import Network
 from .proofs import proves_dead, verify_ack, verify_seal, verify_vote
 from .stamps import buy_stamp
 from .validate import Dossier, InvalidDossier, TrustPolicy, Verifier
-from .witness import CONTESTED, Conflict, Rejected
+from .witness import CONTESTED, MAX_GEN, Conflict, Rejected
 
 
 class SealFailed(Exception):
@@ -128,6 +128,12 @@ def _status(w, sigil: str) -> dict | None:
 
 
 class Wallet:
+    # A sigil is newly bound only below MAX_GEN (SPEC §5.1), and every abort moves a coin one
+    # generation on. From this generation the wallet moves the coin to a fresh address of its
+    # own (generation 0) before anything else, leaving room for the move itself to fail and be
+    # aborted a few times before the limit.
+    REFRESH_GEN = MAX_GEN - 4
+
     def __init__(self, name: str, network: Network, home: str | None = None, *, trusted=None,
                  deep_threshold: int | None = None, clock=None, pledge_ttl: int = 600,
                  max_skew: int = 120, on_pledge=None, deep_after_succession: bool = True):
@@ -462,8 +468,37 @@ class Wallet:
         if self.on_pledge is not None:
             self.on_pledge(self)
 
+    def refresh_aged(self, sigils=None) -> list:
+        """Move each coin at ``REFRESH_GEN`` or above to a fresh address of our own.
+
+        A coin aborted that often would soon reach MAX_GEN, where no witness binds it
+        again and the funds are stuck. The move is an ordinary spend to ourselves; if it
+        fails, the coin keeps its pledge and is settled like any other (a later call, e.g.
+        from ``select``, tries again). ``sigils`` limits it to those coins. Returns the
+        sigils moved.
+        """
+        moved = []
+        busy = {s for p in self.pending.values() for s, _g in p["header"]["inputs"]}
+        for h in list(self.holdings.values()):
+            s, p = h["sigil"], h["parcel"]
+            if (sigils is not None and s not in sigils) or h["gen"] < self.REFRESH_GEN or h["gen"] >= MAX_GEN:
+                continue
+            if s in self.pledged or s in busy or s in self.kill_switches:
+                continue
+            if p["lock"].get("op") != "sig" or p["lock"].get("pk") not in self.keys:
+                continue  # only a coin we can unlock alone
+            a = self.address(p["home"])
+            try:
+                self.transact([h["ref"]], [model.parcel(p["home"], p["asset"], p["amount"], a["lock"], a["salt"])],
+                              memo="refresh")
+            except (SealFailed, ValueError):
+                continue
+            moved.append(s)
+        return moved
+
     def select(self, asset: str, amount: int) -> tuple[list, int]:
         self.release_expired_pledges()
+        self.refresh_aged()
         picked, total = [], 0
         for h in sorted(self.holdings.values(), key=lambda h: -h["parcel"]["amount"]):
             if h["parcel"]["asset"] == asset and h["parcel"]["lock"]["op"] == "sig" and h["sigil"] not in self.pledged:
@@ -756,6 +791,8 @@ class Wallet:
             released.append(s)
         if not any(p[1] == tid for p in self.pledged.values()):
             self.pending.pop(tid, None)
+        # A coin that has now been aborted close to the generation limit moves on at once.
+        self.refresh_aged(set(released))
         return released
 
     def _represent_release(self, sigil: str, home: str, gen: int) -> None:
