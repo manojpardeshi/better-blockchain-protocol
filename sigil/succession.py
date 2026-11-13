@@ -25,7 +25,7 @@ below generation 16, and at most ``MAX_MIRROR_TIDS`` transitions per sigil and
 generation; a release entry needs a death proof of at most 128 KiB for a binding
 the member holds. Each refusal only withholds an ack (no ack, no vote), which
 costs liveness and never safety. The handover of STANDBY, like ADOPT, keeps every
-entry it is given, each distinct one once.
+verifiable entry it is given, each distinct one once, and drops the rest.
 """
 
 import json
@@ -37,7 +37,8 @@ from .encoding import canonical
 from .model import ack_payload, transition_id
 from .proofs import proves_dead, verify_heartbeat
 from .store import WitnessStore
-from .witness import MAX_AUTH_BYTES, MAX_GEN, MAX_PROOF_BYTES, Rejected, _encoding, _too_big, authorises
+from .witness import (MAX_AUTH_BYTES, MAX_GEN, MAX_PROOF_BYTES, Rejected, _encoding, _too_big, authorises,
+                      classify_evidence)
 
 # Distinct transitions a member mirrors per (sigil, generation). An honest owner binds
 # one transition per generation, and re-pledges another only after the first expired
@@ -188,9 +189,14 @@ class Standby:
                 return  # a retried STANDBY
             if self.cid != cid or not _is_int(version) or version <= self.version:
                 raise Rejected("already standing by for another version")
-        # Like ADOPT, the handover keeps every entry it is given whatever its size:
-        # dropping evidence could lose a sealed binding.
-        mirror = _members_snapshot_union(snapshots)
+        # Like ADOPT, the handover keeps every verifiable entry whatever its size (dropping
+        # evidence could lose a sealed binding), and nothing else: junk a Byzantine
+        # predecessor added would otherwise be handed on to every later committee.
+        mirror = {}
+        for sigil, log in _members_snapshot_union(snapshots).items():
+            kept = classify_evidence(sigil, log, cid, self.registry).kept
+            if kept:
+                mirror[sigil] = kept
         since = int(self.clock())
         self._persist(("standby", "", {"constellation": cid, "version": version, "since": since}),
                       *(("mirror", f"{version}|{s}", log) for s, log in mirror.items()))

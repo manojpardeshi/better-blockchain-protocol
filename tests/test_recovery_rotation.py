@@ -145,7 +145,8 @@ class RotationTests(unittest.TestCase):
         self.net.registry.add_chain(self.X, self.net.registry.chain(self.X) + [{"body": nxt, "sigs": sigs}])
         w = Witness(nxt_keys[0], self.net.registry, self.net.clock)
         w.adopt(self.X, 1, snaps)
-        self.assertEqual((w.records[fake_sigil].gen, w.records[fake_sigil].tid), (0, None))
+        self.assertNotIn(fake_sigil, w.records)  # nothing verifiable: no record (unbound at 0, as STATUS says)
+        self.assertEqual((w.status(fake_sigil)["gen"], w.status(fake_sigil)["tid"]), (0, None))
 
 
 if __name__ == "__main__":

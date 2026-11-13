@@ -26,6 +26,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from .charter import Registry, charter_body, charter_hash, quorum, successor_clause
 from .crypto import verify
+from .encoding import ADMIN_DEPTH, MAX_DEPTH, portable
 from .gossip import GossipStore
 from .ratelimit import (DEFAULT_BURST, DEFAULT_RATE, IDLE_TIMEOUT, MAX_CLIENT_CONNECTIONS, MAX_CONNECTIONS,
                         ConnectionLimiter, RateLimiter, client_key, is_loopback)
@@ -150,9 +151,16 @@ class WitnessServer:
                     n = int(self.headers.get("Content-Length", "0"))
                     if not 0 <= n <= (MAX_ADMIN_BODY if admin else MAX_BODY):
                         raise ValueError("body too large")
-                    body = json.loads(self.rfile.read(n) or b"{}")
+                    try:
+                        body = json.loads(self.rfile.read(n) or b"{}")
+                    except RecursionError:
+                        raise ValueError("invalid JSON: nesting too deep") from None
                     if not isinstance(body, dict):
                         raise ValueError("body must be an object")
+                    # Only what the Rust witness can represent too (WIRE.md "Portable JSON"):
+                    # neither kind ever stores what the other could not read in a handover.
+                    if not portable(body, ADMIN_DEPTH if admin else MAX_DEPTH):
+                        raise ValueError("invalid JSON: not portable (WIRE.md)")
                     result = server.dispatch(method, body)
                     self._reply(200, {"ok": result})
                 except Conflict as e:
@@ -374,6 +382,49 @@ def _vote_shaped(v) -> bool:
             and all(isinstance(v.get(k), str) for k in ("constellation", "witness", "sigil", "tid", "sig")))
 
 
+def portable_snapshot(snap) -> dict:
+    """A FREEZE or SUCCEED snapshot from an untrusted predecessor, reduced to what a handover
+    may carry (WIRE.md "Portable JSON"): only object entries that are portable where they will
+    sit in an ``/v0/adopt`` or ``/v0/standby`` body (``body.snapshots[i][sigil][j]``, four levels
+    down). An entry that is not could never verify at a witness of either kind (no witness ever
+    accepts a request holding one), while relaying it would make every Rust adopter refuse the
+    whole handover: one Byzantine predecessor could keep a rotation from ever completing."""
+    if not isinstance(snap, dict):
+        return {}
+    out = {}
+    for sigil, log in snap.items():
+        if not isinstance(sigil, str) or not isinstance(log, list) or not portable(sigil):
+            continue
+        kept = [e for e in log if isinstance(e, dict) and portable(e, ADMIN_DEPTH, 4)]
+        if kept:
+            out[sigil] = kept
+    return out
+
+
+def _handover_reply(url: str, out) -> tuple[str, dict]:
+    """``(sig, snapshot)`` of a FREEZE or SUCCEED reply, or Unreachable if it has the wrong shape."""
+    if not (isinstance(out, dict) and isinstance(out.get("sig"), str) and isinstance(out.get("snapshot"), dict)):
+        raise Unreachable(f"{url}: malformed handover reply")
+    return out["sig"], portable_snapshot(out["snapshot"])
+
+
+def _info_shaped(info, *, stamps: bool = True) -> bool:
+    """``/v0/info`` with the fields a client reads, of the right types."""
+    if not (isinstance(info, dict) and isinstance(info.get("pk"), str) and "constellation" in info and "version" in info
+            and (info.get("constellation") is None or isinstance(info.get("constellation"), str))
+            and (info.get("version") is None or _is_int(info.get("version")))):
+        return False
+    if not stamps:
+        return True
+    st = info.get("stamps")
+    if st is None:
+        return True
+    try:
+        return isinstance(st, dict) and int(st["n"], 16) > 0 and int(st["e"], 16) > 0
+    except (KeyError, TypeError, ValueError):
+        return False
+
+
 class RemoteWitness:
     """A witness reached over HTTP, with the same interface as ``Witness``."""
 
@@ -385,8 +436,10 @@ class RemoteWitness:
         self.admin_token = admin_token  # sent with the rotation calls only
         self.max_response = MAX_RESPONSE  # gossip pulls only: a peer cannot make us buffer more
         info = self._get("info")
+        if not _info_shaped(info):  # nothing a witness sends is trusted, its info included
+            raise Unreachable(f"{self.url}: malformed info reply")
         self.pk, self.cid, self.version = info["pk"], info["constellation"], info["version"]
-        self.stamps = _RemoteStamps(_pub_in(info["stamps"])) if info["stamps"] else None
+        self.stamps = _RemoteStamps(_pub_in(info["stamps"])) if info.get("stamps") else None
 
     def __repr__(self):
         return f"RemoteWitness({self.url}, {self.pk[:8]})"
@@ -395,8 +448,8 @@ class RemoteWitness:
         try:
             with urllib.request.urlopen(f"{self.url}/v0/{path}", timeout=self.timeout) as r:
                 return json.loads(r.read())["ok"]
-        except (urllib.error.URLError, OSError, ValueError) as e:
-            raise Unreachable(f"{self.url}: {e}") from e
+        except (urllib.error.URLError, OSError, ValueError, KeyError, TypeError, RecursionError) as e:
+            raise Unreachable(f"{self.url}: {e!r}") from e
 
     def _call(self, method: str, body: dict):
         headers = {"Content-Type": "application/json"}
@@ -410,13 +463,15 @@ class RemoteWitness:
         except urllib.error.HTTPError as e:
             try:
                 err = json.loads(e.read())
-            except ValueError:
+            except (ValueError, OSError, RecursionError):
+                raise Unreachable(f"{self.url}: HTTP {e.code}") from e
+            if not isinstance(err, dict):
                 raise Unreachable(f"{self.url}: HTTP {e.code}") from e
             if err.get("error") == "conflict":
                 raise Conflict(err.get("vote")) from e
-            raise Rejected(err.get("message", "rejected")) from e
-        except (urllib.error.URLError, OSError, ValueError) as e:
-            raise Unreachable(f"{self.url}: {e}") from e
+            raise Rejected(str(err.get("message", "rejected"))) from e
+        except (urllib.error.URLError, OSError, ValueError, KeyError, TypeError, RecursionError) as e:
+            raise Unreachable(f"{self.url}: {e!r}") from e
 
     def spend(self, req: dict) -> dict:
         return self._call("spend", {"request": req})
@@ -440,7 +495,11 @@ class RemoteWitness:
         return self._call("heartbeat", {"challenge": challenge})
 
     def sell_stamp(self, blinded: int) -> int:
-        return int(self._call("sell_stamp", {"blinded": format(blinded, "x")}), 16)
+        out = self._call("sell_stamp", {"blinded": format(blinded, "x")})
+        try:
+            return int(out, 16)
+        except (TypeError, ValueError) as e:
+            raise Unreachable(f"{self.url}: malformed stamp reply") from e
 
     def charters(self) -> dict:
         return self._get("charters")
@@ -448,8 +507,7 @@ class RemoteWitness:
     # Rotation (SPEC §5.4): operator calls, authorised by ``admin_token``.
 
     def freeze(self, next_charter: dict) -> tuple[str, dict]:
-        out = self._call("freeze", {"charter": next_charter})
-        return out["sig"], out["snapshot"]
+        return _handover_reply(self.url, self._call("freeze", {"charter": next_charter}))
 
     def adopt(self, cid: str, version: int, snapshots: list) -> None:
         out = self._call("adopt", {"constellation": cid, "version": version, "snapshots": snapshots})
@@ -496,6 +554,8 @@ class RemoteStandby(RemoteWitness):
         self.admin_token = admin_token
         self.max_response = MAX_RESPONSE
         info = self._get("info")
+        if not _info_shaped(info, stamps=False):
+            raise Unreachable(f"{self.url}: malformed info reply")
         self.pk, self.cid, self.version = info["pk"], info["constellation"], info["version"]
         self.stamps = None
 
@@ -515,8 +575,7 @@ class RemoteStandby(RemoteWitness):
         self.cid, self.version = out["constellation"], out["version"]
 
     def succeed(self, next_charter: dict, sigs: dict | None = None) -> tuple[str, dict]:
-        out = self._call("succeed", {"charter": next_charter, "sigs": sigs or {}})
-        return out["sig"], out["snapshot"]
+        return _handover_reply(self.url, self._call("succeed", {"charter": next_charter, "sigs": sigs or {}}))
 
     def probe(self, urls: list) -> int:
         return self._call("probe", {"urls": list(urls)})["answered"]
@@ -587,11 +646,13 @@ class RemoteNetwork:
                 chains = c.charters()
             except Unreachable:
                 continue
+            if not isinstance(chains, dict):
+                continue  # a malformed reply counts as no answer
             for other, chain in chains.items():
                 try:
                     self.registry.add_chain(other, chain)
-                except ValueError:
-                    pass  # invalid or forked chains are ignored, never trusted
+                except (ValueError, KeyError, TypeError, AttributeError, RecursionError):
+                    pass  # invalid, malformed or forked chains are ignored, never trusted
 
     def all_witnesses(self, cid: str) -> list:
         return [c for c in (self._client(u) for u in self.urls.get(cid, [])) if c is not None]

@@ -48,6 +48,7 @@ CONTESTED = "!contested"
 MAX_AUTH_BYTES = 32 << 10    # enc({home, lock, salt, unlock, header}) of a SPEND
 MAX_PROOF_BYTES = 128 << 10  # enc(proof) of a RELEASE (a death proof for 128 witnesses fits)
 MAX_GEN = 16                 # a sigil is newly bound only below this generation (so at most 16 times)
+MAX_GEN_VALUE = 1 << 62      # no authorisation names a generation at or above this (SPEC §5.1 step 3)
 
 
 def _encoding(x):
@@ -56,6 +57,10 @@ def _encoding(x):
         return canonical(x)
     except (ValueError, TypeError, RecursionError):
         return id(x)
+
+
+def _is_int(x) -> bool:
+    return isinstance(x, int) and not isinstance(x, bool)
 
 
 def _too_big(x, limit: int) -> bool | None:
@@ -94,7 +99,8 @@ def authorises(sigil: str, auth: dict) -> tuple[int, str] | None:
         if len(gens) != 1 or len(set(sigils)) != len(sigils):
             return None
         gen = gens[0]
-        if not isinstance(gen, int) or isinstance(gen, bool) or gen < 0:
+        # Below 2**62, as in the Rust witness: both must accept exactly the same evidence.
+        if not isinstance(gen, int) or isinstance(gen, bool) or not 0 <= gen < MAX_GEN_VALUE:
             return None
         exp = auth["unlock"].get("expires")
         if not isinstance(exp, int) or isinstance(exp, bool):
@@ -105,6 +111,78 @@ def authorises(sigil: str, auth: dict) -> tuple[int, str] | None:
         return gen, tid
     except (KeyError, TypeError, ValueError, AttributeError):  # e.g. a non-object unlock
         return None
+
+
+class Evidence:
+    """What a handover log of one sigil proves (SPEC §5.4), as ADOPT and STANDBY read it."""
+
+    def __init__(self):
+        self.binds: dict[tuple, dict] = {}   # (gen, tid) -> header, of verified bind entries
+        self.dead: set[str] = set()          # tids whose death proof verified
+        self.sealed: set[tuple] = set()      # (gen, tid) with a verified seal
+        self.votes: list = []                # verified votes of this constellation on the sigil
+        self.log: list = []                  # verified evidence bearing on a binding, in order
+        self.kept: list = []                 # ``log`` plus the verified vote entries, in order
+
+
+def classify_evidence(sigil: str, log: list, cid: str, registry, voter: str | None = None) -> Evidence:
+    """Verify each entry of a (deduplicated) handover log of ``sigil`` for constellation ``cid``.
+
+    Bind entries count if their authorisation passes §5.1 step 3 (with no clock); release
+    entries if their death proof verifies against their header; seal entries if the seal
+    verifies for this sigil and constellation; vote entries if the vote is a valid vote of
+    this constellation on this sigil. Releases and seals only ever bear on bound transactions
+    (an honest witness logs one only for a transaction it bound), so ``log`` keeps them only
+    for a transaction bound in this evidence; everything else is junk anyone could add.
+    With ``voter``, only that key's votes are checked and kept (ADOPT needs only its own).
+    """
+    ev = Evidence()
+    releases, seals, votes = [], [], []
+    for e in log:
+        kind = e.get("kind")
+        if kind == "vote":
+            v = e.get("vote")
+            try:
+                # A vote counts only if signed by a member of the version it names (or, for
+                # ADOPT, by our own key): anyone can mint keys and sign votes with them.
+                if ((v["witness"] == voter if voter is not None else
+                     (_is_int(v["version"]) and v["witness"] in ((registry.charter(cid, v["version"]) or {})
+                                                                  .get("witnesses", ()))))
+                        and v["sigil"] == sigil and v["constellation"] == cid and _is_int(v["gen"])
+                        and isinstance(v["tid"], str) and verify_vote(v)):
+                    ev.votes.append(v)
+                    votes.append(e)
+            except (KeyError, TypeError):
+                pass
+        elif kind == "bind":
+            b = authorises(sigil, e.get("auth", {}))
+            if b is not None:
+                ev.binds[b] = e["auth"]["header"]
+                ev.log.append(e)
+        elif kind == "seal":
+            sl = e.get("seal")
+            try:
+                if sl["sigil"] == sigil and sl["constellation"] == cid and verify_seal(sl, registry):
+                    ev.sealed.add((sl["gen"], sl["tid"]))
+                    seals.append(((sl["gen"], sl["tid"]), e))
+            except (KeyError, TypeError):
+                pass
+        elif kind == "release":
+            h, t = e.get("header"), e.get("tid")
+            try:
+                if transition_id(h) == t and proves_dead(h, t, e.get("proof"), registry):
+                    ev.dead.add(t)
+                    releases.append((t, e))
+            except (KeyError, TypeError, ValueError):
+                pass
+    bound_tids = {t for (_g, t) in ev.binds}
+    useful = {id(e) for e in ev.log}
+    useful |= {id(e) for t, e in releases if t in bound_tids}
+    useful |= {id(e) for b, e in seals if b in ev.binds}
+    ev.log = [e for e in log if id(e) in useful]
+    useful |= {id(e) for e in votes}
+    ev.kept = [e for e in log if id(e) in useful]
+    return ev
 
 
 class Witness:
@@ -439,69 +517,21 @@ class Witness:
                             have.add(k)
                             kept.append(e)
         for sigil, log in evidence.items():
-            binds: dict[tuple, dict] = {}   # (gen, tid) -> header
-            dead: set[str] = set()          # tids proven unsealable
-            sealed: set[tuple] = set()      # (gen, tid) with a verified seal in the evidence
-            floor = 0                       # lowest generation still usable
             prior = self.records.get(sigil)
+            ev = classify_evidence(sigil, log, cid, self.registry, voter=self.pk)
             own = {(v["gen"], v["tid"]): v for v in (prior.votes if prior else [])}  # votes our key cast
-            kept_binds: list = []           # verified entries, in log order
-            releases: list = []             # (tid, entry) whose death proof verified
-            seals: list = []                # ((gen, tid), entry) whose seal verified
-            for e in log:
-                if e.get("kind") == "vote":
-                    v = e.get("vote")
-                    try:
-                        if (v["witness"] == self.pk and v["sigil"] == sigil and v["constellation"] == cid
-                                and verify_vote(v)):
-                            own[(v["gen"], v["tid"])] = v
-                    except (KeyError, TypeError):
-                        pass
-                elif e.get("kind") == "bind":
-                    b = authorises(sigil, e.get("auth", {}))
-                    if b is not None:
-                        binds[b] = e["auth"]["header"]
-                        kept_binds.append(e)
-                elif e.get("kind") == "seal":
-                    sl = e.get("seal")
-                    try:
-                        if (sl["sigil"] == sigil and sl["constellation"] == cid
-                                and verify_seal(sl, self.registry)):
-                            sealed.add((sl["gen"], sl["tid"]))
-                            seals.append(((sl["gen"], sl["tid"]), e))
-                    except (KeyError, TypeError):
-                        pass
-                elif e.get("kind") == "release":
-                    h, t = e.get("header"), e.get("tid")
-                    try:
-                        if transition_id(h) == t and proves_dead(h, t, e.get("proof"), self.registry):
-                            dead.add(t)
-                            releases.append((t, e))
-                    except (KeyError, TypeError, ValueError):
-                        pass
+            for v in ev.votes:
+                own[(v["gen"], v["tid"])] = v
+            binds, dead, sealed = ev.binds, ev.dead, ev.sealed
+            if not ev.log and not own and prior is None:
+                continue  # nothing verifiable bears on this sigil: no record (no padding carried)
+            floor = 0                       # lowest generation still usable
             for (g, t) in binds:
                 floor = max(floor, g + 1 if t in dead else g)
             # A death proof is a timeless fact about a transition, so it
             # retires that binding wherever it was reported.
             alive = {(g, t): h for (g, t), h in binds.items() if t not in dead}
-            # Releases and seals only ever bear on bound transactions (they mark
-            # them dead or settled), and an honest witness logs one only for a
-            # transaction it bound, so those of unbound transactions are junk.
-            bound_tids = {t for (_g, t) in binds}
-            useful = {id(e) for e in kept_binds}
-            useful |= {id(e) for t, e in releases if t in bound_tids}
-            useful |= {id(e) for b, e in seals if b in binds}
-            rec = Record(gen=floor, log=[e for e in log if id(e) in useful], votes=list(own.values()))
-            # A lone live binding (g, t) is inherited only if it is the top of
-            # the evidence: every other binding, dead or alive, is at a LOWER
-            # generation, and our own key never voted above g. Otherwise the log
-            # cannot show which binding (if any) a quorum sealed, or we would
-            # step back below generations already used: a later release would
-            # re-open them (a second seal there, or our key voting twice). Such
-            # a record is contested instead, and the contested release moves it
-            # past every candidate and our own votes. A verified seal for (g, t)
-            # settles generation g itself (SPEC §8 Lemma 1), so siblings AT g
-            # are then allowed (W9).
+            rec = Record(gen=floor, log=list(ev.log), votes=list(own.values()))
             lone = False
             if len(alive) == 1:
                 (g, t), = alive

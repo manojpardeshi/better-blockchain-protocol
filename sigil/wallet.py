@@ -818,8 +818,13 @@ class Wallet:
 
     def buy_stamps(self, cid: str, count: int) -> None:
         for w in self.network.all_witnesses(cid):
-            if w.stamps is not None:
-                self.stamps[w.pk].extend(buy_stamp(w.stamps.public, w.sell_stamp) for _ in range(count))
+            if w.stamps is None:
+                continue
+            for _ in range(count):
+                try:
+                    self.stamps[w.pk].append(buy_stamp(w.stamps.public, w.sell_stamp))
+                except (Rejected, ValueError):
+                    break  # unreachable, or a bad blind signature: the other witnesses still sell
 
     def _stamp_for(self, w):
         pool = self.stamps.get(w.pk)

@@ -22,7 +22,7 @@
 //! [`MAX_MIRROR_TIDS`] transitions per sigil and generation; a release entry needs a death proof
 //! of at most [`MAX_PROOF_BYTES`] for a binding the member holds. Each refusal only withholds an
 //! ack (no ack, no vote), which costs liveness, never safety. The handover of STANDBY, like
-//! ADOPT, keeps every entry it is given, each distinct one once.
+//! ADOPT, keeps every verifiable entry it is given, each distinct one once, and drops the rest.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, RwLock};
@@ -34,7 +34,7 @@ use crate::json::{obj, Json};
 use crate::model::{ack_payload, transition_id};
 use crate::proofs::{proves_dead, verify_heartbeat};
 use crate::store::{Entry, Loaded, Store};
-use crate::witness::{authorises, Clock, Error, Outcome, MAX_AUTH_BYTES, MAX_GEN, MAX_PROOF_BYTES};
+use crate::witness::{authorises, classify_evidence, Clock, Error, Outcome, MAX_AUTH_BYTES, MAX_GEN, MAX_PROOF_BYTES};
 
 /// Distinct transitions a member mirrors per (sigil, generation) (`succession.MAX_MIRROR_TIDS`).
 /// Only the owner can authorise its sigil, so the cap only ever limits an owner flooding its own
@@ -293,9 +293,16 @@ impl Standby {
                 return rejected("already standing by for another version");
             }
         }
-        // Like ADOPT, the handover keeps every entry it is given whatever its size: dropping
-        // evidence could lose a sealed binding.
-        let mirror = snapshot_union(snapshots);
+        // Like ADOPT, the handover keeps every verifiable entry whatever its size (dropping
+        // evidence could lose a sealed binding), and nothing else: junk a Byzantine predecessor
+        // added would otherwise be handed on to every later committee.
+        let mirror: HashMap<String, Vec<Json>> = snapshot_union(snapshots)
+            .into_iter()
+            .filter_map(|(s, log)| {
+                let kept = classify_evidence(&s, log, cid, &registry, self.batch_verify, None).kept;
+                (!kept.is_empty()).then_some((s, kept))
+            })
+            .collect();
         let since = self.now();
         let mut entries: Vec<Entry> = Vec::with_capacity(mirror.len() + 1);
         entries.push((
