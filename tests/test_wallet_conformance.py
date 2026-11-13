@@ -466,6 +466,10 @@ class Universe:
             cur = now.get(s)
             if cur is not None and tuple(cur[:2]) == (g, t):
                 continue
+            if s in self.alice.spent and self.complete(t):
+                # Finalise: the model keeps the pledge beside fin = t, where it can never
+                # act again; the code forgets it once the sigil is recorded as spent.
+                continue
             if not self.unsealable(s, g, t):
                 raise ModelViolation(f"UnpledgeSound: dropped the pledge ({s[:8]},{g},{t[:8]}) "
                                      "while it could still be sealed")

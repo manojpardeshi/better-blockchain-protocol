@@ -184,10 +184,22 @@ class Wallet:
         """Trust another constellation (the owner's decision)."""
         self.policy.trust(cid)
 
-    def _size(self, cid: str) -> int:
-        """Members of a constellation's current charter (not just those reachable)."""
+    def _members(self, cid: str, *, reachable: bool = True) -> tuple[set, dict]:
+        """The keys of ``cid``'s current charter, and the listed witnesses claiming each.
+
+        Only a key of the current charter counts: a stale directory may still list
+        retired members, or list one member twice, and neither may stand in for a
+        current member's answer. Returns ``(keys, {pk: [witness, ...]})``; ``keys``
+        is empty if the charter is unknown.
+        """
         charter = self.network.registry.latest(cid)
-        return len(charter["witnesses"]) if charter else len(self.network.all_witnesses(cid))
+        keys = set(charter["witnesses"]) if charter else set()
+        src = self.network.witnesses(cid) if reachable else self.network.all_witnesses(cid)
+        by_pk: dict[str, list] = defaultdict(list)
+        for w in src:
+            if w.pk in keys and w not in by_pk[w.pk]:
+                by_pk[w.pk].append(w)
+        return keys, dict(by_pk)
 
     # ------------------------------------------------------------- receiving
 
@@ -239,11 +251,22 @@ class Wallet:
                 raise InvalidDossier("parcel was already spent")
             # Fail closed: "at most f report a binding" only means something when a
             # quorum answered; silent witnesses might be the ones holding it.
-            answers = [st for w in self.network.witnesses(p["home"]) if (st := _status(w, s)) is not None]
-            if len(answers) < quorum(self._size(p["home"])):
+            # One answer per distinct key of the home's current charter.
+            keys, members = self._members(p["home"])
+            if not keys:
+                raise InvalidDossier("the parcel's home has no known charter")
+            answered, bound = set(), set()
+            for pk, ws in members.items():
+                for w in ws:
+                    st = _status(w, s)
+                    if st is None:
+                        continue
+                    answered.add(pk)
+                    if st.get("tid") is not None:
+                        bound.add(pk)
+            if len(answered) < quorum(len(keys)):
                 raise InvalidDossier("too few of the parcel's witnesses answered to confirm it is unspent")
-            bound = sum(1 for st in answers if st.get("tid") is not None)
-            if bound > faults(self._size(p["home"])):
+            if len(bound) > faults(len(keys)):
                 raise InvalidDossier("parcel's sigil is already consumed")
             # Only the verified ancestry, and never over entries we already hold.
             self.dossier.merge(dossier.ancestry([r["tx"]]))
@@ -293,10 +316,8 @@ class Wallet:
                 heal = None if seal is None else {
                     "kind": "seal", "sigil": s, "gen": g, "seal": seal,
                     "parcel": {"home": p["home"], "lock": p["lock"], "salt": p["salt"]}}
-                ok = 0
-                for w in self.network.witnesses(home):
-                    if w.pk not in current:
-                        continue
+                ok = set()  # distinct current members vouching (a key listed twice counts once)
+                for w in (w for ws in self._members(home)[1].values() for w in ws):
                     st = _status(w, s)
                     if st is not None and st["tid"] == CONTESTED and heal is not None:
                         # After a rotation the evidence may not show which sibling
@@ -309,8 +330,8 @@ class Wallet:
                     if st is None:
                         continue
                     if st["gen"] == g and st["tid"] == tid:
-                        ok += 1
-                if ok <= faults(len(current)):
+                        ok.add(w.pk)
+                if len(ok) <= faults(len(current)):
                     raise InvalidDossier(f"deep confirmation failed for {s[:12]} in {tid[:12]}")
                 self._confirmed.add((s, g, tid))
 
@@ -613,6 +634,9 @@ class Wallet:
         for r, (s, _g) in zip(body["inputs"], header["inputs"]):
             self.holdings.pop(model.parcel_id(r), None)
             self.spent.add(s)
+            # A consumed sigil can never be signed for again (it is no longer held, and
+            # ``spent`` keeps it from being credited): its pledge has nothing left to guard.
+            self.pledged.pop(s, None)
         for i, o in enumerate(body["outputs"]):
             if model.sigil_of(o) in self.issued:
                 r = model.ref(tid, i)
@@ -641,6 +665,10 @@ class Wallet:
         newly bind the sigil; and every member of the home answered and
         none holds a binding or vote for it, nor (with a successor committee)
         does any standby member hold it in its mirror log.
+
+        "Every member" means one answer from each distinct key of the home's
+        *current* charter: an entry for a retired key, or a second entry for one
+        member, never stands in for a member that did not answer.
         """
         pledge = self.pledged.get(sigil)
         h = next((h for h in self.holdings.values() if h["sigil"] == sigil), None)
@@ -650,17 +678,17 @@ class Wallet:
         if int(self.clock()) <= expires + self.max_skew:
             return False  # a request still in flight could bind it
         home = h["parcel"]["home"]
-        answered = 0
-        for w in self.network.all_witnesses(home):
-            st = None if w.pk in self.network.down else _status(w, sigil)
-            if st is None:
-                return False  # unreachable: it might hold a vote
-            if (st["gen"] == gen and st["tid"] == tid) or any(
-                    v["gen"] == gen and v["tid"] == tid for v in st["votes"]):
-                return False
-            answered += 1
-        if answered < self._size(home):
-            return False  # some member could not even be contacted
+        keys, members = self._members(home, reachable=False)
+        if not keys or set(members) != keys:
+            return False  # some current member is not even listed
+        for ws in members.values():
+            for w in ws:  # every entry claiming the key must answer, and none may hold it
+                st = None if w.pk in self.network.down else _status(w, sigil)
+                if st is None:
+                    return False  # unreachable: it might hold a vote
+                if (st["gen"] == gen and st["tid"] == tid) or any(
+                        v["gen"] == gen and v["tid"] == tid for v in st["votes"]):
+                    return False
         # A binding the successor committee mirrored is inherited by the members of a
         # successor if the home is taken over (SPEC §5.4/§5.5): it is not dead either.
         charter = self.network.registry.latest(home)
@@ -709,9 +737,10 @@ class Wallet:
             # Drop the pledge only once the input is really spendable at g + 1: a
             # quorum of the home answers unbound at a generation <= g + 1. Otherwise
             # keep the pledge and the pending transition so abort can be retried.
-            free = sum(1 for w in self.network.witnesses(home)
-                       if (st := _status(w, s)) is not None and st["tid"] is None and st["gen"] <= pledge[0] + 1)
-            if free < quorum(self._size(home)):
+            keys, members = self._members(home)
+            free = {pk for pk, ws in members.items() for w in ws
+                    if (st := _status(w, s)) is not None and st["tid"] is None and st["gen"] <= pledge[0] + 1}
+            if not keys or len(free) < quorum(len(keys)):
                 continue
             # Best effort: tell the home's successor committee too, so a successor
             # sees the binding died instead of finding the sigil contested (SPEC §5.5).
