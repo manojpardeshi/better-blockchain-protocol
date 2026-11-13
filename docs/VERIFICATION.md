@@ -754,3 +754,31 @@ Tooling: TLAPS (tlapm 1.6.0-pre, bundling Zenon/Z3/Isabelle) and TLC
 (tla2tools 1.7.4), both downloaded on first use into `~/.cache/sigil-tla`,
 pinned and SHA-256-verified, over TLS. Linux x86_64 for the proof; TLC needs
 only Java ≥ 11.
+
+**Why tlapm is pinned to a rolling build, and how to re-pin it.** tla2tools
+1.7.4 is an immutable release, but tlapm has no stable release that can check
+these proofs: `1.6.0-pre` is a rolling pre-release whose tarball upstream
+rebuilds in place under the same URL. `formal/check.sh` therefore pins one
+specific build by its SHA-256 (`TLAPM_SHA256`) and fails closed: if upstream
+rebuilds the tarball, the download no longer matches, `check.sh` reports
+`TLAPS: FAIL` and exits non-zero. On Linux x86_64 (the platform CI runs on) a
+missing or mismatched prover is always a failure, never a skip, so a green CI
+run always means the proofs were machine-checked by the pinned build. Only an
+explicit `SIGIL_SKIP_TLAPS=1`, or a platform tlapm does not support, skips
+the proofs, and the latter says so. CI's `actions/cache` entry keeps the
+verified tarball, which shields runs from an upstream rebuild only while the
+cache lives; the hash check runs on every use regardless.
+
+To re-pin (after an upstream rebuild breaks CI, or to take a newer build):
+
+1. Download the new tarball and compute its SHA-256 (`sha256sum`).
+2. Set `TLAPM_SHA256` in `formal/check.sh` to it (and `TLAPM_VERSION` if the
+   release name changed), then re-prove every proof module locally with the
+   new build: `formal/check.sh` (SigilProofs), `SIGIL_ROT_PROOF=1
+   formal/check.sh` and `SIGIL_SUCC_PROOF=1 formal/check.sh`. All must check
+   with no failed obligation; a prover change that fails one is a finding to
+   investigate, never a reason to weaken a proof.
+3. Update the cache key in `.github/workflows/test.yml` (every
+   `tla2tools-…-tlapm-…-<first 12 hex digits of the hash>` key, one per
+   formal job), so CI does not reuse the old tarball, and commit the hash and
+   the keys together.
