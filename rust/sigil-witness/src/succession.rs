@@ -33,7 +33,7 @@ use crate::gossip::{check_message, CowRegistry, GossipStore};
 use crate::json::{obj, Json};
 use crate::model::{ack_payload, transition_id};
 use crate::proofs::{proves_dead, verify_heartbeat};
-use crate::store::{Entry, Loaded, Store};
+use crate::store::{charter_entries, charter_entry, restore_charters, Entry, Loaded, Store};
 use crate::witness::{authorises, Clock, Error, Outcome, MAX_AUTH_BYTES, MAX_GEN, MAX_PROOF_BYTES};
 
 /// Distinct transitions a member mirrors per (sigil, generation) (`succession.MAX_MIRROR_TIDS`).
@@ -173,7 +173,9 @@ impl Standby {
     /// fresh store stands by for version 0 at once if the key is in version 0's committee and
     /// the constellation has not rotated; otherwise (or with `wait`) it waits for `/v0/standby`
     /// with the handover of a later version.
-    pub fn open(kp: KeyPair, registry: Registry, cid: &str, store: Arc<Store>, loaded: Loaded, clock: Clock, wait: bool) -> Result<Standby, String> {
+    pub fn open(kp: KeyPair, mut registry: Registry, cid: &str, store: Arc<Store>, loaded: Loaded, clock: Clock, wait: bool) -> Result<Standby, String> {
+        // Charter chains learned before the restart: the registry file may predate them.
+        restore_charters(&mut registry, &loaded.charters);
         if !registry.contains(cid) {
             return Err(format!("constellation {cid} is not in the registry"));
         }
@@ -297,7 +299,10 @@ impl Standby {
         // evidence could lose a sealed binding.
         let mirror = snapshot_union(snapshots);
         let since = self.now();
-        let mut entries: Vec<Entry> = Vec::with_capacity(mirror.len() + 1);
+        let mut entries: Vec<Entry> = Vec::with_capacity(mirror.len() + 2);
+        // The charter chain of the version we stand by for: a restart from an older registry
+        // file must still know it.
+        entries.push(charter_entry(&registry, cid));
         entries.push((
             "standby".into(),
             String::new(),
@@ -561,10 +566,15 @@ impl Standby {
         let base = self.registry();
         let mut reg = CowRegistry::new(&base);
         let out = g.merge(&mut reg, msg, self.batch_verify).map_err(Error::BadRequest);
+        let mut seq = 0;
         if let Some(changed) = reg.into_changed() {
+            let entries = charter_entries(&base, &changed);
+            if !entries.is_empty() {
+                seq = self.store.submit(entries);
+            }
             *self.registry.write().expect("registry lock") = Arc::new(changed);
         }
-        (out, 0)
+        (out, seq)
     }
 
     /// `/v0/proofs`: `{proofs, forks}`.

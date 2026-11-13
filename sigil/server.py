@@ -212,7 +212,9 @@ class WitnessServer:
             if method == "sell_stamp":
                 return format(w.sell_stamp(int(body["blinded"], 16)), "x")
             if method == "gossip":
-                return self.gossip.merge(body)
+                out = self.gossip.merge(body)
+                w.remember_charters()  # a restart must not forget a version learned here
+                return out
         raise ValueError(f"unknown method {method!r}")
 
     def _admin(self, method: str, body: dict):
@@ -303,7 +305,9 @@ class StandbyServer(WitnessServer):
             if method == "status":
                 return s.status(body["sigil"])
             if method == "gossip":
-                return self.gossip.merge(body)
+                out = self.gossip.merge(body)
+                s.remember_charters()
+                return out
             if method == "standby":
                 if not isinstance(body["snapshots"], list):
                     raise ValueError("snapshots must be a list")

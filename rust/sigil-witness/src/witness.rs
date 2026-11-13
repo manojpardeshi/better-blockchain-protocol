@@ -27,7 +27,7 @@ use crate::locks::evaluate;
 use crate::model::{heartbeat_payload, sigil_of, transition_id, vote_payload};
 use crate::proofs::{acked_by, proves_dead, verify_seal, verify_vote};
 use crate::stamps::StampKey;
-use crate::store::{Entry, Loaded, Store};
+use crate::store::{charter_entries, charter_entry, restore_charters, Entry, Loaded, Store};
 
 pub const CONTESTED: &str = "!contested";
 
@@ -258,13 +258,15 @@ impl Witness {
     /// ADOPT (`witnessd run --adopt`). A store that already joined is restored either way.
     pub fn open_with(
         kp: KeyPair,
-        registry: Registry,
+        mut registry: Registry,
         cid: &str,
         store: Arc<Store>,
         loaded: Loaded,
         clock: Clock,
         adopt: bool,
     ) -> Result<Witness, String> {
+        // Charter chains learned before the restart: the registry file may predate them.
+        restore_charters(&mut registry, &loaded.charters);
         if !registry.contains(cid) {
             return Err(format!("constellation {cid} is not in the registry"));
         }
@@ -899,8 +901,10 @@ impl Witness {
             records.push((sigil, rec));
         }
         // Membership and inherited records land in one atomic batch: a crash must never leave
-        // us active but missing a binding.
-        let mut batch_entries: Vec<Entry> = Vec::with_capacity(records.len() + 1);
+        // us active but missing a binding. Our version's charter chain lands with it: a restart
+        // from an older registry file must still know the version we are a member of.
+        let mut batch_entries: Vec<Entry> = Vec::with_capacity(records.len() + 2);
+        batch_entries.push(charter_entry(&registry, cid));
         batch_entries.push(("member".into(), String::new(), Json::Arr(vec![Json::str(cid), Json::Int(version)])));
         batch_entries.extend(records.iter().map(|(s, r)| ("record".to_string(), s.clone(), r.to_json())));
         self.store.submit(batch_entries);
@@ -922,10 +926,16 @@ impl Witness {
         let base = self.registry();
         let mut reg = CowRegistry::new(&base);
         let out = g.merge(&mut reg, msg, self.batch_verify).map_err(Error::BadRequest);
+        let mut seq = 0;
         if let Some(changed) = reg.into_changed() {
+            // A restart must not forget a version learned here (durable before the answer).
+            let entries = charter_entries(&base, &changed);
+            if !entries.is_empty() {
+                seq = self.store.submit(entries);
+            }
             *self.registry.write().expect("registry lock") = Arc::new(changed);
         }
-        (out, 0)
+        (out, seq)
     }
 
     /// `/v0/proofs`: `{proofs, forks}`.

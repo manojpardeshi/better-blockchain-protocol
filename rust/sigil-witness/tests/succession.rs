@@ -197,6 +197,48 @@ fn without_its_own_charter_nothing_is_voted_or_signed() {
     assert_eq!(k.succeed(&w.next, None).0, Err(Error::Rejected("own charter version unknown".into())));
 }
 
+#[test]
+fn standby_member_keeps_its_charter_across_a_restart_with_an_old_registry_file() {
+    // Version 1 (with committee `<tag>c0..3`) is signed by v0's committee after a dead-man
+    // period. A member of the new committee learns it by gossip and stands by for it; restarted
+    // from the registry file of version 0 it still knows the version it stands by for.
+    let dir = TempDir::new("oldreg");
+    let w = world("deneb");
+    let now = Arc::new(AtomicI64::new(1_700_000_000));
+    let cpks = Json::Arr((0..4).map(|i| Json::str(key(&format!("denebc{i}")).pk)).collect());
+    let mut next = w.next.clone();
+    if let Json::Obj(m) = &mut next {
+        m.insert("successor".into(), obj([("committee", cpks), ("dead_man", Json::Int(DEAD))]));
+    }
+    let mut sigs = Vec::new();
+    for i in 0..3 {
+        let seed = format!("denebk{i}");
+        let k = Standby::open(key(&seed), w.reg.clone(), &w.cid, Store::memory(), Default::default(), clock(&now), false).unwrap();
+        now.fetch_add(DEAD as i64 + 1, Ordering::SeqCst);
+        let r = k.succeed(&next, None).0.unwrap();
+        sigs.push((key(&seed).pk, r.get("sig").unwrap().clone()));
+    }
+    let mut chain = w.reg.raw_chain(&w.cid).to_vec();
+    chain.push(obj([("body", next.clone()), ("sigs", Json::Obj(sigs.into_iter().collect()))]));
+
+    let p = dir.path("c0.redb");
+    let (store, loaded) = Store::open(&p).unwrap();
+    let c = Standby::open(key("denebc0"), w.reg.clone(), &w.cid, store, loaded, clock(&now), true).unwrap();
+    let msg = obj([("charters", obj([(w.cid.as_str(), Json::Arr(chain))]))]);
+    ok(c.gossip(&msg), &c.store);
+    ok(c.enter(&Json::str(&w.cid), &Json::Int(1), &[]), &c.store);
+    c.store.close();
+    drop(c);
+
+    let (store, loaded) = Store::open(&p).unwrap();
+    let c = Standby::open(key("denebc0"), w.reg.clone(), &w.cid, store, loaded, clock(&now), false).unwrap();
+    assert_eq!(c.member(), Some((w.cid.clone(), 1)));
+    assert_eq!(c.registry().chain(&w.cid).len(), 2);
+    now.fetch_add(DEAD as i64 + 1, Ordering::SeqCst);
+    assert!(c.dead(), "it knows version 1's charter, so it can watch it");
+    c.store.close();
+}
+
 async fn http(addr: std::net::SocketAddr, method: &str, path: &str, auth: Option<&str>, body: &str) -> (u16, Json) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();

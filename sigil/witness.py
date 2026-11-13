@@ -25,7 +25,7 @@ from .locks import evaluate
 from .model import heartbeat_payload, sigil_of, transition_id, vote_payload
 from .proofs import acked_by, proves_dead, verify_seal, verify_vote
 from .stamps import StampMint
-from .store import WitnessStore
+from .store import WitnessStore, charter_entries, restore_charters
 
 
 class Rejected(Exception):
@@ -120,6 +120,7 @@ class Witness:
         self.frozen = False
         self.frozen_for: str | None = None  # hash of the one successor charter we froze for
         self.records: dict[str, Record] = {}
+        self._charters_saved: dict[str, int] = {}  # cid -> chain length the store holds
         self.store = store
         if store is not None:
             self._restore()
@@ -132,6 +133,8 @@ class Witness:
             self.store.append([("pk", "", self.pk)])
         elif state["pk"] != self.pk:
             raise ValueError("store belongs to a different witness key")
+        # Charter chains learned before the restart: the registry file may predate them.
+        self._charters_saved = restore_charters(self.registry, state.get("charters", {}))
         if state["member"] is not None:
             self.cid, self.version = state["member"]
         # Stores written before successor binding hold ``true``: the successor
@@ -146,6 +149,16 @@ class Witness:
         """Make ``entries`` durable (no-op without a store). Callers mutate state only afterwards."""
         if self.store is not None:
             self.store.append(list(entries))
+
+    def remember_charters(self) -> None:
+        """Persist every charter chain our registry learned (by gossip or ADOPT) that the
+        store does not hold yet, so a restart from an older registry file still knows them."""
+        if self.store is not None:
+            saved = dict(self._charters_saved)
+            entries = charter_entries(self.registry, saved)
+            if entries:
+                self._persist(*entries)
+            self._charters_saved = saved
 
     @staticmethod
     def _rec(sigil: str, rec: Record) -> tuple[str, str, dict]:
@@ -521,7 +534,12 @@ class Witness:
                 rec.candidates = [[g, t, h] for (g, t), h in sorted(alive.items(), key=lambda kv: kv[0])]
             records[sigil] = rec
         # Membership and inherited records land in one atomic batch: a crash
-        # must never leave us active but missing a binding.
-        self._persist(("member", "", [cid, version]), *(self._rec(s, r) for s, r in records.items()))
+        # must never leave us active but missing a binding. The charter chains we
+        # know (our new version's among them) land with it: a restart from an older
+        # registry file must still know the version we are a member of.
+        saved = dict(self._charters_saved)
+        charters = charter_entries(self.registry, saved) if self.store is not None else []
+        self._persist(*charters, ("member", "", [cid, version]), *(self._rec(s, r) for s, r in records.items()))
+        self._charters_saved = saved
         self.cid, self.version = cid, version
         self.records.update(records)

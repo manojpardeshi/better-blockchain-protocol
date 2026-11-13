@@ -224,7 +224,16 @@ member of a version with a committee restarted with a registry file nobody
 updated): it found no committee and voted without acks, which the model does
 not allow. It now creates no vote until it knows its charter (Python and Rust,
 `test_a_witness_without_its_own_charter_votes_on_nothing` and
-`without_its_own_charter_nothing_is_voted_or_signed`).
+`without_its_own_charter_nothing_is_voted_or_signed`). Failing closed made such a member useless
+until someone gossiped the chain again, so the charter chains a witness or
+standby member learns (gossip, ADOPT, STANDBY) are now persisted in its store
+and merged into the registry file's at start (`tests/test_charter_memory.py`,
+Rust `adopted_member_votes_after_a_restart_with_an_old_registry_file`,
+`chain_learned_by_gossip_survives_a_restart`,
+`standby_member_keeps_its_charter_across_a_restart_with_an_old_registry_file`,
+and the restarts in the integration test of a cooperative rotation with a
+committee). A stored chain is verified again on load; one that does not
+verify or forks from the file's is ignored, which only fails closed again.
 
 **Code that stores less than the model.** ADOPT keeps in the new record's log
 only verified bind entries and the verified releases and seals of transactions

@@ -13,6 +13,10 @@ Kinds:
 * ``frozen``  -- hash of the successor charter the witness froze for (``true`` in older stores)
 * ``record``  -- key = sigil, value = the full ``Record`` as a dict
 * ``stamp``   -- key = a redeemed stamp serial
+* ``charter`` -- key = a constellation id, value = the longest verified charter
+  chain the witness learned for it (by gossip or ADOPT). A restarted witness
+  merges these into the registry file's chains, so it never starts with a
+  registry older than its own membership (stores written before have none)
 
 Each ``append`` is one transaction committed in WAL mode with
 ``synchronous=FULL``, so once it returns the rows survive a crash or power
@@ -60,10 +64,12 @@ class WitnessStore:
 
     def load(self) -> dict:
         """Replay the log into ``{pk, member, frozen, records, stamps}``."""
-        state = {"pk": None, "member": None, "frozen": False, "records": {}, "stamps": set()}
+        state = {"pk": None, "member": None, "frozen": False, "records": {}, "stamps": set(), "charters": {}}
         for kind, key, value in self.db.execute("SELECT kind, key, value FROM log ORDER BY seq"):
             v = json.loads(value)
-            if kind == "record":
+            if kind == "charter":
+                state["charters"][key] = v
+            elif kind == "record":
                 state["records"][key] = v
             elif kind == "stamp":
                 state["stamps"].add(key)
@@ -73,3 +79,32 @@ class WitnessStore:
 
     def close(self) -> None:
         self.db.close()
+
+
+def restore_charters(registry, charters: dict) -> dict:
+    """Merge the charter chains a store kept into ``registry``; returns ``{cid: length}`` kept.
+
+    Each chain is verified again on entry. One that does not verify, or forks from
+    the registry file's, is ignored: the registry stays as the file has it, and a
+    witness that then lacks its own charter version refuses to vote (fail closed).
+    """
+    saved = {}
+    for cid, chain in charters.items():
+        try:
+            registry.add_chain(cid, chain)
+        except (ValueError, KeyError, TypeError):
+            continue
+        saved[cid] = len(chain)
+    return saved
+
+
+def charter_entries(registry, saved: dict) -> list:
+    """``charter`` entries for every chain ``registry`` holds beyond what ``saved`` says the
+    store has (and updates ``saved``)."""
+    out = []
+    for cid in registry.ids():
+        chain = registry.chain(cid)
+        if len(chain) > saved.get(cid, 0):
+            out.append(("charter", cid, chain))
+            saved[cid] = len(chain)
+    return out

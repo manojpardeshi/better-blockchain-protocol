@@ -389,7 +389,7 @@ class LegacyStoreTests(unittest.TestCase):
         Python rows answers like the Python witness (checked above); here, the Python rows
         have exactly the kinds store.py documents."""
         kinds = {k for k, _, _ in self.L["rows"]}
-        self.assertLessEqual(kinds, {"pk", "member", "frozen", "record", "stamp"})
+        self.assertLessEqual(kinds, {"pk", "member", "frozen", "record", "stamp", "charter"})
 
 
 # ------------------------------------------------------------------ wallets

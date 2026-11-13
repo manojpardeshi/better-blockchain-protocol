@@ -36,7 +36,7 @@ from .crypto import KeyPair
 from .encoding import canonical
 from .model import ack_payload, transition_id
 from .proofs import proves_dead, verify_heartbeat
-from .store import WitnessStore
+from .store import WitnessStore, charter_entries, restore_charters
 from .witness import MAX_AUTH_BYTES, MAX_GEN, MAX_PROOF_BYTES, Rejected, _encoding, _too_big, authorises
 
 # Distinct transitions a member mirrors per (sigil, generation). An honest owner binds
@@ -51,15 +51,18 @@ class StandbyStore(WitnessStore):
 
     Kinds: ``pk``; ``standby`` (``{constellation, version, since}``); ``fenced``
     (``{constellation, version, charter}``: the successor it signed); ``mirror``
-    (key ``"<version>|<sigil>"``, value the mirror log of that sigil).
+    (key ``"<version>|<sigil>"``, value the mirror log of that sigil); ``charter``
+    (as ``WitnessStore``: a charter chain learned by gossip or STANDBY).
     """
 
     def load(self) -> dict:
-        state = {"pk": None, "standby": None, "fenced": None, "mirror": {}}
+        state = {"pk": None, "standby": None, "fenced": None, "mirror": {}, "charters": {}}
         for kind, key, value in self.db.execute("SELECT kind, key, value FROM log ORDER BY seq"):
             v = json.loads(value)
             if kind == "mirror":
                 state["mirror"][key] = v
+            elif kind == "charter":
+                state["charters"][key] = v
             elif kind in ("pk", "standby", "fenced"):
                 state[kind] = v
         return state
@@ -121,6 +124,7 @@ class Standby:
         self.fenced_for: str | None = None     # hash of the one successor we signed
         self.heard: dict[str, int] = {}        # member pk -> when it last answered our challenge
         self.since: int | None = None          # start of our observation window
+        self._charters_saved: dict[str, int] = {}  # cid -> chain length the store holds
         self.store = store
         if store is not None:
             self._restore()
@@ -133,6 +137,8 @@ class Standby:
             self.store.append([("pk", "", self.pk)])
         elif state["pk"] != self.pk:
             raise ValueError("store belongs to a different key")
+        # Charter chains learned before the restart: the registry file may predate them.
+        self._charters_saved = restore_charters(self.registry, state.get("charters", {}))
         sb = state["standby"]
         if sb is None:
             return
@@ -149,6 +155,16 @@ class Standby:
     def _persist(self, *entries) -> None:
         if self.store is not None:
             self.store.append(list(entries))
+
+    def remember_charters(self) -> None:
+        """Persist every charter chain our registry learned that the store does not hold yet
+        (as ``Witness.remember_charters``)."""
+        if self.store is not None:
+            saved = dict(self._charters_saved)
+            entries = charter_entries(self.registry, saved)
+            if entries:
+                self._persist(*entries)
+            self._charters_saved = saved
 
     def _set_mirrored(self, binds: set) -> None:
         self.mirrored, self._tids, self._by_sigil = set(), {}, {}
@@ -192,8 +208,11 @@ class Standby:
         # dropping evidence could lose a sealed binding.
         mirror = _members_snapshot_union(snapshots)
         since = int(self.clock())
-        self._persist(("standby", "", {"constellation": cid, "version": version, "since": since}),
+        saved = dict(self._charters_saved)
+        charters = charter_entries(self.registry, saved) if self.store is not None else []
+        self._persist(*charters, ("standby", "", {"constellation": cid, "version": version, "since": since}),
                       *(("mirror", f"{version}|{s}", log) for s, log in mirror.items()))
+        self._charters_saved = saved
         self.cid, self.version, self.since = cid, version, since
         self.mirror, self.fenced_for, self.heard = mirror, None, {}
         self._set_mirrored(_bindings(mirror))
