@@ -258,6 +258,12 @@ from TLC 1.8.0 on 4 cores. All of these run from `formal/check.sh`.
 | `MC_rot_sibling_v1_mutant` | `MC_rot.tla` | the first sibling rule (`AdoptMode = "sibling_v1"`) on an instance where a sealed generation lies above a lone binding | Ty, Tb, Tu, Tg | **violated (expected)**, Bugs 3/4 | — |
 | `MC_rot_sibling_top` | `MC_rot.tla` | the implemented rule (top of the evidence) on the same instance | Ty, Tb, Tu, Tg | opt-in (`SIGIL_TLC_EXTRA`): the state space exceeds the CI budget; `MC_rotp_cex` checks this instance in the proved spec, and `SigilRotProofs.tla` proves the rule for every instance | — |
 | `MC_rot_sibling_witness`, `…_witness2`, `…_witness3` | `MC_rot.tla` | non-vacuity: Tg completes after rotation; a contested record is released; a contested record is settled by a seal | same + Tg | **violated (expected)** | — |
+| `MC_ckpt` | `MC_ckpt.tla` (on `SigilRotProofs` via `MC_rotp`) | **compaction** (SPEC §5.7): settlement on completion certificates, an adversarial driver choosing any checkpoint set per charter, the signer rules at FREEZE, checkpointed sigils left out of snapshots and adopted from the set; Safety, cross-version Lemma 1, sound death proofs, honest non-equivocation, `CkSound` | 3 versions (v0 n=4 q=3 with eager Byz, v1 and v2 n=1), sigil s, Ta={(s,0)}, Tg={(s,1)}, gens 0..1 | hold | 6,508 (depth 19) |
+| `MC_ckpt_ks` *(opt-in)*, `MC_ckpt_sib` *(opt-in)* | `MC_ckpt.tla` | as `MC_ckpt`, on the kill-switch instance (Tb={(s,0),(x,0)}, Ty={(x,0)}) and on the four-transition rotation instance | sigils s, x | `MC_ckpt_ks`: KS_RESULT | — |
+| `MC_ckpt_forget_mutant` | `MC_ckpt.tla` | the adopter **forgets** checkpointed sigils (what "drop consumed records" would do) | as `MC_ckpt` | **violated (expected)**: v1 votes Tg on the consumed sigil, a double spend | 2,089 (depth 10) |
+| `MC_ckpt_noextend_mutant` | `MC_ckpt.tla` | no **extension rule**: a member freezes for a charter whose checkpoint drops a sigil it holds checkpointed | as `MC_ckpt` | **violated (expected)**: a double spend across three versions | 4,769 (depth 14) |
+| `MC_ckpt_nocheck_mutant`, `MC_ckpt_sealonly_mutant` | `MC_ckpt.tla` | members freeze without checking entries against their settled records / a witness settles on one input's seal instead of a completion certificate | as `MC_ckpt` / kill-switch instance | **violated (expected)**: `CkSound` (a checkpoint names a transition that is not complete, freezing the owner's sigil) | 727 / 28,141 |
+| `MC_ckpt_witness`, `MC_ckpt_witness2` | `MC_ckpt.tla` | non-vacuity: a checkpointed record reaches version 2; and v2 still seals transitions meanwhile | as `MC_ckpt` (+ Ty) | **violated (expected)** | — |
 | `MC_expiry` | `SigilExpiry.tla` | **owner-signed expiry** + the wallet unpledge rule: with drifting clocks and arbitrarily delayed requests, once the wallet drops a pledge the tid can never be sealed | n=4 q=3, skew 1, `max_skew` 2, time 0..7 | hold | 113,030 |
 | `MC_expiry_mutant`, `MC_expiry_skew_mutant` | `SigilExpiry.tla` | witness ignores expiry / wallet margin `max_skew < 2·skew` | same | **violated (expected)** | — |
 | `MC_deep` | `SigilDeep.tla` | **deep confirmation** (SPEC §9): `f+1` current-charter confirmations ⇒ the binding is real, against a retired-key forgery; and the true binding is always confirmable | current n=4 f=1, threshold 2 | hold | 4 |
@@ -284,6 +290,45 @@ are monotone in votes), and it also keeps the state space tractable. The
 adversarial *forged-snapshot* dimension of rotation (a lying predecessor
 handing new members fabricated logs) is exercised by the pre-existing Python
 explorer `tests/test_model_check_extended.py`, not re-modelled here.
+
+What the compaction model covers (`formal/MC_ckpt.tla`, SPEC §5.7,
+docs/COMPACTION.md). It reuses the proved rotation spec's actions (Spend,
+Release, the contested release and W9 seal settlement, the lone and contested
+ADOPT rules, own votes) and adds: `Settle` (a record is settled only on a
+completion certificate, and a settled record takes no further step), `Charter`
+(the driver fixes each version's checkpoint set, any set of input entries),
+`CFreeze` (the signer rules, the snapshot without the checkpointed sigils) and
+`CAdopt` (checkpoint entries become settled records with no log; snapshot
+entries for them, including what a Byzantine freezer adds, are ignored). Three
+versions are needed for the extension rule: a sigil checkpointed by v1 must
+still be covered when v1's members (whose records of it have no log) freeze for
+v2. Not modelled: succession (standby members carry the checkpoint set and apply
+the same extension rule at SUCCEED; a dead-man successor carries exactly the
+set), and re-used keys across the checkpoint (a checkpointed record keeps only
+its own vote for exactly its binding and never votes, so key re-use adds no
+step). Both rest on the refinement argument below.
+
+**Refinement argument (why the TLAPS theorems carry over).** Map a run of the
+protocol with settlement and checkpoints to a run of the uncompacted rotation and
+succession specs (`SigilRotProofs.tla`, `SigilSuccProofs.tla`) with the same
+witnesses, votes and charter chain, in which every log is kept in full. (1) A
+settled or checkpointed record creates no vote and takes no release: the abstract
+witness declines the same requests, which those specs allow at every step
+(declining is abstention). (2) For a sigil outside every checkpoint so far, the
+concrete records, logs and snapshots equal the abstract ones, by induction over
+versions: by the extension rule (enforced by every honest signer, and a quorum of
+signers contains one), a sigil outside `S_{v+1}` was outside `S_v`, so its
+evidence was handed over in full at every earlier rotation or succession, and
+FREEZE omits only sigils in the next set. (3) For a sigil inside `S_{v+1}` the
+concrete adopter holds a checkpointed record, which takes no step, while the
+abstract adopter holds whatever the full evidence gives and declines everything
+on that sigil. Hence the concrete vote set is a subset of an abstract run's vote
+set at every point. Safety, `OneSealAcrossVersions`, `DeathProofsSound` and
+`HonestNoEquiv` are properties of the vote set alone (seals and death proofs are
+defined from votes), so they hold for every compacted run. This is a paper
+argument, not a TLAPS proof; TLC checks the compacted spec directly on the
+instances above, and the two double-spend mutants show that steps (2) and (3)
+are where the argument needs the extension rule and the checkpoint set.
 
 What the wallet model covers (`formal/SigilWallet.tla`, SPEC §4, §5.1–5.2):
 one parcel of an honest wallet whose home has 3 honest witnesses and 1
@@ -628,6 +673,17 @@ code, and now runs as a regression test.
 | chaos | a pledge released under §4 rule 3 came back after a succession (the committee had mirrored it) | rule 3 also asks every standby member (new `POST /v0/status` on standby members); the pledge stays and the wallet completes the transition |
 | chaos | a swap interrupted after its kill switches were released never settled | each party keeps the others' unlocks (`Wallet.cosign`); a kill switch already pledged to the same tid is re-signed; a settling transition is retried with the unlocks held |
 | chaos | a failed succession attempt fenced a minority and halted a live home | two-phase succession: `dead` in standby info is read first, SUCCEED sent only once a quorum agrees |
+
+Compaction (SPEC §5.7, §6.1) added `tests/test_compaction.py` (settlement, forged and
+partial certificates, the signer rules, forged checkpoint sets at ADOPT, a lying predecessor
+handing over evidence for a checkpointed sigil or omitting a settled one, the extension rule
+at FREEZE and SUCCEED, standby restarts, delta dossiers and a hostile copy of a held
+transition), SETTLE/SETTLED cases in the wire-compatibility suite (both twins answer
+identically), a `compaction` golden-vector script, and handover, checkpoint and delta-dossier
+measurements in the soak (docs/BENCHMARKS.md). The first 600 s soak with it failed once at the
+takeover with a duplicate witness key in the successor charter: the harness picked ports with
+`free_port`, which only asks the OS, so two members could be assigned one port and answer with
+one key; `Cluster` now never hands out a port another member was given.
 
 The last two chaos fixes make the code stricter than the models (rule 3 asks
 more members before releasing; succession asks before signing), so the

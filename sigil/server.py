@@ -813,6 +813,7 @@ class RemoteNetwork:
             self._standbys.pop(url, None)
         self.urls[cid] = new_urls
         self.committees[cid] = committee_urls
+        self.last_handover = (snapshots, ck or [])  # for measurements (the soak test)
         if pending:
             e = RotationIncomplete(nxt["version"], pending)
             e.checkpoint = ck  # what a late ADOPT must be given with the snapshots

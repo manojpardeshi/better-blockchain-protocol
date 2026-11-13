@@ -108,7 +108,7 @@ class Cluster:
                 "name": f"{name}-{i}", "cid": cid, "key": k, "kind": kind,
                 "store": os.path.join(self.dir, "data", f"{name}-{i}.{ext}"),
                 "log": os.path.join(self.dir, "logs", f"{name}-{i}.log"),
-                "port": free_port(self.host), "args": list((extra_args or {}).get(kind, [])),
+                "port": self._port(), "args": list((extra_args or {}).get(kind, [])),
             })
         return cid
 
@@ -130,17 +130,27 @@ class Cluster:
                 "name": f"member-{n}", "cid": cid, "key": key, "kind": kind, "pending": True,
                 "store": os.path.join(self.dir, "data", f"member-{n}.{ext}"),
                 "log": os.path.join(self.dir, "logs", f"member-{n}.log"),
-                "port": free_port(self.host), "args": ["--adopt", *(extra_args or {}).get(kind, [])],
+                "port": self._port(), "args": ["--adopt", *(extra_args or {}).get(kind, [])],
             })
             out.append(n)
         return out
+
+    def _port(self) -> int:
+        """A free port no witness of this cluster was given: free_port only asks the OS, which
+        may hand back a port an earlier (stopped or not yet started) member was assigned, and
+        two members on one port answer with one key."""
+        taken = {w["port"] for w in self.witnesses}
+        while True:
+            p = free_port(self.host)
+            if p not in taken:
+                return p
 
     def _standby(self, name: str, cid: str, key: str, kind: str, args: list) -> dict:
         ext = "redb" if kind == "rust" else "db"
         return {"name": name, "cid": cid, "key": key, "kind": kind, "role": "standby",
                 "store": os.path.join(self.dir, "data", f"{name}.{ext}"),
                 "log": os.path.join(self.dir, "logs", f"{name}.log"),
-                "port": free_port(self.host), "args": list(args)}
+                "port": self._port(), "args": list(args)}
 
     def add_standbys(self, cid: str, kinds: list, extra_args: dict | None = None) -> list:
         """Standby members for the committee of a later charter version of ``cid``, started

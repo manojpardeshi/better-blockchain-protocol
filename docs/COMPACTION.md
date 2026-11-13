@@ -157,6 +157,12 @@ the same chain deep confirmation already trusts.
 
 ## 5. What it costs and what is left
 
+Measured (600 s soak, docs/BENCHMARKS.md "State growth under load"): rotation time stays at
+0.5–0.7 s instead of rising from 0.85 s to 2.5 s by the ninth rotation; the handover at the
+ninth rotation is 99.8 KB (708 checkpointed sigils); the new members' stores shrink about 7–9×;
+a payment hop carries 193 KB on average (median 10 KB) instead of 1.35 MB (median 1.15 MB),
+while a fresh holder still receives the whole history (3.5 MB on average in that run).
+
 * **Per consumed sigil after one checkpointed rotation:** ~135 B in `S` (one copy per
   adopter, not one per freezer), one hash for the whole set instead of 1–3 signature
   checks per entry, a ~150 B record. The total is still linear in consumed sigils (§2),
