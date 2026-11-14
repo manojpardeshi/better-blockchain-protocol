@@ -21,8 +21,9 @@ Do not publish those containers on an open network.
    operator calls. Bind it to loopback or a private interface, and put an
    authenticated, TLS protected transport in front of it before giving clients
    an outside URL. Keep the path from that transport to the daemon private.
-   Publish `https://` URLs in the client directory only after testing them
-   from another host. Do not send an admin bearer token across plain HTTP.
+   Publish `https://` URLs for Python wallets and `RemoteNetwork` in the
+   client directory only after testing them from another host. Do not send an
+   admin bearer token across plain HTTP.
    Restrict access to `/v0/freeze`, `/v0/adopt`, `/v0/standby`,
    `/v0/succeed` and `/v0/probe` at the network boundary as well as with
    each daemon's own `--admin-token FILE`. These calls can freeze or fence
@@ -85,6 +86,26 @@ Create a directory mapping `<cid>` to each operator's reachable `https://`
 URL, following [the wire format](WIRE.md#files). A successor committee needs
 its own independent keys, stores, endpoints and `committees` entry; see
 [succession](WIRE.md#succession). The local Compose fixture has no committee.
+
+### Rust standby heartbeat endpoints
+
+The Rust `sigil-witness standby` heartbeat client currently accepts only
+`http://` URLs. This applies to `--members URL ...` with `--probe-every S`
+and to URLs passed to its admin `/v0/probe` call. Those member URLs must be
+**private HTTP endpoints carried over an operator-controlled protected network
+or tunnel**, with the witness listener inaccessible from the public Internet.
+Keep the public wallet directory on HTTPS; it describes different endpoints
+for a different client. Supplying the directory's HTTPS URLs to a Rust standby
+will make its heartbeat probes fail, potentially causing a false dead-man
+observation. Do not substitute publicly reachable plain HTTP URLs.
+
+`RemoteNetwork.probe` sends the directory's member URLs to `/v0/probe`.
+Therefore it cannot be used as a liveness check for a Rust standby in this
+split-endpoint setup. For an operator check, call that standby's admin
+`/v0/probe` without `urls`; it uses the private `--members` list and returns
+`answered`. The Python standby uses
+`urllib.request` and can probe HTTPS URLs. This limitation remains until the
+Rust heartbeat client supports TLS.
 
 ## Testnet acceptance drills
 
