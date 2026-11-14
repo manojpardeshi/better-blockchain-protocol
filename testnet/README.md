@@ -79,4 +79,4 @@ docker compose down            # keeps keys and stores; `down -v` wipes them
 
 A one-shot `init` service (`testnet/docker-init.sh`) writes the keys, the genesis charter and the directory files into a shared `net` volume. Each witness keeps its store in its own volume (`data1` to `data4`). `directory.internal.json` lists the URLs for clients inside the compose network.
 
-For a testnet only: all private keys sit in one shared volume. A real deployment gives each witness only its own key.
+This Compose setup is for local experiments only: all private keys sit in one shared volume, every container can read them, and the witness rate limit is disabled. Do not publish its ports beyond loopback. For independently operated nodes, use the [operator testnet runbook](../docs/OPERATOR_TESTNET.md).

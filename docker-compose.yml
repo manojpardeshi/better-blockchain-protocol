@@ -7,13 +7,18 @@
 #
 # `init` creates the keys, the genesis charter and directory.json once, in the
 # shared `net` volume. Each witness keeps its durable store in its own volume.
-# Witnesses are published on host ports 7001-7004. See testnet/README.md.
+# Witnesses are published on host loopback ports 7001-7004. This compose file
+# is for local tests only: /net contains every witness private key, and the
+# clients share one bridge address, so the witness rate limit is disabled.
+# Do not expose these containers or reuse this topology for outside operators.
+# See testnet/README.md and docs/OPERATOR_TESTNET.md.
 #
 # Each witness listens on 0.0.0.0 inside its container, which turns on the per-client
 # rate limit by default (docs/WIRE.md "Admission control"). The ports are published on
 # 127.0.0.1 only and every host client reaches a container from the bridge's one
-# address, so this local testnet disables it with --rate-limit 0. Drop that flag (and
-# publish on a public address) to run the containers as open-network witnesses.
+# address, so this local testnet disables it with --rate-limit 0. Merely
+# removing that flag and publishing the ports does not make this deployment
+# suitable for an open network.
 
 x-witness: &witness
   build: .
