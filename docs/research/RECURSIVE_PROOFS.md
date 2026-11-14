@@ -304,4 +304,6 @@ rustup target add riscv32im-unknown-none-elf && python3 -m research.rv32_cycles.
 rustup toolchain install nightly && sh research/plonky2_pcd/run.sh 16                 # §6.1 (≈ 8 min)
 ```
 
-Note on the code base: at commit 4f52887 `locks.sign_unlock` requires `expires`, but `Wallet.authorise` doesn't pass it yet (its follow-up commit is pending). `research/_compat.py` detects exactly that state and patches a faithful copy of `authorise` that signs `expires = now + 3600`. It does nothing once the wallet is fixed. Nothing under `sigil/` was modified.
+The RV32 runner exits with an error and does not overwrite the result file if the guest fails or its statement digest differs from the Python reference. Run `python3 -m unittest research.rv32_cycles.test_run -v` to check that gate without rebuilding the guest.
+
+The current `Wallet.authorise` signs the unlock expiry directly; no compatibility patch is needed for the RV32 measurements. Nothing under `sigil/` is modified by these commands.
