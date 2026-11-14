@@ -77,18 +77,91 @@ class SettleTests(Base):
             with self.assertRaises(Rejected):
                 w.release(s, {"kind": "seal", "sigil": s, "gen": 0, "parcel": self.tgt(ps), "seal": seal})
 
-    def test_a_witness_that_never_saw_the_binding_settles_and_abstains(self):
+    def test_settle_needs_the_binding_it_settles(self):
+        """SETTLE never creates or changes a binding: a witness that never saw (s, 0, Ta)
+        refuses the certificate, and the sigil's record is untouched."""
         ps, s = self.parcel("s")
         Ta = self.hdr([(s, 0)], "a")
         ws = self.net.witnesses(self.X)
         seal = self.seal(Ta, s, ps, ws[:3])
         late = ws[3]
-        late.settle(self.cert(Ta, [(ps, seal)]))
-        self.assertIsNone(late.records[s].vote)
-        with self.assertRaises(Rejected):   # never a new vote, not even for the settled tid
-            late.spend(self.req(Ta, s, ps))
-        with self.assertRaises(Rejected):   # nor at a later generation (the owner re-spending)
-            late.spend(self.req(self.hdr([(s, 1)], "g"), s, ps))
+        with self.assertRaises(Rejected):
+            late.settle(self.cert(Ta, [(ps, seal)]))
+        self.assertNotIn(s, late.records)
+
+    def forge(self, keys, cid, version, sigil, gen, h):
+        votes = []
+        for kp in keys:
+            v = {"constellation": cid, "version": version, "sigil": sigil, "gen": gen,
+                 "tid": model.transition_id(h), "witness": kp.pk, "time": int(self.net.clock())}
+            v["sig"] = kp.sign("vote", model.vote_payload(v))
+            votes.append(v)
+        return model.seal_from_votes(votes)
+
+    def test_retired_keys_cannot_rebind_a_consumed_sigil(self):
+        """Review PoC1 (long-range forgery through SETTLE): s is sealed to Ta by version 0,
+        the home rotates, and the retired v0 keys sign (s, 0, Tb). Before the fix every v1
+        member settled at Tb, reported Tb in STATUS (deep confirmation then accepted the
+        forgery and refused Ta) and the next checkpoint carried [s, 0, Tb]."""
+        old = [w.kp for w in self.net.witnesses(self.X)]
+        ps, s = self.parcel("s")
+        Ta, Tb = self.hdr([(s, 0)], "a"), self.hdr([(s, 0)], "b")
+        self.seal(Ta, s, ps)
+        self.net.rotate(self.X, [KeyPair.generate() for _ in range(4)])
+        forged = self.forge(old[:3], self.X, 0, s, 0, Tb)
+        pf, f = self.parcel("fresh")                      # a sigil nobody spent yet
+        Tf = self.hdr([(f, 0)], "f")
+        forged_f = self.forge(old[:3], self.X, 0, f, 0, Tf)
+        for w in self.net.witnesses(self.X):
+            with self.assertRaises(Rejected):
+                w.settle(self.cert(Tb, [(ps, forged)]))
+            with self.assertRaises(Rejected):
+                w.settle(self.cert(Tf, [(pf, forged_f)]))
+            self.assertEqual((w.status(s)["gen"], w.status(s)["tid"]), (0, model.transition_id(Ta)))
+            self.assertNotIn(f, w.records)
+        self.seal(Tf, f, pf)                              # the fresh sigil is still spendable
+
+    def test_settle_never_rewinds_a_record(self):
+        """Review PoC2: an attacker-run second home seals both T (completing it) and Tk
+        (killing it); s is released from T and re-spent at generation 1 as T2. A certificate
+        for T must not rewind s from (1, T2) to (0, T)."""
+        Y = self.net.create_constellation("mallory", 4)
+        ps, s = self.parcel("s")
+        py, y = self.parcel("y", Y)
+        T, Tk = self.hdr([(s, 0), (y, 0)], "t"), self.hdr([(y, 0)], "k")
+        seal_s, seal_yT = self.seal(T, s, ps), self.seal(T, y, py)
+        cur = self.net.registry.latest(Y)["version"]
+        seal_yK = self.forge([w.kp for w in self.net.witnesses(Y)[:3]], Y, cur, y, 0, Tk)
+        ws = self.net.witnesses(self.X)
+        for w in ws:
+            w.release(s, {"kind": "seal", "sigil": y, "gen": 0, "parcel": self.tgt(py), "seal": seal_yK})
+        T2 = self.hdr([(s, 1)], "2")
+        self.seal(T2, s, ps)
+        for w in ws:
+            with self.assertRaises(Rejected):
+                w.settle(self.cert(T, [(ps, seal_s), (py, seal_yT)]))
+            self.assertEqual((w.status(s)["gen"], w.status(s)["tid"], w.records[s].settled),
+                             (1, model.transition_id(T2), 0))
+
+    def test_a_retired_foreign_seal_cannot_complete_a_dead_transition(self):
+        """Review finding 3: T = {(a, 0) here, (y, 0) at Y}; y was really consumed by Ty, so
+        T is dead and a must stay releasable (kill switch). Y rotates, and its retired keys
+        forge (y, 0, T): the certificate is refused (not Y's current version), and a is
+        released with Ty's seal."""
+        Y = self.net.create_constellation("lyra", 4)
+        pa, a = self.parcel("a")
+        py, y = self.parcel("y", Y)
+        T, Ty = self.hdr([(a, 0), (y, 0)], "t"), self.hdr([(y, 0)], "u")
+        seal_a = self.seal(T, a, pa)
+        seal_y = self.seal(Ty, y, py)
+        oldY = [w.kp for w in self.net.witnesses(Y)]
+        self.net.rotate(Y, [KeyPair.generate() for _ in range(4)])
+        forged = self.forge(oldY[:3], Y, 0, y, 0, T)
+        proof = {"kind": "seal", "sigil": y, "gen": 0, "parcel": self.tgt(py), "seal": seal_y}
+        for w in self.net.witnesses(self.X):
+            with self.assertRaises(Rejected):
+                w.settle(self.cert(T, [(pa, seal_a), (py, forged)]))
+            self.assertEqual(w.release(a, proof), 1)
 
     def test_one_input_sealed_is_not_a_certificate(self):
         """The kill-switch case: Tb's input s is sealed, but x was spent elsewhere, so Tb is

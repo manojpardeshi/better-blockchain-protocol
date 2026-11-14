@@ -286,6 +286,8 @@ fn load(db: &Database) -> Result<Loaded, String> {
             "checkpoint" => {
                 out.checkpoint.insert(key.to_string(), value);
             }
+            // The store format (2: may hold settled or checkpointed records); readable here.
+            "format" => {}
             _ => return Err(format!("unknown store entry kind {kind:?}")),
         }
     }

@@ -663,43 +663,52 @@ impl Witness {
         if mine.is_empty() {
             return rejected("no input of this transition lives here");
         }
+        // SETTLE never changes a binding: only a record we hold bound to exactly (g, tid).
+        let held: Vec<(String, i128)> = {
+            let st = self.state.lock().expect("state lock");
+            mine.iter()
+                .filter(|(s, g)| st.records.get(s).is_some_and(|r| r.gen == *g && r.tid.as_deref() == Some(tid.as_str())))
+                .cloned()
+                .collect()
+        };
+        if held.is_empty() {
+            return rejected("this witness holds no binding of this transition");
+        }
         let registry = self.registry();
+        // Every seal from its home's current version: retired keys cannot complete a transition.
+        let current = |home: &str, seal: &Json| {
+            let latest = registry.chain(home).last().map(|c| c.version);
+            latest.is_some() && seal.get("version").and_then(Json::as_int) == latest
+        };
+        if !inputs.iter().all(|(_, _, home, seal)| current(home, seal)) {
+            return rejected("a seal is not from its home's current charter version");
+        }
         if !inputs.iter().all(|(_, _, _, seal)| verify_seal(seal, &registry, &HashSet::new(), self.batch_verify)) {
             return rejected("invalid settlement certificate");
         }
-        let header = cert.get("header").cloned();
         let mut st = self.state.lock().expect("state lock");
         if st.active().map(|(c, _)| c).as_deref() != Some(cid.as_str()) {
             return rejected("witness not active");
         }
         let mut changed: Vec<(String, Record)> = Vec::new();
-        for (s, g) in &mine {
-            let mut rec = st.records.get(s).cloned().unwrap_or_default();
-            if rec.settled != 0 || changed.iter().any(|(c, _)| c == s) {
-                continue; // settled already (at another binding only with > f faults: keep the first)
+        for (s, g) in &held {
+            let Some(r) = st.records.get(s) else { continue };
+            if r.settled != 0 || r.gen != *g || r.tid.as_deref() != Some(tid.as_str()) || changed.iter().any(|(c, _)| c == s) {
+                continue;
             }
-            rec.gen = *g;
-            rec.tid = Some(tid.clone());
-            rec.header = header.clone();
-            rec.candidates.clear();
-            rec.abstain = false;
-            rec.vote = rec.votes.iter().find(|v| vote_key(v) == Some((*g, tid.clone()))).cloned();
+            let mut rec = r.clone();
             rec.settled = SETTLED;
             changed.push((s.clone(), rec));
         }
         if !changed.is_empty() {
-            self.store.submit(changed.iter().map(|(s, r)| ("record".to_string(), s.clone(), r.to_json())).collect());
+            let mut entries: Vec<Entry> = vec![format_entry()];
+            entries.extend(changed.iter().map(|(s, r)| ("record".to_string(), s.clone(), r.to_json())));
+            self.store.submit(entries);
             for (s, r) in changed {
                 st.records.insert(s, r);
             }
         }
-        let mut out: Vec<String> = mine
-            .iter()
-            .filter(|(s, g)| {
-                st.records.get(s).is_some_and(|r| r.settled != 0 && r.gen == *g && r.tid.as_deref() == Some(tid.as_str()))
-            })
-            .map(|(s, _)| s.clone())
-            .collect();
+        let mut out: Vec<String> = held.into_iter().map(|(s, _)| s).collect();
         out.sort();
         Ok(obj([("settled", Json::Arr(out.into_iter().map(Json::Str).collect()))]))
     }
@@ -1096,6 +1105,9 @@ impl Witness {
         // us active but missing a binding.
         let mut batch_entries: Vec<Entry> = Vec::with_capacity(records.len() + 1);
         batch_entries.push(("member".into(), String::new(), Json::Arr(vec![Json::str(cid), Json::Int(version)])));
+        if !ck.is_empty() {
+            batch_entries.push(format_entry());
+        }
         batch_entries.extend(records.iter().map(|(s, r)| ("record".to_string(), s.clone(), r.to_json())));
         self.store.submit(batch_entries);
         st.member = Some((cid.to_string(), version));
@@ -1221,4 +1233,11 @@ pub(crate) fn checkpoint_for(body_ck: Option<&Json>, entries: Option<&Json>) -> 
             .collect()),
         _ => rejected("checkpoint set does not match the charter"),
     }
+}
+
+/// Written with every settled or checkpointed record (`Witness._format_entry`): a binary from
+/// before compaction refuses the unknown entry kind instead of opening a store whose
+/// checkpointed records have no log to hand over.
+fn format_entry() -> Entry {
+    ("format".into(), String::new(), Json::Int(2))
 }

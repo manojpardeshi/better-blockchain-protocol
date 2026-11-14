@@ -1311,15 +1311,16 @@ def compaction_script():
     sc.run("x0", "settled_records", t[0] + 6)
     t[0] += 10
 
-    ck = [[s, g, tt] for s, g, tt in sorted([[sA, 0, tidA], [sY, 0, model.transition_id(TY)]])]
+    ck = [[sA, 0, tidA]]                                        # x0 never saw TY: sY is not settled there
+    other = [[sY, 0, model.transition_id(TY)]]
     keys1 = [kp(1410), kp(1411)]
     nxt = charter_body("cmp", 1, [k.pk for k in keys1], charter_hash(body0), None, checkpoint_hash(ck))
     plain = charter_body("cmp", 1, [k.pk for k in keys1], charter_hash(body0))
     live = sorted(ck + [[sL, 0, model.transition_id(TL)]])
     bad_live = charter_body("cmp", 1, [k.pk for k in keys1], charter_hash(body0), None, checkpoint_hash(live))
     sc.run("x0", "freeze", t[0], nxt)                          # no set given
-    sc.run("x0", "freeze", t[0], nxt, ck[:1])                  # a set that does not match the hash
-    sc.run("x0", "freeze", t[0], nxt, list(reversed(ck)))      # unsorted
+    sc.run("x0", "freeze", t[0], nxt, other)                   # a set that does not match the hash
+    sc.run("x0", "freeze", t[0], nxt, sorted(live, reverse=True))   # unsorted
     sc.run("x0", "freeze", t[0], plain, ck)                    # a set for a charter without one
     sc.run("x0", "freeze", t[0], bad_live, live)               # a live (unsettled) sigil
     sc.run("x0", "freeze", t[0], dict(nxt, checkpoint="AB" * 32), ck)   # not a lowercase hash
@@ -1335,20 +1336,23 @@ def compaction_script():
     # A lying predecessor: evidence for a checkpointed sigil at a later generation.
     lie = {sA: [{"kind": "bind", "gen": 1, "auth": {k: v for k, v in req(hdr([(sA, 1)], "a3"), sA, pA).items() if k != "sigil"}}]}
     sc.add("a0", Witness(keys1[0], reg1, lambda: clock[0]), 1410, "v1", adopt=True)
-    for bad in (None, [], ck[:1], [[sA, 0, "11" * 32], ck[1]]):
+    for bad in (None, [], other, [[sA, 0, "11" * 32]]):
         sc.run("a0", "adopt", t[0] + 3, X, 1, snaps, bad)
     sc.run("a0", "adopt", t[0] + 4, X, 1, snaps + [lie], ck)
     for s in (sA, sY, sL, sB, xB):
         sc.run("a0", "record", t[0] + 5, s)
     sc.run("a0", "spend", t[0] + 6, req(hdr([(sA, 1)], "a3"), sA, pA))   # the owner's re-spend: refused
     sc.run("a0", "spend", t[0] + 7, req(TL, sL, pL))           # inherited binding: votes
+    seal_L = model.seal_from_votes([o[i].status(sL)["votes"][0] for i in range(1, 4)])
+    sc.run("a0", "settle", t[0] + 7, cert(TL, [(pL, seal_L)]))   # a v0 seal: not X's current version
+    sc.run("a0", "settle", t[0] + 7, cert(hdr([(sA, 0)], "a2"), [(pA, seal_A)]))  # never rebinds (a checkpointed sigil)
     sc.run("a0", "status", t[0] + 8, sA)
     sc.run("a0", "settled_records", t[0] + 9)
     # The extension rule at the next FREEZE.
     nxt2 = charter_body("cmp", 2, [kp(1420).pk], charter_hash(nxt))
     sc.run("a0", "freeze", t[0] + 10, nxt2)                    # drops the checkpoint
-    nxt2b = charter_body("cmp", 2, [kp(1420).pk], charter_hash(nxt), None, checkpoint_hash(ck[1:]))
-    sc.run("a0", "freeze", t[0] + 11, nxt2b, ck[1:])           # drops sA
+    nxt2b = charter_body("cmp", 2, [kp(1420).pk], charter_hash(nxt), None, checkpoint_hash(other))
+    sc.run("a0", "freeze", t[0] + 11, nxt2b, other)            # drops sA
     nxt2c = charter_body("cmp", 2, [kp(1420).pk], charter_hash(nxt), None, checkpoint_hash(ck))
     sc.run("a0", "freeze", t[0] + 12, nxt2c, ck)               # carried over: fine
 

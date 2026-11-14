@@ -156,6 +156,14 @@ class Witness:
             self.store.append(list(entries))
 
     @staticmethod
+    def _format_entry() -> list:
+        """Written with every settled or checkpointed record: a store holding one must not be
+        opened by a version that cannot read it (a Rust binary from before compaction refuses
+        an unknown entry kind; a Python one fails on the ``settled`` field), since a checkpointed
+        record has no log and an old version would hand it over as nothing."""
+        return [("format", "", 2)]
+
+    @staticmethod
     def _rec(sigil: str, rec: Record) -> tuple[str, str, dict]:
         return ("record", sigil, asdict(rec))
 
@@ -352,14 +360,16 @@ class Witness:
     # ------------------------------------------------------------ settlement
 
     def settle(self, cert) -> dict:
-        """SETTLE (SPEC §5.7): ``cert`` shows a transition complete; settle our inputs.
+        """SETTLE (SPEC §5.7): ``cert`` shows a transition complete; settle our bindings to it.
 
-        Every input of the transition that lives here is marked settled at its
-        generation: from then on we never vote on that sigil again (except to hand
-        back a vote we already hold for exactly that binding) and never release it.
-        That is abstention, safe whatever the certificate says; it is checked so that
-        we never settle a sigil whose transition could still die. The log is kept for
-        the next handover until a checkpoint covers the sigil.
+        SETTLE never changes a binding. An input that lives here is settled only if we
+        already hold it bound to exactly the certificate's transition at the
+        certificate's generation (not contested, not released, not settled): from then
+        on we never vote on that sigil again (except to hand back the vote we hold) and
+        never release it. Every seal must come from the CURRENT charter version of its
+        home as our registry knows it: retired keys (of our home or another) cannot make
+        a transition look complete, so an honest owner's kill-switch recovery stays
+        possible. The log is kept for the next handover until a checkpoint covers it.
         """
         if self.cid is None or self.frozen:
             raise Rejected("witness not active")
@@ -373,23 +383,27 @@ class Witness:
         mine = [(s, g) for s, g, home, _seal in inputs if home == self.cid]
         if not mine:
             raise Rejected("no input of this transition lives here")
+        held = [(s, g) for s, g in mine if (r := self.records.get(s)) is not None and (r.gen, r.tid) == (g, tid)]
+        if not held:
+            raise Rejected("this witness holds no binding of this transition")
+        for _s, _g, home, seal in inputs:
+            cur = self.registry.latest(home)
+            if cur is None or type(seal.get("version")) is not int or seal["version"] != cur["version"]:
+                raise Rejected("a seal is not from its home's current charter version")
         if verify_settlement(cert, self.registry) is None:
             raise Rejected("invalid settlement certificate")
         changed = {}
-        for s, g in mine:
-            old = self.records.get(s)
-            if old is not None and old.settled:
-                continue  # settled already (at another binding only with > f faults: keep the first)
-            rec = old.copy() if old is not None else Record()
-            rec.gen, rec.tid, rec.header, rec.candidates, rec.abstain = g, tid, cert["header"], [], False
-            rec.vote = next((v for v in rec.votes if v["gen"] == g and v["tid"] == tid), None)
+        for s, g in held:
+            rec = self.records[s]
+            if rec.settled:
+                continue
+            rec = rec.copy()
             rec.settled = SETTLED
             changed[s] = rec
         if changed:
-            self._persist(*(self._rec(s, r) for s, r in changed.items()))
+            self._persist(*self._format_entry(), *(self._rec(s, r) for s, r in changed.items()))
             self.records.update(changed)
-        return {"settled": sorted(s for s, g in mine
-                                  if self.records[s].settled and (self.records[s].gen, self.records[s].tid) == (g, tid))}
+        return {"settled": sorted(s for s, g in held)}
 
     def settled_records(self) -> dict:
         """SETTLED (SPEC §5.7): our settled and checkpointed records as ``[sigil, gen, tid]``."""
@@ -647,6 +661,7 @@ class Witness:
             records[sigil] = rec
         # Membership and inherited records land in one atomic batch: a crash
         # must never leave us active but missing a binding.
-        self._persist(("member", "", [cid, version]), *(self._rec(s, r) for s, r in records.items()))
+        self._persist(("member", "", [cid, version]), *(self._format_entry() if ck else []),
+                      *(self._rec(s, r) for s, r in records.items()))
         self.cid, self.version = cid, version
         self.records.update(records)
