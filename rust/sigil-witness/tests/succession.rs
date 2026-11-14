@@ -11,7 +11,7 @@ use sigil_witness::json::{obj, parse, Json};
 use sigil_witness::ratelimit::RateLimiter;
 use sigil_witness::store::{Loaded, Store};
 use sigil_witness::succession::Standby;
-use sigil_witness::testkit::spend_request;
+use sigil_witness::testkit::{spend_request, vote};
 use sigil_witness::witness::{Clock, Error, Witness};
 
 const DEAD: i128 = 100;
@@ -254,12 +254,16 @@ fn standby_handover_keeps_only_what_adopt_keeps() {
     }
     log.push(obj([("kind", "release".into()), ("gen", Json::Int(0)), ("tid", Json::str(&ta)), ("header", ra.get("header").unwrap().clone()), ("proof", obj([]))]));
     log.push(obj([("kind", "vote".into()), ("vote", obj([]))]));
+    // A verified vote by a member of version 0 is kept (a re-used key adopts it); a stranger's is not.
+    let member_vote = obj([("kind", "vote".into()), ("vote", vote(&key("rigelw0"), &w.cid, &sa, 0, &ta, 1))]);
+    log.push(member_vote.clone());
+    log.push(obj([("kind", "vote".into()), ("vote", vote(&key("stranger"), &w.cid, &sa, 0, &ta, 1))]));
     log.push(obj([("kind", "mystery".into())]));
     let snap = obj([(sa.as_str(), Json::Arr(log)), ("f".repeat(64).as_str(), Json::Arr(vec![obj([("kind", "mystery".into())])]))]);
     let k = Standby::open(key("rigelk1"), w.reg.clone(), &w.cid, Store::memory(), Default::default(), clock(&now), true).unwrap();
     ok(k.enter(&Json::str(&w.cid), &Json::Int(0), &[snap.clone(), snap]), &k.store);
     let mirror = k.snapshot();
-    assert_eq!(mirror.get(&sa), Some(&Json::Arr(vec![bind])));
+    assert_eq!(mirror.get(&sa), Some(&Json::Arr(vec![bind, member_vote])));
     assert_eq!(mirror.get(&"f".repeat(64)), None);
     assert_eq!(ok(k.mirror_bind(&with_version(&ra, 0)), &k.store).get("tid"), Some(&Json::str(&ta)), "the binding is mirrored");
 }

@@ -964,10 +964,12 @@ impl Witness {
     }
 }
 
-/// `witness.verified_evidence`: the entries of one sigil's handover log that ADOPT keeps in the
-/// new record's log (SPEC §5.4): bind entries with a valid owner authorisation, and release and
-/// seal entries that verify for a transaction bound in this evidence, in log order. STANDBY
-/// keeps the same entries of its handover (SPEC §5.5).
+/// `witness.verified_evidence`: the entries of one sigil's handover log that STANDBY keeps
+/// (SPEC §5.5): what ADOPT keeps in a new record's log (SPEC §5.4: bind entries with a valid
+/// owner authorisation, and release and seal entries that verify for a transaction bound in this
+/// evidence), plus every verified vote of this sigil by a member of the version it names. ADOPT
+/// reads an adopter's own votes from those, and the mirror is the only carrier of a retired key's
+/// votes across more than one version. In log order.
 pub(crate) fn verified_evidence(sigil: &str, log: Vec<Json>, cid: &str, registry: &Registry, batch: bool) -> Vec<Json> {
     let sigil_j = Json::str(sigil);
     let null = Json::Null;
@@ -977,6 +979,23 @@ pub(crate) fn verified_evidence(sigil: &str, log: Vec<Json>, cid: &str, registry
     let mut seals: Vec<(usize, (i128, String))> = Vec::new();
     for (i, e) in log.iter().enumerate() {
         match e.get("kind").and_then(Json::as_str) {
+            Some("vote") => {
+                // A member's vote: a key re-used later adopts it as its own (witness.py).
+                let Some(v) = e.get("vote") else { continue };
+                let member = v
+                    .get("version")
+                    .and_then(Json::as_int)
+                    .and_then(|ver| registry.charter(cid, ver))
+                    .zip(v.get("witness").and_then(Json::as_str))
+                    .is_some_and(|(c, w)| c.witnesses.iter().any(|x| x == w));
+                if member
+                    && v.get("sigil").and_then(Json::as_str) == Some(sigil)
+                    && v.get("constellation").and_then(Json::as_str) == Some(cid)
+                    && verify_vote(v)
+                {
+                    keep[i] = true;
+                }
+            }
             Some("bind") => {
                 let auth = e.get("auth").cloned().unwrap_or(Json::Obj(Default::default()));
                 if let Ok(Some(b)) = authorises(&sigil_j, &auth, None, batch) {

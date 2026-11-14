@@ -25,8 +25,8 @@ below generation 16, and at most ``MAX_MIRROR_TIDS`` transitions per sigil and
 generation; a release entry needs a death proof of at most 128 KiB for a binding
 the member holds. Each refusal only withholds an ack (no ack, no vote), which
 costs liveness and never safety. The handover of STANDBY, like ADOPT, keeps every
-verifiable entry it is given (verified binds, and verified releases and seals of
-transactions bound in it), each distinct one once.
+verifiable entry it is given (verified binds, verified releases and seals of
+transactions bound in it, and verified members' votes), each distinct one once.
 """
 
 import json
@@ -207,8 +207,9 @@ class Standby:
             if self.cid != cid or not _is_int(version) or version <= self.version:
                 raise Rejected("already standing by for another version")
         # Like ADOPT, the handover keeps every verifiable entry whatever its size (dropping
-        # evidence could lose a sealed binding), and only those: verified bind entries and
-        # the verified releases and seals of transactions bound in it (SPEC §5.4, §5.5).
+        # evidence could lose a sealed binding), and only those: verified bind entries, the
+        # verified releases and seals of transactions bound in it, and verified members'
+        # votes, which a re-used key adopts as its own (SPEC §5.4, §5.5).
         # Our mirror log is the evidence a successor adopts, so junk kept here would be
         # forwarded at every later handover.
         mirror = {}

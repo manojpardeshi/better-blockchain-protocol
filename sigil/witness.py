@@ -108,12 +108,16 @@ def authorises(sigil: str, auth: dict) -> tuple[int, str] | None:
 
 
 def verified_evidence(sigil: str, log: list, cid: str, registry: Registry) -> list:
-    """The entries of one sigil's handover log that ADOPT keeps in the new record's log (SPEC §5.4).
+    """The entries of one sigil's handover log that STANDBY keeps (SPEC §5.5).
 
-    Bind entries with a valid owner authorisation, and release and seal entries that
-    verify for a transaction bound in this evidence; everything else (junk, votes,
-    releases or seals of transactions nobody bound) is dropped, in log order otherwise.
-    STANDBY keeps the same entries of its handover (SPEC §5.5).
+    What ADOPT keeps in a new record's log (SPEC §5.4): bind entries with a valid
+    owner authorisation, and release and seal entries that verify for a transaction
+    bound in this evidence. Plus every vote entry that verifies, for this sigil, by a
+    member of the version of ``cid`` it names: ADOPT reads an adopter's OWN votes out
+    of these, and a standby member's mirror is the only carrier of a retired key's
+    votes across more than one version (a key re-used later must never vote a sibling
+    of its own vote). Everything else (junk, votes by non-members, releases or seals
+    of transactions nobody bound) is dropped, in log order otherwise.
     """
     binds: set = set()
     releases, seals, keep = [], [], set()
@@ -121,7 +125,16 @@ def verified_evidence(sigil: str, log: list, cid: str, registry: Registry) -> li
         if not isinstance(e, dict):
             continue
         kind = e.get("kind")
-        if kind == "bind":
+        if kind == "vote":
+            v = e.get("vote")
+            try:
+                charter = registry.charter(cid, v["version"])
+                if (v["sigil"] == sigil and v["constellation"] == cid and charter is not None
+                        and v["witness"] in charter["witnesses"] and verify_vote(v)):
+                    keep.add(i)
+            except (KeyError, TypeError, ValueError, AttributeError):
+                pass
+        elif kind == "bind":
             b = authorises(sigil, e.get("auth", {}))
             if b is not None:
                 binds.add(b)

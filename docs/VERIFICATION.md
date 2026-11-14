@@ -249,11 +249,14 @@ handed-over entry in the member's mirror log, the code only the verified binds
 and the verified releases and seals of bound transactions. Every binding the
 model's mirror holds with a valid owner authorisation is kept,
 so the bindings behind every vote reach the successor exactly as in the model;
-what is dropped is either never modelled (unverifiable) or an entry the
-successor's own ADOPT would drop from that evidence anyway, and handing it on
-or not changes no ADOPT outcome. Votes in a handover are dropped too: ADOPT
-reads only the adopter's own votes, which a re-used key brings itself
-(SPEC §5.4). A mirror log that keeps fewer such entries is what the model
+verified votes by members are kept too, because ADOPT reads an adopter's own
+votes out of the evidence and the mirror is the only carrier of a retired
+key's votes across more than one version (dropping them let a key re-used two
+versions later vote a sibling of its own vote; review regression
+`tests/test_review_fixes.py`). What is dropped is either never modelled
+(unverifiable, or a vote by a non-member) or an entry the successor's own
+ADOPT would drop from that evidence anyway, and handing it on or not changes
+no ADOPT outcome. A mirror log that keeps fewer such entries is what the model
 produces when the Byzantine predecessor that supplied them omits them. The code
 therefore still refines the proved specs (rotation and succession).
 (`test_adopt_evidence.test_standby_keeps_what_adopt_keeps`, Rust

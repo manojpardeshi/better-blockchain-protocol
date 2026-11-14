@@ -141,7 +141,10 @@ class AdoptEvidenceFilterTests(unittest.TestCase):
         m = Standby(ck, self.net.registry, self.net.clock)
         m.enter(self.X, 1, snaps + [junk])
         log = m.mirror[self.s]
-        self.assertEqual(sorted(e["kind"] for e in log), ["bind", "release"], log)
+        # The freezing members' own votes are kept (a re-used key adopts them); the
+        # stranger's vote and the rest of the junk are not.
+        self.assertEqual(sorted(e["kind"] for e in log), ["bind", "release", "vote", "vote", "vote"], log)
+        self.assertEqual({e["vote"]["witness"] for e in log if e["kind"] == "vote"}, {w.pk for w in k[:3]})
         self.assertEqual({e["tid"] for e in log if e["kind"] == "release"}, {model.transition_id(Tb)})
         self.assertNotIn("f" * 64, m.mirror)
         # The binding the mirror records is unchanged.
