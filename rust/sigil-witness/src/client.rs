@@ -3,7 +3,7 @@
 //! no new dependencies. Nothing it reads is trusted: callers verify what comes back.
 
 use std::io::{ErrorKind, Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::time::{Duration, Instant};
 
 use crate::json::{parse, Json};
@@ -23,6 +23,27 @@ fn left(url: &str, deadline: Instant, timeout: Duration) -> Result<Duration, Str
     Ok(rest.min(timeout))
 }
 
+// DNS may return an unreachable address first. Reserve a share of the connect
+// budget for every remaining address while respecting the exchange deadline.
+fn connect_any(url: &str, addrs: impl IntoIterator<Item = SocketAddr>, deadline: Instant, timeout: Duration) -> Result<TcpStream, String> {
+    let addrs: Vec<_> = addrs.into_iter().collect();
+    if addrs.is_empty() {
+        return Err(format!("{url}: no address"));
+    }
+    let mut last_error = String::new();
+    for (index, addr) in addrs.iter().enumerate() {
+        let slice = left(url, deadline, timeout)? / (addrs.len() - index) as u32;
+        if slice.is_zero() {
+            return Err(format!("{url}: connection timed out"));
+        }
+        match TcpStream::connect_timeout(addr, slice) {
+            Ok(stream) => return Ok(stream),
+            Err(error) => last_error = error.to_string(),
+        }
+    }
+    Err(format!("{url}: {last_error}"))
+}
+
 /// `POST {url}/v0/{method}` with `body`; the `ok` result of an HTTP 200 reply, else an error.
 ///
 /// Every socket operation is bounded by `timeout` and the whole exchange by `REPLY_DEADLINE`
@@ -31,8 +52,8 @@ pub fn post(url: &str, method: &str, body: &Json, timeout: Duration) -> Result<J
     let deadline = Instant::now() + timeout * REPLY_DEADLINE;
     let rest = url.strip_prefix("http://").ok_or_else(|| format!("{url}: only http:// URLs are supported"))?;
     let hostport = rest.split('/').next().unwrap_or(rest);
-    let addr = hostport.to_socket_addrs().map_err(|e| format!("{url}: {e}"))?.next().ok_or_else(|| format!("{url}: no address"))?;
-    let mut s = TcpStream::connect_timeout(&addr, left(url, deadline, timeout)?).map_err(|e| format!("{url}: {e}"))?;
+    let addrs = hostport.to_socket_addrs().map_err(|e| format!("{url}: {e}"))?;
+    let mut s = connect_any(url, addrs, deadline, timeout)?;
     let data = body.canonical();
     let head = format!(
         "POST /v0/{method} HTTP/1.1\r\nHost: {hostport}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -89,8 +110,17 @@ pub fn post(url: &str, method: &str, body: &Json, timeout: Duration) -> Result<J
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::TcpListener;
+    use std::net::{SocketAddr, TcpListener};
     use std::time::Instant;
+
+    #[test]
+    fn tries_next_address_after_connection_failure() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let reachable = listener.local_addr().unwrap();
+        let unreachable: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let stream = connect_any("test", [unreachable, reachable], Instant::now() + Duration::from_secs(4), Duration::from_secs(1)).unwrap();
+        assert_eq!(stream.peer_addr().unwrap(), reachable);
+    }
 
     /// A member that trickles its reply one byte at a time, each just inside the socket
     /// timeout, must not hold the prober: the whole reply has a deadline (before: the prober
