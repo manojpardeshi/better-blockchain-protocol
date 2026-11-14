@@ -207,6 +207,9 @@ class WireCompatTests(unittest.TestCase):
         for t in (cls.plain, cls.stamped, cls.limited, cls.standby, cls.heirw):
             for dmn in t:
                 wait_http(dmn.url, proc=dmn.proc, log=dmn.log)
+        # The standby twins report `dead` once dead_man (1 s) has passed with no member heard;
+        # compare their info only once both are past that point, not on either side of it.
+        time.sleep(2)
         cls.owner = KeyPair.from_seed(b"\x07" * 32)
         cls.rec = Recorder()
 
