@@ -51,7 +51,7 @@ TLA_URL="https://github.com/tlaplus/tlaplus/releases/download/v${TLA_VERSION}/tl
 # SigilSuccProofs) with the new build, then update the hash here and the cache
 # keys in .github/workflows/test.yml (docs/VERIFICATION.md §6 has the policy).
 TLAPM_VERSION="1.6.0-pre"
-TLAPM_SHA256="6fc2162a8f02f6e7e2d8d71dbe0fb0ee4a547018d6e44bc158e26496ecf1a015"
+TLAPM_SHA256="99db29f119cb6f43ffed653b212ba2d005e5bf8e242c53468876cb0d08da6bcc"
 TLAPM_URL="https://github.com/tlaplus/tlapm/releases/download/${TLAPM_VERSION}/tlapm-${TLAPM_VERSION}-x86_64-linux-gnu.tar.gz"
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

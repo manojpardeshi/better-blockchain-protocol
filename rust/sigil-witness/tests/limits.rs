@@ -166,8 +166,8 @@ fn adopt_keeps_each_evidence_entry_once() {
     let log = a.record(&s).unwrap().log;
     assert_eq!(log.len(), 1, "{}", Json::Arr(log.clone()).canonical_string());
     // The junk is dropped, and the generation cap reads the record: the owner can spend.
-    let r = a.record(&fs).unwrap();
-    assert_eq!((r.log.len(), r.gen), (0, 0));
+    // A sigil whose log holds only junk gets no record at all (nothing carried forward).
+    assert!(a.record(&fs).is_none());
     assert!(a.spend(&fresh).0.is_ok());
 }
 

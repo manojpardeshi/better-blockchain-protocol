@@ -18,14 +18,16 @@ started without one. ``RemoteNetwork.rotate`` drives a rotation over them.
 """
 
 import hmac
+import http.client
 import json
+import socket
 import threading
-import urllib.error
-import urllib.request
+import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from .charter import Registry, charter_body, charter_hash, quorum, successor_clause
 from .crypto import verify
+from .encoding import ADMIN_DEPTH, MAX_DEPTH, portable
 from .gossip import GossipStore
 from .ratelimit import (DEFAULT_BURST, DEFAULT_RATE, IDLE_TIMEOUT, MAX_CLIENT_CONNECTIONS, MAX_CONNECTIONS,
                         ConnectionLimiter, RateLimiter, client_key, is_loopback)
@@ -127,12 +129,18 @@ class WitnessServer:
             def do_GET(self):
                 if not self._admitted(self.path.removeprefix("/v0/"), False):
                     return
-                if self.path == "/v0/info":
+                path = self.path.split("?", 1)[0]  # a query is ignored, as by the Rust witness
+                if path == "/v0/info":
                     return self._reply(200, {"ok": server.info()})
-                if self.path == "/v0/charters":
+                if path == "/v0/charters":
                     reg = server.witness.registry
                     return self._reply(200, {"ok": {cid: reg.chain(cid) for cid in reg.ids()}})
-                if self.path == "/v0/proofs":
+                cid = path.removeprefix("/v0/charters/")
+                if path.startswith("/v0/charters/") and cid and "/" not in cid:
+                    # One constellation's chain ([] if unknown): what a client needs, however
+                    # many other chains gossip has handed this witness. One path segment.
+                    return self._reply(200, {"ok": server.witness.registry.chain(urllib.parse.unquote(cid))})
+                if path == "/v0/proofs":
                     with server._lock:
                         snap = {"proofs": list(server.gossip.proofs.values()),
                                 "forks": list(server.gossip.forks.values())}
@@ -150,9 +158,16 @@ class WitnessServer:
                     n = int(self.headers.get("Content-Length", "0"))
                     if not 0 <= n <= (MAX_ADMIN_BODY if admin else MAX_BODY):
                         raise ValueError("body too large")
-                    body = json.loads(self.rfile.read(n) or b"{}")
+                    try:
+                        body = json.loads(self.rfile.read(n) or b"{}")
+                    except RecursionError:
+                        raise ValueError("invalid JSON: nesting too deep") from None
                     if not isinstance(body, dict):
                         raise ValueError("body must be an object")
+                    # Only what the Rust witness can represent too (WIRE.md "Portable JSON"):
+                    # neither kind ever stores what the other could not read in a handover.
+                    if not portable(body, ADMIN_DEPTH if admin else MAX_DEPTH):
+                        raise ValueError("invalid JSON: not portable (WIRE.md)")
                     result = server.dispatch(method, body)
                     self._reply(200, {"ok": result})
                 except Conflict as e:
@@ -172,7 +187,10 @@ class WitnessServer:
                 for k, v in (headers or {}).items():
                     self.send_header(k, v)
                 self.end_headers()
-                self.wfile.write(data)
+                try:
+                    self.wfile.write(data)
+                except OSError:  # the client hung up (e.g. it stopped reading at its reply cap)
+                    pass
 
         conns = ConnectionLimiter(MAX_CONNECTIONS, MAX_CLIENT_CONNECTIONS if self.limiter is not None else None)
         self.httpd = _HTTPServer((host, port), Handler, conns)
@@ -278,17 +296,29 @@ class StandbyServer(WitnessServer):
         return dict(self.standby.info(), frozen=False, stamps=None)
 
     def probe(self, urls: list) -> int:
-        """Challenge each member at ``urls``; network calls happen outside the lock."""
+        """Challenge each member at ``urls``; network calls happen outside the lock.
+
+        Members are asked at once and each answer is recorded as it arrives, so a member
+        that stalls its replies (up to the client deadline) never delays hearing the others.
+        """
         import secrets
-        answers = []
-        for url in urls:
+        counted = []
+
+        def ask(url):
             challenge = secrets.token_hex(16)
             try:
-                answers.append((RemoteWitness(url, 5.0).heartbeat(challenge), challenge))
+                hb = RemoteWitness(url, 5.0).heartbeat(challenge)
             except Rejected:
-                continue
-        with self._lock:
-            return sum(self.standby.observe(hb, ch) for hb, ch in answers)
+                return
+            with self._lock:
+                counted.append(self.standby.observe(hb, challenge))
+
+        threads = [threading.Thread(target=ask, args=(u,), daemon=True) for u in dict.fromkeys(urls)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        return sum(counted)
 
     def dispatch(self, method: str, body: dict):
         s = self.standby
@@ -339,10 +369,6 @@ def _pub_out(pub: dict) -> dict:
     return {"n": format(pub["n"], "x"), "e": format(pub["e"], "x")}
 
 
-def _pub_in(pub: dict) -> dict:
-    return {"n": int(pub["n"], 16), "e": int(pub["e"], 16)}
-
-
 # ------------------------------------------------------------------ client
 
 class Unreachable(Rejected):
@@ -378,115 +404,367 @@ def _vote_shaped(v) -> bool:
             and all(isinstance(v.get(k), str) for k in ("constellation", "witness", "sigil", "tid", "sig")))
 
 
+def _info_shaped(i) -> bool:
+    """An INFO reply: ``pk`` a string, ``constellation`` a string or null, ``version`` an int or null."""
+    return (isinstance(i, dict) and isinstance(i.get("pk"), str)
+            and (i.get("constellation") is None or isinstance(i["constellation"], str))
+            and (i.get("version") is None or _is_int(i["version"])))
+
+
+MAX_STAMP_BITS = 8192  # a larger stamp key is junk: every blinding costs a modexp by it
+
+
+def _stamp_key(pub) -> dict | None:
+    """A witness's stamp public key ``{n, e}`` from hex, or None if it is not a usable RSA key."""
+    try:
+        n, e = int(pub["n"], 16), int(pub["e"], 16)
+    except (KeyError, TypeError, ValueError):
+        return None
+    if not (3 <= n and n.bit_length() <= MAX_STAMP_BITS and 3 <= e < n):
+        return None
+    return {"n": n, "e": e}
+
+
+# Limits on what a client reads from one witness (docs/WIRE.md "Nothing a witness sends is
+# trusted"). An ordinary reply (a vote, a STATUS: at most one vote per generation it holds, so a
+# few KiB) is read up to MAX_REPLY; charter chains and gossip pulls up to MAX_RESPONSE; the
+# operator calls up to MAX_ADMIN_BODY (a FREEZE snapshot is every binding the member holds).
+MAX_REPLY = 256 << 10
+MAX_STATUS_VOTES = 256        # a STATUS holds our own votes, one per generation (MAX_GEN): junk beyond
+# The whole exchange (connect, request, status line, headers, body) must finish within
+# ``REPLY_DEADLINE`` socket timeouts: the socket timeout bounds each read, not the reply, so
+# without it a witness trickling bytes (or endless "100 Continue" lines) could hold a client.
+REPLY_DEADLINE = 4
+ADMIN_DEADLINE = 60           # operator calls move snapshots of up to MAX_ADMIN_BODY
+_MALFORMED_JSON = (ValueError, RecursionError)  # json.loads: not JSON, or nested beyond the stack
+
+
+def _parse(data: bytes):
+    """``json.loads`` (linear). Memory is bounded by the reply caps, never by a heuristic on the
+    content: snapshots, mirror logs, proofs and charters carry what clients sent."""
+    return json.loads(data)
+
+
+class _TooLarge(ValueError):
+    """A reply over its cap."""
+
+
+class _Error(Exception):
+    """An HTTP reply other than 200: its status and (capped) body."""
+
+    def __init__(self, status: int, body: bytes):
+        super().__init__(f"HTTP {status}")
+        self.status, self.body = status, body
+
+
+def portable_snapshot(snap) -> dict:
+    """A FREEZE or SUCCEED snapshot from an untrusted predecessor, reduced to what a handover
+    may carry (WIRE.md "Portable JSON"): only object entries that are portable where they will
+    sit in an ``/v0/adopt`` or ``/v0/standby`` body (``body.snapshots[i][sigil][j]``, four levels
+    down). An entry that is not could never verify at a witness of either kind, while relaying it
+    would make every Rust adopter refuse the whole handover: one Byzantine predecessor could keep
+    a rotation from ever completing."""
+    if not isinstance(snap, dict):
+        return {}
+    out = {}
+    for sigil, log in snap.items():
+        if not isinstance(sigil, str) or not isinstance(log, list) or not portable(sigil):
+            continue
+        kept = [e for e in log if isinstance(e, dict) and portable(e, ADMIN_DEPTH, 4)]
+        if kept:
+            out[sigil] = kept
+    return out
+
+
+def _cited_homes(snapshots) -> set:
+    """The constellations whose charters the release entries of ``snapshots`` cite."""
+    out = set()
+    for snap in snapshots:
+        for log in (snap.values() if isinstance(snap, dict) else ()):
+            for e in (log if isinstance(log, list) else ()):
+                proof = e.get("proof") if isinstance(e, dict) and e.get("kind") == "release" else None
+                if not isinstance(proof, dict):
+                    continue
+                for x in (proof.get("parcel"), proof.get("seal")):
+                    c = x.get("home", x.get("constellation")) if isinstance(x, dict) else None
+                    if isinstance(c, str):
+                        out.add(c)
+                for v in (proof.get("votes") if isinstance(proof.get("votes"), list) else []):
+                    if isinstance(v, dict) and isinstance(v.get("constellation"), str):
+                        out.add(v["constellation"])
+    return out
+
+
 class RemoteWitness:
-    """A witness reached over HTTP, with the same interface as ``Witness``."""
+    """A witness reached over HTTP, with the same interface as ``Witness``.
+
+    Nothing a witness sends is trusted (docs/WIRE.md): a reply larger than ``max_response``
+    (``MAX_ADMIN_BODY`` for the operator calls), slower than ``REPLY_DEADLINE`` timeouts, not
+    JSON, or not of the shape the call returns counts as no answer (``Unreachable``), and so
+    does a malformed error reply. Votes, seals and proofs in well-formed replies are still
+    verified by whoever uses them.
+    """
 
     admin_methods = ADMIN_METHODS
+    max_response = MAX_RESPONSE  # the largest reply read (operator calls: MAX_ADMIN_BODY)
 
     def __init__(self, url: str, timeout: float = 5.0, *, admin_token: str | None = None):
         self.url = url.rstrip("/")
         self.timeout = timeout
         self.admin_token = admin_token  # sent with the rotation calls only
-        self.max_response = MAX_RESPONSE  # gossip pulls only: a peer cannot make us buffer more
-        info = self._get("info")
-        self.pk, self.cid, self.version = info["pk"], info["constellation"], info["version"]
-        self.stamps = _RemoteStamps(_pub_in(info["stamps"])) if info["stamps"] else None
+        info = self._info()
+        self.pk, self.cid, self.version = info["pk"], info.get("constellation"), info.get("version")
+        stamps = info.get("stamps")
+        self.stamps = None
+        if stamps is not None:
+            key = _stamp_key(stamps)
+            if key is None:
+                raise self._malformed("info")
+            self.stamps = _RemoteStamps(key)
 
     def __repr__(self):
         return f"RemoteWitness({self.url}, {self.pk[:8]})"
 
-    def _get(self, path: str):
+    def _malformed(self, what: str) -> "Unreachable":
+        return Unreachable(f"{self.url}: malformed {what} reply")
+
+    def _info(self) -> dict:
+        info = self._get("info")
+        if not _info_shaped(info):
+            raise self._malformed("info")
+        return info
+
+    def _exchange(self, method: str, path: str, data: bytes | None, headers: dict, cap: int,
+                  budget: float) -> bytes:
+        """One HTTP exchange, all of it within ``budget`` seconds; the body of a 200 reply.
+
+        A watchdog shuts the socket down when the budget runs out, which ends any read in
+        progress (a trickled status line or header, a flood of ``100 Continue``, a slow body).
+        Redirects are never followed. Raises ``_Error`` for any other status, ``OSError`` /
+        ``HTTPException`` / ``ValueError`` for anything else that went wrong.
+        """
+        u = urllib.parse.urlsplit(self.url)
+        if u.scheme not in ("http", "https") or not u.hostname:
+            raise ValueError(f"not an http(s) URL: {self.url!r}")
+        cls = http.client.HTTPSConnection if u.scheme == "https" else http.client.HTTPConnection
+        conn = cls(u.hostname, u.port, timeout=self.timeout)
+        expired, held = threading.Event(), []
+
+        def expire():
+            expired.set()
+            for sock in held + [conn.sock]:  # the response keeps reading from ``held[0]``
+                if sock is not None:
+                    try:
+                        sock.shutdown(socket.SHUT_RDWR)
+                    except OSError:
+                        pass
+
+        timer = threading.Timer(budget, expire)
+        timer.daemon = True
+        timer.start()
         try:
-            with urllib.request.urlopen(f"{self.url}/v0/{path}", timeout=self.timeout) as r:
-                return json.loads(r.read())["ok"]
-        except (urllib.error.URLError, OSError, ValueError) as e:
-            raise Unreachable(f"{self.url}: {e}") from e
+            conn.connect()
+            held.append(conn.sock)
+            if expired.is_set():
+                raise TimeoutError("no connection in time")
+            conn.request(method, (u.path or "") + path, body=data, headers=headers)
+            if expired.is_set():
+                raise TimeoutError("no reply in time")
+            r = conn.getresponse()
+            length = r.getheader("Content-Length")
+            if length is not None and length.strip().isdigit() and int(length) > cap:
+                raise _TooLarge("reply too large")
+            chunks, n = [], 0
+            while True:
+                chunk = r.read1(1 << 16)
+                if not chunk:
+                    break
+                n += len(chunk)
+                if n > cap:
+                    raise _TooLarge("reply too large")
+                chunks.append(chunk)
+            if expired.is_set():
+                raise TimeoutError("no complete reply in time")
+            body = b"".join(chunks)
+        except (OSError, http.client.HTTPException) as e:
+            if expired.is_set():
+                raise TimeoutError(f"no complete reply within {budget:g} s") from e
+            raise
+        finally:
+            timer.cancel()
+            conn.close()
+        if r.status != 200:
+            raise _Error(r.status, body)
+        return body
+
+    def _request(self, method: str, path: str, data: bytes | None, headers: dict, what: str, cap: int,
+                 budget: float):
+        """The ``ok`` result of a call, else the error its reply means (``Unreachable`` if malformed)."""
+        try:
+            reply = _parse(self._exchange(method, path, data, headers, cap, budget))
+        except _Error as e:
+            self._error(e, get=method == "GET")
+        except (OSError, http.client.HTTPException, *_MALFORMED_JSON) as e:
+            err = Unreachable(f"{self.url}: {e}")
+            err.too_large = isinstance(e, _TooLarge)
+            raise err from e
+        if not isinstance(reply, dict) or "ok" not in reply:
+            raise self._malformed(what)
+        return reply["ok"]
+
+    def _get(self, path: str, cap: int | None = None):
+        cap = self.max_response if cap is None else min(cap, self.max_response)
+        return self._request("GET", f"/v0/{path}", None, {}, path, cap, REPLY_DEADLINE * self.timeout)
 
     def _call(self, method: str, body: dict):
         headers = {"Content-Type": "application/json"}
-        if method in self.admin_methods and self.admin_token is not None:
+        admin = method in self.admin_methods
+        if admin and self.admin_token is not None:
             headers["Authorization"] = f"Bearer {self.admin_token}"
-        req = urllib.request.Request(f"{self.url}/v0/{method}", data=json.dumps(body).encode(),
-                                     headers=headers, method="POST")
+        cap = MAX_ADMIN_BODY if admin else min(MAX_REPLY, self.max_response)
+        budget = (ADMIN_DEADLINE if admin else REPLY_DEADLINE) * self.timeout
+        return self._request("POST", f"/v0/{method}", json.dumps(body).encode(), headers, method, cap, budget)
+
+    def _error(self, e: _Error, get: bool = False):
+        """Raise what an error reply means: ``Conflict``, ``Rejected``, or ``Unreachable`` if malformed.
+
+        A GET has no refusal to report: any error reply to one is ``Unreachable``.
+        """
         try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as r:
-                return json.loads(r.read())["ok"]
-        except urllib.error.HTTPError as e:
-            try:
-                err = json.loads(e.read())
-            except ValueError:
-                raise Unreachable(f"{self.url}: HTTP {e.code}") from e
-            if err.get("error") == "conflict":
-                raise Conflict(err.get("vote")) from e
-            raise Rejected(err.get("message", "rejected")) from e
-        except (urllib.error.URLError, OSError, ValueError) as e:
-            raise Unreachable(f"{self.url}: {e}") from e
+            err = _parse(e.body)
+        except _MALFORMED_JSON:
+            err = None
+        if not isinstance(err, dict):
+            raise Unreachable(f"{self.url}: HTTP {e.status}") from e
+        msg = err.get("message")
+        msg = msg if isinstance(msg, str) else "rejected"
+        if get:
+            raise Unreachable(f"{self.url}: HTTP {e.status}: {msg}") from e
+        if err.get("error") == "conflict":
+            vote = err.get("vote")
+            if vote is not None and not _vote_shaped(vote):
+                raise self._malformed("conflict") from e
+            raise Conflict(vote) from e
+        raise Rejected(msg) from e
 
     def spend(self, req: dict) -> dict:
-        return self._call("spend", {"request": req})
+        v = self._call("spend", {"request": req})
+        if not _vote_shaped(v):
+            raise self._malformed("SPEND")
+        return v
 
     def release(self, sigil: str, proof: dict) -> int:
-        return self._call("release", {"sigil": sigil, "proof": proof})
+        gen = self._call("release", {"sigil": sigil, "proof": proof})
+        if not _is_int(gen):
+            raise self._malformed("RELEASE")
+        return gen
 
     def status(self, sigil: str) -> dict:
-        # Nothing a witness sends is trusted (WIRE.md): a reply of the wrong shape counts as
-        # no answer, and votes that are not well-formed vote objects are dropped (the rest
-        # are still verified by whoever uses them).
+        # A reply of the wrong shape counts as no answer, and votes that are not well-formed vote
+        # objects are dropped (the rest are still verified by whoever uses them).
         st = self._call("status", {"sigil": sigil})
         if not (isinstance(st, dict) and _is_int(st.get("gen")) and st["gen"] >= 0
                 and (st.get("tid") is None or isinstance(st.get("tid"), str))
                 and isinstance(st.get("votes"), list)):
-            raise Unreachable(f"{self.url}: malformed STATUS reply")
-        votes = [v for v in st["votes"] if _vote_shaped(v)]
+            raise self._malformed("STATUS")
+        votes = [v for v in st["votes"][:MAX_STATUS_VOTES] if _vote_shaped(v)]
         return dict(st, votes=votes)
 
     def heartbeat(self, challenge: str) -> dict:
-        return self._call("heartbeat", {"challenge": challenge})
+        hb = self._call("heartbeat", {"challenge": challenge})
+        if not isinstance(hb, dict):
+            raise self._malformed("heartbeat")
+        return hb
 
     def sell_stamp(self, blinded: int) -> int:
-        return int(self._call("sell_stamp", {"blinded": format(blinded, "x")}), 16)
+        sig = self._call("sell_stamp", {"blinded": format(blinded, "x")})
+        try:
+            return int(sig, 16)
+        except (TypeError, ValueError):
+            raise self._malformed("sell_stamp") from None
 
     def charters(self) -> dict:
-        return self._get("charters")
+        """The charter chains the witness offers, ``{cid: chain}`` (each verified by the caller)."""
+        chains = self._get("charters")
+        if not isinstance(chains, dict):
+            raise self._malformed("charters")
+        return {cid: c for cid, c in chains.items() if isinstance(c, list)}
+
+    def chain(self, cid: str) -> list:
+        """The witness's charter chain of ``cid`` (``[]`` if it knows none; verified by the caller).
+
+        Asked for by name, so it arrives however many other chains gossip has handed the
+        witness. A witness older than ``GET /v0/charters/<cid>`` answers 404: then the chain
+        is taken from ``GET /v0/charters``.
+        """
+        if not (isinstance(cid, str) and cid.isalnum()):
+            return []
+        try:
+            chain = self._get(f"charters/{cid}")
+        except Unreachable as e:
+            if getattr(e.__cause__, "status", None) != 404:
+                raise
+            chain = self.charters().get(cid, [])
+        if not isinstance(chain, list):
+            raise self._malformed("charters")
+        return chain
 
     # Rotation (SPEC §5.4): operator calls, authorised by ``admin_token``.
 
+    def _sig_snapshot(self, method: str, out) -> tuple[str, dict]:
+        # A snapshot maps sigils to lists of evidence entries (SPEC §5.4); each entry is
+        # checked by the member that adopts it.
+        snap = out.get("snapshot") if isinstance(out, dict) else None
+        if not (isinstance(out.get("sig") if isinstance(out, dict) else None, str) and isinstance(snap, dict)
+                and all(isinstance(v, list) for v in snap.values())):
+            raise self._malformed(method)
+        return out["sig"], portable_snapshot(out["snapshot"])
+
+    def _membership(self, method: str, out) -> None:
+        if not (isinstance(out, dict) and isinstance(out.get("constellation"), str) and _is_int(out.get("version"))):
+            raise self._malformed(method)
+        self.cid, self.version = out["constellation"], out["version"]
+
     def freeze(self, next_charter: dict) -> tuple[str, dict]:
-        out = self._call("freeze", {"charter": next_charter})
-        return out["sig"], out["snapshot"]
+        return self._sig_snapshot("freeze", self._call("freeze", {"charter": next_charter}))
 
     def adopt(self, cid: str, version: int, snapshots: list) -> None:
-        out = self._call("adopt", {"constellation": cid, "version": version, "snapshots": snapshots})
-        self.cid, self.version = out["constellation"], out["version"]
+        self._membership("adopt", self._call("adopt", {"constellation": cid, "version": version,
+                                                       "snapshots": snapshots}))
 
     # Gossip (docs/WIRE.md "Gossip"). Nothing pulled is trusted: the caller
     # admits it through a ``GossipStore``, which verifies every item.
 
-    def _get_capped(self, path: str):
-        try:
-            with urllib.request.urlopen(f"{self.url}/v0/{path}", timeout=self.timeout) as r:
-                data = r.read(self.max_response + 1)
-            if len(data) > self.max_response:
-                raise ValueError("response too large")
-            return json.loads(data)["ok"]
-        except (urllib.error.URLError, OSError, ValueError, KeyError, TypeError) as e:
-            raise Unreachable(f"{self.url}: {e}") from e
-
     def proofs(self) -> dict:
-        """The ``{proofs, forks}`` the witness holds."""
-        return self._get_capped("proofs")
-
-    def pull(self) -> dict:
-        """Everything the witness can gossip: ``{charters, proofs, forks}``."""
-        out = self._get_capped("proofs")
+        """The ``{proofs, forks}`` the witness holds (each item verified by the caller)."""
+        out = self._get("proofs")
         if not isinstance(out, dict):
-            raise Unreachable(f"{self.url}: malformed proofs reply")
-        out["charters"] = self._get_capped("charters")
+            raise self._malformed("proofs")
+        proofs, forks = out.get("proofs"), out.get("forks")
+        return {"proofs": proofs if isinstance(proofs, list) else [],
+                "forks": forks if isinstance(forks, list) else []}
+
+    def pull(self, cids=()) -> dict:
+        """Everything the witness can gossip: ``{charters, proofs, forks}``.
+
+        If every chain it holds is more than one reply can carry (gossip admits any valid
+        genesis, so anyone can fill a witness), the chains of ``cids`` are asked for one by one.
+        """
+        out = self.proofs()
+        try:
+            out["charters"] = self.charters()
+        except Unreachable as e:
+            if not cids or not getattr(e, "too_large", False):
+                raise
+            out["charters"] = {cid: c for cid in cids if (c := self.chain(cid))}
         return out
 
     def gossip(self, msg: dict) -> dict:
         """Offer ``{charters, proofs, forks}``; returns the counts the witness accepted."""
-        return self._call("gossip", msg)
+        out = self._call("gossip", msg)
+        if not (isinstance(out, dict) and all(_is_int(v) for v in out.values())):
+            raise self._malformed("gossip")
+        return out
 
 
 class RemoteStandby(RemoteWitness):
@@ -498,32 +776,39 @@ class RemoteStandby(RemoteWitness):
         self.url = url.rstrip("/")
         self.timeout = timeout
         self.admin_token = admin_token
-        self.max_response = MAX_RESPONSE
-        info = self._get("info")
-        self.pk, self.cid, self.version = info["pk"], info["constellation"], info["version"]
+        info = self._info()
+        self.pk, self.cid, self.version = info["pk"], info.get("constellation"), info.get("version")
         self.stamps = None
 
     def __repr__(self):
         return f"RemoteStandby({self.url}, {self.pk[:8]})"
 
     def mirror_bind(self, req: dict) -> dict:
-        return self._call("mirror", {"request": req})
+        ack = self._call("mirror", {"request": req})
+        if not isinstance(ack, dict):
+            raise self._malformed("mirror")
+        return ack
 
     def note_release(self, sigil: str, entry: dict) -> bool:
-        return self._call("note_release", {"sigil": sigil, "entry": entry})
+        out = self._call("note_release", {"sigil": sigil, "entry": entry})
+        if not isinstance(out, bool):
+            raise self._malformed("note_release")
+        return out
 
     # Operator calls, authorised by ``admin_token``.
 
     def enter(self, cid: str, version: int, snapshots: list) -> None:
-        out = self._call("standby", {"constellation": cid, "version": version, "snapshots": snapshots})
-        self.cid, self.version = out["constellation"], out["version"]
+        self._membership("standby", self._call("standby", {"constellation": cid, "version": version,
+                                                           "snapshots": snapshots}))
 
     def succeed(self, next_charter: dict, sigs: dict | None = None) -> tuple[str, dict]:
-        out = self._call("succeed", {"charter": next_charter, "sigs": sigs or {}})
-        return out["sig"], out["snapshot"]
+        return self._sig_snapshot("succeed", self._call("succeed", {"charter": next_charter, "sigs": sigs or {}}))
 
     def probe(self, urls: list) -> int:
-        return self._call("probe", {"urls": list(urls)})["answered"]
+        out = self._call("probe", {"urls": list(urls)})
+        if not (isinstance(out, dict) and _is_int(out.get("answered")) and out["answered"] >= 0):
+            raise self._malformed("probe")
+        return out["answered"]
 
     def status(self, sigil: str) -> dict:
         """The ``{bindings: [[gen, tid], ...]}`` of ``sigil`` in the member's mirror log."""
@@ -531,11 +816,11 @@ class RemoteStandby(RemoteWitness):
         if not (isinstance(st, dict) and isinstance(st.get("bindings"), list)
                 and all(isinstance(b, list) and len(b) == 2 and _is_int(b[0]) and isinstance(b[1], str)
                         for b in st["bindings"])):
-            raise Unreachable(f"{self.url}: malformed STATUS reply")
+            raise self._malformed("STATUS")
         return st
 
     def info(self) -> dict:
-        return self._get("info")
+        return self._info()
 
 
 class RemoteNetwork:
@@ -564,7 +849,7 @@ class RemoteNetwork:
         if c is None:
             try:
                 c = self._standbys[url] = RemoteStandby(url, self.timeout)
-            except Unreachable:
+            except Rejected:  # unreachable, refused (e.g. rate limited) or a malformed reply
                 return None
         return c
 
@@ -578,24 +863,33 @@ class RemoteNetwork:
         if c is None:
             try:
                 c = self._clients[url] = RemoteWitness(url, self.timeout)
-            except Unreachable:
+            except Rejected:  # unreachable, refused (e.g. rate limited) or a malformed reply
                 return None
         return c
 
+    def configured(self) -> set:
+        """The constellations this address book was given: the default trust of a wallet.
+
+        Never whatever the registry learned since (from witnesses or dossiers): gossip
+        admits any valid genesis chain from anyone, so learning a chain is not a reason to
+        trust it.
+        """
+        return set(self.urls) | set(self.committees)
+
     def refresh_charters(self, cid: str) -> None:
+        """Learn ``cid``'s charter chain from its witnesses (only that chain, verified)."""
         for url in self.urls.get(cid, []):
             c = self._client(url)
             if c is None:
                 continue
             try:
-                chains = c.charters()
-            except Unreachable:
+                chain = c.chain(cid)
+            except Rejected:
                 continue
-            for other, chain in chains.items():
-                try:
-                    self.registry.add_chain(other, chain)
-                except ValueError:
-                    pass  # invalid or forked chains are ignored, never trusted
+            try:
+                self.registry.add_chain(cid, chain)
+            except (ValueError, KeyError, TypeError, AttributeError, IndexError, RecursionError):
+                pass  # invalid, malformed or forked chains are ignored, never trusted
 
     def all_witnesses(self, cid: str) -> list:
         return [c for c in (self._client(u) for u in self.urls.get(cid, [])) if c is not None]
@@ -739,11 +1033,17 @@ class RemoteNetwork:
         self.registry.add_chain(cid, new_chain)
         # Everyone involved learns the new version (gossip admits it only if it verifies).
         everyone = self.urls.get(cid, []) + new_urls + self.committees.get(cid, []) + committee_urls
+        # ... and the chains the handed-over death proofs cite: an adopter or standby member can
+        # only verify (and so keep) a release whose evidence comes from a chain it knows.
+        cited = {c: self.registry.chain(c) for c in _cited_homes(snapshots) if c != cid and self.registry.chain(c)}
+        items = list(cited.items())
+        batches = [{cid: new_chain}] + [dict(items[k:k + 32]) for k in range(0, len(items), 32)]
         for url in dict.fromkeys(everyone):
-            try:
-                RemoteWitness(url, self.timeout).gossip({"charters": {cid: new_chain}})
-            except Rejected:
-                pass
+            for chains in batches:
+                try:
+                    RemoteWitness(url, self.timeout).gossip({"charters": chains})
+                except Rejected:
+                    pass
         pending = []
         for w in new:
             if w.pk in cur["witnesses"] and w.pk not in frozen:

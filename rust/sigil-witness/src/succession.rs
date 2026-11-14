@@ -22,8 +22,7 @@
 //! [`MAX_MIRROR_TIDS`] transitions per sigil and generation; a release entry needs a death proof
 //! of at most [`MAX_PROOF_BYTES`] for a binding the member holds. Each refusal only withholds an
 //! ack (no ack, no vote), which costs liveness, never safety. The handover of STANDBY, like
-//! ADOPT, keeps every verifiable entry it is given (verified binds, and verified releases and
-//! seals of transactions bound in it), each distinct one once.
+//! ADOPT, keeps every verifiable entry it is given, each distinct one once, and drops the rest.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, RwLock};
@@ -35,7 +34,7 @@ use crate::json::{obj, Json};
 use crate::model::{ack_payload, transition_id};
 use crate::proofs::{proves_dead, verify_heartbeat};
 use crate::store::{charter_entries, charter_entry, restore_charters, Entry, Loaded, Store};
-use crate::witness::{authorises, verified_evidence, Clock, Error, Outcome, MAX_AUTH_BYTES, MAX_GEN, MAX_PROOF_BYTES};
+use crate::witness::{authorises, classify_evidence, Clock, Error, Outcome, MAX_AUTH_BYTES, MAX_GEN, MAX_PROOF_BYTES};
 
 /// Distinct transitions a member mirrors per (sigil, generation) (`succession.MAX_MIRROR_TIDS`).
 /// Only the owner can authorise its sigil, so the cap only ever limits an owner flooding its own
@@ -300,17 +299,16 @@ impl Standby {
             }
         }
         // Like ADOPT, the handover keeps every verifiable entry whatever its size (dropping
-        // evidence could lose a sealed binding), and only those: verified bind entries and the
-        // verified releases and seals of transactions bound in it (SPEC §5.4, §5.5). Our mirror
-        // log is the evidence a successor adopts, so junk kept here would be forwarded at every
-        // later handover.
+        // evidence could lose a sealed binding), and nothing else: junk a Byzantine predecessor
+        // added would otherwise be handed on to every later committee.
+        let members: HashSet<String> =
+            registry.charter(cid, version).map(|c| c.witnesses.iter().cloned().collect()).unwrap_or_default();
         let mirror: HashMap<String, Vec<Json>> = snapshot_union(snapshots)
             .into_iter()
-            .map(|(s, log)| {
-                let kept = verified_evidence(&s, log, cid, &registry, self.batch_verify);
-                (s, kept)
+            .filter_map(|(s, log)| {
+                let kept = classify_evidence(&s, log, cid, &registry, self.batch_verify, None, &members).kept;
+                (!kept.is_empty()).then_some((s, kept))
             })
-            .filter(|(_, log)| !log.is_empty())
             .collect();
         let since = self.now();
         let mut entries: Vec<Entry> = Vec::with_capacity(mirror.len() + 2);
@@ -444,9 +442,16 @@ impl Standby {
             return rejected("not standing by for this constellation version");
         }
         let mut log = st.mirror.get(sigil).cloned().unwrap_or_default();
-        if log.iter().any(|e| e.get("kind").and_then(Json::as_str) == Some("release") && e.get("tid").and_then(Json::as_str) == Some(t)) {
+        let is_rel = |e: &Json| e.get("kind").and_then(Json::as_str) == Some("release") && e.get("tid").and_then(Json::as_str) == Some(t);
+        let null = Json::Null;
+        let registry = self.registry();
+        if log.iter().filter(|e| is_rel(e)).any(|e| {
+            proves_dead(e.get("header").unwrap_or(&null), t, e.get("proof").unwrap_or(&null), &registry, self.batch_verify)
+        }) {
             return Ok(Json::Bool(false));
         }
+        // Releases kept from a handover that we could not verify give way to one that verifies.
+        log.retain(|e| !is_rel(e));
         log.push(obj([
             ("kind", "release".into()),
             ("gen", Json::Int(gen)),
@@ -561,16 +566,27 @@ impl Standby {
     }
 
     /// Challenge each member at `urls` for a heartbeat (outside any lock); count valid answers.
+    /// Members are asked at once and each answer is recorded as it arrives, so a member that
+    /// stalls its reply (up to the client deadline) never delays hearing the others.
     pub fn probe(&self, urls: &[String]) -> usize {
-        let mut n = 0;
-        for url in urls {
-            let challenge = hex::encode(rand::random::<[u8; 16]>());
-            let body = obj([("challenge", Json::str(&challenge))]);
-            if let Ok(hb) = crate::client::post(url, "heartbeat", &body, std::time::Duration::from_secs(5)) {
-                n += self.observe(&hb, &challenge) as usize;
-            }
-        }
-        n
+        let mut seen = std::collections::BTreeSet::new();
+        let urls: Vec<&String> = urls.iter().filter(|u| seen.insert(u.as_str())).collect();
+        std::thread::scope(|scope| {
+            let asks: Vec<_> = urls
+                .into_iter()
+                .map(|url| {
+                    scope.spawn(move || {
+                        let challenge = hex::encode(rand::random::<[u8; 16]>());
+                        let body = obj([("challenge", Json::str(&challenge))]);
+                        match crate::client::post(url, "heartbeat", &body, std::time::Duration::from_secs(5)) {
+                            Ok(hb) => self.observe(&hb, &challenge) as usize,
+                            Err(_) => 0,
+                        }
+                    })
+                })
+                .collect();
+            asks.into_iter().map(|a| a.join().unwrap_or(0)).sum()
+        })
     }
 
     /// `/v0/gossip`: admit what verifies; the registry learns new charter versions.

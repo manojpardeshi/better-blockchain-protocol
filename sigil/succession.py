@@ -25,8 +25,7 @@ below generation 16, and at most ``MAX_MIRROR_TIDS`` transitions per sigil and
 generation; a release entry needs a death proof of at most 128 KiB for a binding
 the member holds. Each refusal only withholds an ack (no ack, no vote), which
 costs liveness and never safety. The handover of STANDBY, like ADOPT, keeps every
-verifiable entry it is given (verified binds, verified releases and seals of
-transactions bound in it, and verified members' votes), each distinct one once.
+verifiable entry it is given, each distinct one once, and drops the rest.
 """
 
 import json
@@ -39,7 +38,7 @@ from .model import ack_payload, transition_id
 from .proofs import proves_dead, verify_heartbeat
 from .store import WitnessStore, charter_entries, restore_charters
 from .witness import (MAX_AUTH_BYTES, MAX_GEN, MAX_PROOF_BYTES, Rejected, _encoding, _too_big, authorises,
-                      verified_evidence)
+                      classify_evidence)
 
 # Distinct transitions a member mirrors per (sigil, generation). An honest owner binds
 # one transition per generation, and re-pledges another only after the first expired
@@ -208,14 +207,12 @@ class Standby:
             if self.cid != cid or not _is_int(version) or version <= self.version:
                 raise Rejected("already standing by for another version")
         # Like ADOPT, the handover keeps every verifiable entry whatever its size (dropping
-        # evidence could lose a sealed binding), and only those: verified bind entries, the
-        # verified releases and seals of transactions bound in it, and verified members'
-        # votes, which a re-used key adopts as its own (SPEC §5.4, §5.5).
-        # Our mirror log is the evidence a successor adopts, so junk kept here would be
-        # forwarded at every later handover.
+        # evidence could lose a sealed binding), and nothing else: junk a Byzantine
+        # predecessor added would otherwise be handed on to every later committee.
         mirror = {}
+        members = set(self.registry.charter(cid, version)["witnesses"])
         for sigil, log in _members_snapshot_union(snapshots).items():
-            kept = verified_evidence(sigil, log, cid, self.registry)
+            kept = classify_evidence(sigil, log, cid, self.registry, members=members).kept
             if kept:
                 mirror[sigil] = kept
         since = int(self.clock())
@@ -296,8 +293,11 @@ class Standby:
         if not ok:
             raise Rejected("invalid release evidence")
         log = self.mirror.get(sigil, [])
-        if any(e.get("kind") == "release" and e.get("tid") == t for e in log):
+        held = [e for e in log if e.get("kind") == "release" and e.get("tid") == t]
+        if any(proves_dead(e["header"], t, e["proof"], self.registry) for e in held):
             return False
+        # Releases kept from a handover that we could not verify give way to one that verifies.
+        log = [e for e in log if not (e.get("kind") == "release" and e.get("tid") == t)]
         log = log + [{"kind": "release", "gen": entry["gen"], "tid": t, "header": h, "proof": proof}]
         self._persist(("mirror", f"{self.version}|{sigil}", log))
         self.mirror[sigil] = log

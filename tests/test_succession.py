@@ -810,7 +810,7 @@ class SuccessionLimitTests(unittest.TestCase):
             m.note_release(self.s, entry(T2))         # anyone can build T2; it was never bound here
         self.assertEqual([e["kind"] for e in m.mirror[self.s]], ["bind", "release"])
 
-    def test_handover_keeps_each_verified_entry_once_and_drops_junk(self):
+    def test_handover_keeps_each_verifiable_entry_once(self):
         h = self.h
         r = h.req(h.hdr([(self.s, 0)], "1"), self.s, self.p)
         bind = {"kind": "bind", "gen": 0, "auth": {k: r[k] for k in ("home", "lock", "salt", "unlock", "header")}}
@@ -818,7 +818,7 @@ class SuccessionLimitTests(unittest.TestCase):
         snap = {self.s: [bind] + junk, "x": "not a log"}
         fresh = Standby(h.ckeys[1], h.net.registry, h.net.clock)
         fresh.enter(h.X, 0, [snap, snap, snap, "not a snapshot"])
-        # Each distinct entry once, and only verifiable ones (as ADOPT, SPEC §5.4/§5.5).
+        # Unverifiable entries are dropped: junk would be handed on to every later committee.
         self.assertEqual(fresh.mirror[self.s], [bind])
         self.assertEqual(fresh.mirrored, {(self.s, 0, model.transition_id(r["header"]))})
         self.assertNotIn("x", fresh.mirror)

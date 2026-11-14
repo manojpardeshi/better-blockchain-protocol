@@ -73,7 +73,8 @@ $S --wallet bob   address > bob-addr.json         # bob gives this to alice
 $S --wallet alice pay bob-addr.json <id> 300 --out payment.json
 $S --wallet bob   receive payment.json [--deep]   # verifies, then takes custody
 $S --wallet bob   balance; $S --wallet bob assets; $S --wallet bob export-dossier
-$S --wallet bob   trust <other-cid>               # accept parcels homed there too
+$S --wallet bob   trust <other-cid>               # accept parcels homed there too (by default a wallet
+                                                   # trusts only its home and the directory's constellations)
 $S --wallet alice buy-stamps <cid> 10             # for homes whose witnesses require stamps
 ```
 
