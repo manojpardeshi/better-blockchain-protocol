@@ -854,14 +854,25 @@ impl Witness {
         }
         // Our signed votes travel with the evidence, so that a re-used key never votes another
         // transition at a (sigil, generation) where it already voted.
+        // A re-used key keeps its own vote for a checkpointed binding (STATUS still shows it).
+        let reused = next_charter.get("witnesses").and_then(Json::as_arr).is_some_and(|ws| ws.iter().any(|w| w.as_str() == Some(self.pk.as_str())));
         let snapshot = Json::Obj(
             st.records
                 .iter()
-                .filter(|(s, _)| !ck.contains_key(*s))
-                .map(|(s, r)| {
-                    let mut log = r.log.clone();
-                    log.extend(r.votes.iter().map(|v| obj([("kind", "vote".into()), ("vote", v.clone())])));
-                    (s.clone(), Json::Arr(log))
+                .filter_map(|(s, r)| {
+                    if !ck.contains_key(s) {
+                        let mut log = r.log.clone();
+                        log.extend(r.votes.iter().map(|v| obj([("kind", "vote".into()), ("vote", v.clone())])));
+                        return Some((s.clone(), Json::Arr(log)));
+                    }
+                    let want = r.tid.clone().map(|t| (r.gen, t));
+                    let mine: Vec<Json> = r
+                        .votes
+                        .iter()
+                        .filter(|v| reused && vote_key(v) == want)
+                        .map(|v| obj([("kind", "vote".into()), ("vote", v.clone())]))
+                        .collect();
+                    (!mine.is_empty()).then(|| (s.clone(), Json::Arr(mine)))
                 })
                 .collect(),
         );

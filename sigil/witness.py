@@ -495,6 +495,13 @@ class Witness:
         # at a (sigil, generation) where we already voted.
         snapshot = {s: list(r.log) + [{"kind": "vote", "vote": v} for v in r.votes]
                     for s, r in self.records.items() if s not in ck}
+        if self.pk in next_charter["witnesses"]:
+            # A re-used key keeps its own vote for a checkpointed binding (STATUS still shows it).
+            for s in ck:
+                r = self.records[s]
+                mine = [{"kind": "vote", "vote": v} for v in r.votes if (v["gen"], v["tid"]) == (r.gen, r.tid)]
+                if mine:
+                    snapshot[s] = mine
         return sign_charter(self.kp, next_charter), snapshot
 
     def adopt(self, cid: str, version: int, snapshots: list, checkpoint: list | None = None) -> None:
