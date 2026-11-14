@@ -398,9 +398,10 @@ bound; `f+1` current confirmations mean ≥ 1 honest current witness vouches, an
 honest witnesses inherit every real binding on rotation (SPEC §5.4). Bonds with
 unbonding longer than the deep-confirmation horizon keep the forgers slashable.
 
-**Residual risk — Medium.** Deep confirmation is **off by default** (`deep_threshold
-= None`) and only as strong as the *current* honest majority and the `f+1`
-threshold (`MC_deep_mutant` shows `f` is unsafe). BUG-4 demonstrated that a
+**Residual risk — Medium.** Amount-triggered deep confirmation is **off by
+default** (`deep_threshold = None`); confirmation after succession is on by
+default. Either check is only as strong as the *current* honest majority and the
+`f+1` threshold (`MC_deep_mutant` shows `f` is unsafe). BUG-4 demonstrated that a
 per-parcel threshold could be bypassed by splitting a payment; the wallet now
 checks the total per asset in one receipt. Per-counter-party limits over time are
 still absent. BUG-2's false rejection of honest history is also fixed. The
