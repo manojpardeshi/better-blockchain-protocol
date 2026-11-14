@@ -11,7 +11,9 @@ Commands (all print JSON on stdout):
     assets                               assets held, with names
     pay ADDRESS_FILE ASSET AMOUNT --out PAYMENT_FILE
                                          seal a payment; writes the file the payee needs
-    receive PAYMENT_FILE [--deep]        verify a payment file and take custody
+    receive PAYMENT_FILE [--deep]        verify a payment file and take custody (a file
+                                         holding a swap we authorised, completed by the
+                                         other party, also completes it here)
     export-dossier                       the whole dossier
 
 Payments are holder-to-holder file hand-offs: no server stores them. A
@@ -193,7 +195,20 @@ def cmd_receive(args):
         ids = [model.parcel_id(r) for r in refs]
     except (ValueError, KeyError, TypeError) as e:
         raise CliError(f"malformed payment file: {e}") from e
+    # A multi-party transition (a swap) we authorised and the other party completed: record it
+    # from their dossier (our wallet may lack an unlock it needs, e.g. after a crash).
+    done = []
+    for tid in [t for t in dossier.transitions if t in w.pending]:
+        try:
+            w.accept_completed(dossier, tid)
+        except (KeyError, TypeError) as e:
+            raise InvalidDossier(f"malformed payment: {e}") from e
+        done.append(tid)
+    if done:
+        wallet_store.save(w, args.wallet)
     new = [r for r, i in zip(refs, ids) if i not in w.holdings]
+    if not new and done:
+        return {"already": False, "completed": done, "received": []}
     if not new:
         return {"already": True, "received": []}
     try:

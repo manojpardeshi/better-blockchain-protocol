@@ -553,6 +553,31 @@ class Regressions(unittest.TestCase):
         live = {h["sigil"] for h in a.holdings.values()} & set(a.pledged)
         self.assertEqual(live, set(), "alice's main input is stuck pledged to a swap she forgot")
 
+    def test_single_party_seal_stops_at_the_first_failure(self):
+        """REVIEW FINDING (Low). A payment of alice's with inputs in two homes, the first home
+        down: ``seal`` must not go on binding the healthy home's input to a tid that cannot
+        complete now (it did once it bound every input it could, which only swaps need)."""
+        a = self.a
+        y_kill = a.kill_switch(self.Y)                    # a parcel of alice's homed at Y
+        xs = next(h for h in a.holdings.values() if h["parcel"]["home"] == self.X and h["parcel"]["amount"] == 100)
+        me = a.address()
+        header, body, _ = a.prepare([y_kill["ref"], xs["ref"]],
+                                    [model.parcel(self.X, self.x, 100, me["lock"], me["salt"])])
+        unlocks = a.authorise(header, body, release_kill=True)
+        self.net.down |= {w.pk for w in self.net.all_witnesses(self.Y)}
+        with self.assertRaises(SealFailed):
+            a.seal(header, body, unlocks)
+        self.net.down.clear()
+        self.assertTrue(all(w.status(xs["sigil"])["tid"] is None for w in self.net.all_witnesses(self.X)))
+
+    def test_accept_completed_rejects_a_dossier_without_the_transition(self):
+        """REVIEW FINDING (Low): a malformed hand-over raised KeyError instead of InvalidDossier."""
+        header, body, unlocks, kills = self.swap_to_kill_switches()
+        tid = model.transition_id(header)
+        from sigil.validate import Dossier
+        with self.assertRaises(InvalidDossier):
+            self.b.accept_completed(Dossier(), tid)
+
     def test_swap_settles_when_a_crash_lost_the_counterpartys_unlock(self):
         """FINDING (wallet, Medium-High). Both parties released their kill switches; alice holds
         every unlock (her cosign was saved), bob's crash lost alice's kill-switch unlock (his

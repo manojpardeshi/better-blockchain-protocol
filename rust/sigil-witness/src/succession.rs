@@ -296,10 +296,12 @@ impl Standby {
         // Like ADOPT, the handover keeps every verifiable entry whatever its size (dropping
         // evidence could lose a sealed binding), and nothing else: junk a Byzantine predecessor
         // added would otherwise be handed on to every later committee.
+        let members: HashSet<String> =
+            registry.charter(cid, version).map(|c| c.witnesses.iter().cloned().collect()).unwrap_or_default();
         let mirror: HashMap<String, Vec<Json>> = snapshot_union(snapshots)
             .into_iter()
             .filter_map(|(s, log)| {
-                let kept = classify_evidence(&s, log, cid, &registry, self.batch_verify, None).kept;
+                let kept = classify_evidence(&s, log, cid, &registry, self.batch_verify, None, &members).kept;
                 (!kept.is_empty()).then_some((s, kept))
             })
             .collect();

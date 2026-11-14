@@ -784,7 +784,7 @@ impl Witness {
         }
         let mut records: Vec<(String, Record)> = Vec::with_capacity(evidence.items.len());
         for (sigil, (log, _)) in evidence.items {
-            let ev = classify_evidence(&sigil, log, cid, &registry, batch, Some(&self.pk));
+            let ev = classify_evidence(&sigil, log, cid, &registry, batch, Some(&self.pk), &HashSet::new());
             let prior = st.records.get(&sigil);
             let mut own: OrderedMap<(i128, String), Json> = OrderedMap::new(); // votes our key cast
             if let Some(prior) = prior {
@@ -968,7 +968,19 @@ pub(crate) struct Evidence {
 /// sigil. Releases and seals are kept only for a transaction bound in this evidence (an honest
 /// witness logs one only for a transaction it bound); everything else is junk.
 /// With `voter`, only that key's votes are checked and kept (ADOPT needs only its own).
-pub(crate) fn classify_evidence(sigil: &str, log: Vec<Json>, cid: &str, registry: &Registry, batch: bool, voter: Option<&str>) -> Evidence {
+/// Without `voter` (STANDBY), `kept` also holds, for a kept binding, the first release whose
+/// death proof cites a home whose chain this member does not know (a later adopter that knows it
+/// can verify it), within `MAX_PROOF_BYTES`; and a vote only if its sigil has a kept binding or
+/// its signer is in `members` (the version handed over: a re-used key's own votes travel).
+pub(crate) fn classify_evidence(
+    sigil: &str,
+    log: Vec<Json>,
+    cid: &str,
+    registry: &Registry,
+    batch: bool,
+    voter: Option<&str>,
+    members: &HashSet<String>,
+) -> Evidence {
     let sigil_j = Json::str(sigil);
     let mut binds: OrderedMap<(i128, String), Json> = OrderedMap::new();
     let mut dead: HashSet<String> = HashSet::new();
@@ -977,6 +989,7 @@ pub(crate) fn classify_evidence(sigil: &str, log: Vec<Json>, cid: &str, registry
     let mut keep = vec![false; log.len()];
     let mut is_vote = vec![false; log.len()];
     let mut releases: Vec<(usize, String)> = Vec::new();
+    let mut unknown: Vec<(usize, String)> = Vec::new();
     let mut seals: Vec<(usize, (i128, String))> = Vec::new();
     for (i, e) in log.iter().enumerate() {
         match e.get("kind").and_then(Json::as_str) {
@@ -1021,9 +1034,12 @@ pub(crate) fn classify_evidence(sigil: &str, log: Vec<Json>, cid: &str, registry
                 let null = Json::Null;
                 let h = e.get("header").unwrap_or(&null);
                 let Some(t) = e.get("tid").and_then(Json::as_str) else { continue };
-                if transition_id(h) == t && proves_dead(h, t, e.get("proof").unwrap_or(&null), registry, batch) {
+                let proof = e.get("proof").unwrap_or(&null);
+                if transition_id(h) == t && proves_dead(h, t, proof, registry, batch) {
                     dead.insert(t.to_string());
                     releases.push((i, t.to_string()));
+                } else if voter.is_none() && transition_id(h) == t && cites_unknown_home(proof, registry) {
+                    unknown.push((i, t.to_string()));
                 }
             }
             _ => {}
@@ -1040,6 +1056,14 @@ pub(crate) fn classify_evidence(sigil: &str, log: Vec<Json>, cid: &str, registry
             keep[*i] = true;
         }
     }
+    let mut extra = vec![false; log.len()];
+    let mut once: HashSet<&String> = HashSet::new();
+    for (i, t) in &unknown {
+        if bound.contains(t) && !dead.contains(t) && once.insert(t) {
+            extra[*i] = true;
+        }
+    }
+    let bound_sigil = !binds.items.is_empty();
     let mut out_log = Vec::new();
     let mut kept = Vec::new();
     for (i, e) in log.into_iter().enumerate() {
@@ -1047,10 +1071,25 @@ pub(crate) fn classify_evidence(sigil: &str, log: Vec<Json>, cid: &str, registry
             out_log.push(e.clone());
             kept.push(e);
         } else if is_vote[i] {
+            let signer = e.get("vote").and_then(|v| v.get("witness")).and_then(Json::as_str).unwrap_or("");
+            if voter.is_some() || bound_sigil || members.contains(signer) {
+                kept.push(e);
+            }
+        } else if extra[i] {
             kept.push(e);
         }
     }
     Evidence { binds, dead, sealed, votes, log: out_log, kept }
+}
+
+/// Does a death proof (within the size cap) cite a home whose chain `registry` lacks?
+fn cites_unknown_home(proof: &Json, registry: &Registry) -> bool {
+    if proof.as_obj().is_none() {
+        return false;
+    }
+    let Some(parcel) = proof.get("parcel").filter(|p| p.as_obj().is_some()) else { return false };
+    let Some(home) = parcel.get("home").and_then(Json::as_str) else { return false };
+    registry.chain(home).is_empty() && proof.canonical().len() <= MAX_PROOF_BYTES
 }
 
 /// `(v["gen"], v["tid"])` of one of our votes.

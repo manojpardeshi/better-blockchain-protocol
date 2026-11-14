@@ -334,6 +334,50 @@ class HandoverAdversary(unittest.TestCase):
             with self.subTest(role=role):
                 self.compare([snap], [a], role)
 
+    def test_release_citing_an_unknown_home_is_kept_by_standby(self):
+        """REVIEW FINDING (Medium). A swap of a (homed here) and q (homed at lyra) died: q was
+        spent elsewhere and sealed by lyra. The release's death proof cites lyra, whose chain the
+        standby member does not know, so it cannot verify it, and STANDBY used to drop it for
+        good; after a takeover the successor would find a bound to the dead swap. Now a standby
+        member keeps such a release for a binding it holds (once per tid, within the proof cap),
+        for an adopter that knows lyra to verify."""
+        d = make_tmpdir(self, "lyra")
+        ly = new_constellation(d, "lyra", 4)
+        lkeys = [load_key(k) for k in ly["keys"]]
+        pa, a = self.parcel("a5" * 16)
+        pq, q = self.parcel("c5" * 16, cid=ly["cid"])
+        Tsw, Tq = self.hdr([(a, 0), (q, 0)], "5"), self.hdr([(q, 0)], "6")
+        tsw, tq = model.transition_id(Tsw), model.transition_id(Tq)
+        seal = model.seal_from_votes([self.vote(k, q, 0, tq, cid=ly["cid"]) for k in lkeys[:3]])
+        proof = {"kind": "seal", "sigil": q, "gen": 0, "parcel": {k: pq[k] for k in ("home", "lock", "salt")},
+                 "seal": seal}
+        rel = {"kind": "release", "gen": 0, "tid": tsw, "header": Tsw, "proof": proof}
+        snap = {a: [self.bind(Tsw, a, pa, 0), rel, dict(rel, proof=dict(proof, pad="x"))]}
+        st, car = self.compare([snap], [a], "standby")
+        self.assertEqual(car.get(a), snap[a][:2], "the release (once) is carried for a later adopter")
+        # A witness that knows lyra verifies it: the binding is dead, a is free at generation 1.
+        pair = self.twins("witness")
+        for dmn in pair:
+            http(dmn.url, "/v0/gossip", {"charters": {ly["cid"]: json.load(open(ly["registry"]))[ly["cid"]]}})
+            code, _r, _ = http(dmn.url, "/v0/adopt", {"constellation": self.cid, "version": 1, "snapshots": [car]},
+                               headers=self.tok)
+            self.assertEqual(code, 200)
+            ok = http(dmn.url, "/v0/status", {"sigil": a})[1]["ok"]
+            self.assertEqual((ok["gen"], ok["tid"]), (1, None))
+
+    def test_standby_drops_votes_on_made_up_sigils(self):
+        """REVIEW FINDING (Low). A Byzantine former member pads the mirror with valid votes of its
+        own on made-up sigils. A vote is now kept only for a sigil with a kept binding, or if its
+        signer is a member of the version handed over (a re-used key's own votes must travel)."""
+        snap, info = self.honest_evidence()
+        a = info["a"][0]
+        former, member = self.old[3], self.old[0]           # old[3] is not in version 1
+        pad = {f"{k:064x}": [{"kind": "vote", "vote": self.vote(former, f"{k:064x}", 0, "ab" * 32)}]
+               for k in range(50)}
+        keep = {"cd" * 32: [{"kind": "vote", "vote": self.vote(member, "cd" * 32, 0, "ab" * 32)}]}
+        st, car = self.compare([snap, pad, keep], [a], "standby")
+        self.assertEqual(sorted(car), sorted([a, info["b"][0], "cd" * 32]))
+
     def test_expiry_beyond_128_bits(self):
         """A binding whose authorisation expires at 2**130 (the owner signed it; an honest wallet
         never does). Python used to bind such a SPEND while Rust could not parse it, so a quorum

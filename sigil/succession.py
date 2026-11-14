@@ -193,8 +193,9 @@ class Standby:
         # evidence could lose a sealed binding), and nothing else: junk a Byzantine
         # predecessor added would otherwise be handed on to every later committee.
         mirror = {}
+        members = set(self.registry.charter(cid, version)["witnesses"])
         for sigil, log in _members_snapshot_union(snapshots).items():
-            kept = classify_evidence(sigil, log, cid, self.registry).kept
+            kept = classify_evidence(sigil, log, cid, self.registry, members=members).kept
             if kept:
                 mirror[sigil] = kept
         since = int(self.clock())

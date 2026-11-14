@@ -602,6 +602,10 @@ class Wallet:
     def seal(self, header: dict, body: dict, unlocks: dict, only=None) -> list:
         """Seal the inputs of a transition (all of them, or the sigils in ``only``)."""
         seals, failed = [], None
+        # Only a multi-party transition goes on past a failed input (see below); a transition of
+        # ours alone stops at once, binding nothing more to a tid that may never complete.
+        mine = {h["sigil"] for h in self.holdings.values()}
+        multi = any(s not in mine for s, _g in header["inputs"])
         for r, (s, _g) in zip(body["inputs"], header["inputs"]):
             if only is not None and s not in only:
                 continue
@@ -615,12 +619,14 @@ class Wallet:
                 # Go on with the other inputs, and fail at the end: binding the inputs we can
                 # unlock lets a counter-party finish the transition (e.g. a swap whose other
                 # party lost our kill switch's unlock in a crash), instead of both waiting.
+                if not multi:
+                    raise
                 if failed is None:
                     failed = e
-        for seal in seals:
-            self.dossier.add_seal(seal)
         if failed is not None:
             raise failed
+        for seal in seals:
+            self.dossier.add_seal(seal)
         return seals
 
     def accept_completed(self, dossier: Dossier, tid: str) -> str:
@@ -633,11 +639,26 @@ class Wallet:
         """
         if tid not in self.pending:
             raise ValueError("no such pending transition")
-        anc = dossier.ancestry([tid])
+        try:
+            anc = dossier.ancestry([tid])
+        except (KeyError, TypeError, AttributeError) as e:
+            raise InvalidDossier(f"dossier does not hold transition {str(tid)[:12]}") from e
         view = Dossier()
         view.merge(self.dossier)
         view.merge(anc)
-        self.verifier.verify_transition(view, tid)
+        try:
+            self.verifier.verify_transition(view, tid)
+            ours = [o for o in anc.transitions[tid]["body"]["outputs"] if model.sigil_of(o) in self.issued]
+        except (KeyError, TypeError, ValueError, AttributeError) as e:
+            raise InvalidDossier(f"malformed transition: {e}") from e
+        # Deep confirmation as for a receipt (SPEC §9): large amounts, or history a succeeded
+        # version sealed.
+        totals: dict = defaultdict(int)
+        for o in ours:
+            totals[o["asset"]] += o["amount"] if isinstance(o.get("amount"), int) else 0
+        if ((self.deep_threshold is not None and any(v >= self.deep_threshold for v in totals.values()))
+                or (self.deep_after_succession and self.sealed_by_succeeded_version(view, [tid]))):
+            self.deep_confirm(view, [tid])
         self.dossier.merge(anc)
         tx = anc.transitions[tid]
         return self.finalise(tx["header"], tx["body"], tx["unlocks"])
@@ -763,6 +784,7 @@ class Wallet:
             # Best effort: tell the home's successor committee too, so a successor
             # sees the binding died instead of finding the sigil contested (SPEC §5.5).
             for m in (self.network.committee(h["parcel"]["home"]) if hasattr(self.network, "committee") else []):
+                self._share_charters(m, proof)  # it can only verify a proof from charters it knows
                 try:
                     m.note_release(s, {"kind": "release", "gen": pledge[0], "tid": tid, "header": header,
                                        "proof": proof})

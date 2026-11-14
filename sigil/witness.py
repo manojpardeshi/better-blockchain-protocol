@@ -125,7 +125,8 @@ class Evidence:
         self.kept: list = []                 # ``log`` plus the verified vote entries, in order
 
 
-def classify_evidence(sigil: str, log: list, cid: str, registry, voter: str | None = None) -> Evidence:
+def classify_evidence(sigil: str, log: list, cid: str, registry, voter: str | None = None,
+                      members=None) -> Evidence:
     """Verify each entry of a (deduplicated) handover log of ``sigil`` for constellation ``cid``.
 
     Bind entries count if their authorisation passes §5.1 step 3 (with no clock); release
@@ -135,9 +136,15 @@ def classify_evidence(sigil: str, log: list, cid: str, registry, voter: str | No
     (an honest witness logs one only for a transaction it bound), so ``log`` keeps them only
     for a transaction bound in this evidence; everything else is junk anyone could add.
     With ``voter``, only that key's votes are checked and kept (ADOPT needs only its own).
+
+    Without ``voter`` (STANDBY) ``kept`` also holds, for a binding it keeps, the first release
+    whose death proof cites a home whose charter chain this member does not know (it cannot
+    verify it; a later adopter that knows the chain can), within ``MAX_PROOF_BYTES``; and a vote
+    only if its sigil has a kept binding or its signer is in ``members`` (the version handed
+    over, so a re-used key's own votes travel): votes on made-up sigils are padding.
     """
     ev = Evidence()
-    releases, seals, votes = [], [], []
+    releases, seals, votes, unknown = [], [], [], []
     for e in log:
         kind = e.get("kind")
         if kind == "vote":
@@ -173,6 +180,8 @@ def classify_evidence(sigil: str, log: list, cid: str, registry, voter: str | No
                 if transition_id(h) == t and proves_dead(h, t, e.get("proof"), registry):
                     ev.dead.add(t)
                     releases.append((t, e))
+                elif voter is None and transition_id(h) == t and _cites_unknown_home(e.get("proof"), registry):
+                    unknown.append((t, e))
             except (KeyError, TypeError, ValueError):
                 pass
     bound_tids = {t for (_g, t) in ev.binds}
@@ -180,9 +189,25 @@ def classify_evidence(sigil: str, log: list, cid: str, registry, voter: str | No
     useful |= {id(e) for t, e in releases if t in bound_tids}
     useful |= {id(e) for b, e in seals if b in ev.binds}
     ev.log = [e for e in log if id(e) in useful]
-    useful |= {id(e) for e in votes}
+    bound_sigil = bool(ev.binds)
+    useful |= {id(e) for e in votes if voter is not None or bound_sigil or e["vote"]["witness"] in (members or ())}
+    once: set = set()
+    for t, e in unknown:
+        if t in bound_tids and t not in ev.dead and t not in once:
+            once.add(t)
+            useful.add(id(e))
     ev.kept = [e for e in log if id(e) in useful]
     return ev
+
+
+def _cites_unknown_home(proof, registry) -> bool:
+    """Does a death proof (within the size cap) cite a home whose chain ``registry`` lacks?"""
+    if not isinstance(proof, dict) or not isinstance(proof.get("parcel"), dict):
+        return False
+    home = proof["parcel"].get("home")
+    if not isinstance(home, str) or registry.chain(home):
+        return False
+    return _too_big(proof, MAX_PROOF_BYTES) is False
 
 
 class Witness:

@@ -401,6 +401,25 @@ def portable_snapshot(snap) -> dict:
     return out
 
 
+def _cited_homes(snapshots) -> set:
+    """The constellations whose charters the release entries of ``snapshots`` cite."""
+    out = set()
+    for snap in snapshots:
+        for log in (snap.values() if isinstance(snap, dict) else ()):
+            for e in (log if isinstance(log, list) else ()):
+                proof = e.get("proof") if isinstance(e, dict) and e.get("kind") == "release" else None
+                if not isinstance(proof, dict):
+                    continue
+                for x in (proof.get("parcel"), proof.get("seal")):
+                    c = x.get("home", x.get("constellation")) if isinstance(x, dict) else None
+                    if isinstance(c, str):
+                        out.add(c)
+                for v in (proof.get("votes") if isinstance(proof.get("votes"), list) else []):
+                    if isinstance(v, dict) and isinstance(v.get("constellation"), str):
+                        out.add(v["constellation"])
+    return out
+
+
 def _handover_reply(url: str, out) -> tuple[str, dict]:
     """``(sig, snapshot)`` of a FREEZE or SUCCEED reply, or Unreachable if it has the wrong shape."""
     if not (isinstance(out, dict) and isinstance(out.get("sig"), str) and isinstance(out.get("snapshot"), dict)):
@@ -796,11 +815,18 @@ class RemoteNetwork:
         self.registry.add_chain(cid, new_chain)
         # Everyone involved learns the new version (gossip admits it only if it verifies).
         everyone = self.urls.get(cid, []) + new_urls + self.committees.get(cid, []) + committee_urls
+        # ... and the chains the handed-over death proofs cite: an adopter or standby member can
+        # only verify (and so keep) a release whose evidence comes from a chain it knows.
+        cited = {c: self.registry.chain(c) for c in _cited_homes(snapshots) if c != cid and self.registry.chain(c)}
+        batches = [{cid: new_chain}]
+        items = list(cited.items())
+        batches += [dict(items[k:k + 32]) for k in range(0, len(items), 32)]
         for url in dict.fromkeys(everyone):
-            try:
-                RemoteWitness(url, self.timeout).gossip({"charters": {cid: new_chain}})
-            except Rejected:
-                pass
+            for chains in batches:
+                try:
+                    RemoteWitness(url, self.timeout).gossip({"charters": chains})
+                except Rejected:
+                    pass
         pending = []
         for w in new:
             if w.pk in cur["witnesses"] and w.pk not in frozen:
