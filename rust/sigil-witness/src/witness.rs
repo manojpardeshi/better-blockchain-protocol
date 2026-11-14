@@ -205,7 +205,8 @@ pub struct Witness {
     pub store: Arc<Store>,
     clock: Clock,
     /// Use Ed25519 batch verification for seals, death proofs and equivocation proofs.
-    pub batch_verify: bool,
+    pub batch_verify: bool,    /// The constellations the registry file names: only their chains are persisted.
+    keep: HashSet<String>,
 }
 
 /// What a call returns, plus the store sequence its reply depends on.
@@ -266,6 +267,7 @@ impl Witness {
         adopt: bool,
     ) -> Result<Witness, String> {
         // Charter chains learned before the restart: the registry file may predate them.
+        let keep: HashSet<String> = registry.ids().map(str::to_string).collect();
         restore_charters(&mut registry, &loaded.charters);
         if !registry.contains(cid) {
             return Err(format!("constellation {cid} is not in the registry"));
@@ -314,6 +316,7 @@ impl Witness {
             store,
             clock,
             batch_verify: true,
+            keep,
         })
     }
 
@@ -908,7 +911,9 @@ impl Witness {
         // us active but missing a binding. Our version's charter chain lands with it: a restart
         // from an older registry file must still know the version we are a member of.
         let mut batch_entries: Vec<Entry> = Vec::with_capacity(records.len() + 2);
-        batch_entries.push(charter_entry(&registry, cid));
+        if self.keep.contains(cid) {
+            batch_entries.push(charter_entry(&registry, cid));
+        }
         batch_entries.push(("member".into(), String::new(), Json::Arr(vec![Json::str(cid), Json::Int(version)])));
         batch_entries.extend(records.iter().map(|(s, r)| ("record".to_string(), s.clone(), r.to_json())));
         self.store.submit(batch_entries);
@@ -933,7 +938,7 @@ impl Witness {
         let mut seq = 0;
         if let Some(changed) = reg.into_changed() {
             // A restart must not forget a version learned here (durable before the answer).
-            let entries = charter_entries(&base, &changed);
+            let entries = charter_entries(&base, &changed, &self.keep);
             if !entries.is_empty() {
                 seq = self.store.submit(entries);
             }

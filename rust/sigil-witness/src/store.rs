@@ -64,23 +64,30 @@ pub struct Loaded {
     pub charters: HashMap<String, Json>,
 }
 
-/// Merge the charter chains a store kept into `registry` (`store.restore_charters`). Each chain
-/// is verified again; one that does not verify, or forks from the registry file's, is ignored:
-/// the registry stays as the file has it, and a member that then lacks its own charter version
+/// Merge the charter chains a store kept into `registry` (`store.restore_charters`). Only chains
+/// of constellations the registry file already names are restored (rows an older version wrote
+/// for others are ignored, so gossip's constellation cap never becomes permanent). Each chain is
+/// verified again; one that does not verify, or forks from the registry file's, is ignored: the
+/// registry stays as the file has it, and a member that then lacks its own charter version
 /// refuses to vote (fail closed).
 pub fn restore_charters(registry: &mut Registry, charters: &HashMap<String, Json>) {
     for (cid, chain) in charters {
+        if !registry.contains(cid) {
+            continue;
+        }
         if let Some(chain) = chain.as_arr() {
             let _ = registry.add_chain(cid, chain);
         }
     }
 }
 
-/// `charter` entries for every chain of `new` that is longer than in `old` (what gossip learned).
-pub fn charter_entries(old: &Registry, new: &Registry) -> Vec<Entry> {
+/// `charter` entries for every chain of a constellation in `keep` (those the registry file names)
+/// that is longer in `new` than in `old` (what gossip learned). A chain only gossip introduced is
+/// not persisted: wallets hand it over again with the evidence that needs it.
+pub fn charter_entries(old: &Registry, new: &Registry, keep: &HashSet<String>) -> Vec<Entry> {
     let mut out: Vec<Entry> = new
         .ids()
-        .filter(|cid| new.raw_chain(cid).len() > old.raw_chain(cid).len())
+        .filter(|cid| keep.contains(*cid) && new.raw_chain(cid).len() > old.raw_chain(cid).len())
         .map(|cid| charter_entry(new, cid))
         .collect();
     out.sort_by(|a, b| a.1.cmp(&b.1));
@@ -318,7 +325,8 @@ fn load(db: &Database) -> Result<Loaded, String> {
             "charter" => {
                 out.charters.insert(key.to_string(), value);
             }
-            _ => return Err(format!("unknown store entry kind {kind:?}")),
+            // A kind a later version wrote: skipped, so a store can roll back and forward.
+            _ => {}
         }
     }
     Ok(out)

@@ -173,6 +173,7 @@ class Witness:
         self.frozen_for: str | None = None  # hash of the one successor charter we froze for
         self.records: dict[str, Record] = {}
         self._charters_saved: dict[str, int] = {}  # cid -> chain length the store holds
+        self._charters_keep = set(registry.ids())  # constellations the registry file names
         self.store = store
         if store is not None:
             self._restore()
@@ -207,7 +208,7 @@ class Witness:
         store does not hold yet, so a restart from an older registry file still knows them."""
         if self.store is not None:
             saved = dict(self._charters_saved)
-            entries = charter_entries(self.registry, saved)
+            entries = charter_entries(self.registry, saved, self._charters_keep)
             if entries:
                 self._persist(*entries)
             self._charters_saved = saved
@@ -594,7 +595,10 @@ class Witness:
         # know (our new version's among them) land with it: a restart from an older
         # registry file must still know the version we are a member of.
         saved = dict(self._charters_saved)
-        charters = charter_entries(self.registry, saved) if self.store is not None else []
+        charters = []
+        if self.store is not None and cid in self._charters_keep:
+            charters = [("charter", cid, self.registry.chain(cid))]  # always our own chain
+            saved[cid] = len(charters[0][2])
         self._persist(*charters, ("member", "", [cid, version]), *(self._rec(s, r) for s, r in records.items()))
         self._charters_saved = saved
         self.cid, self.version = cid, version

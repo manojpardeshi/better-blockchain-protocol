@@ -13,8 +13,9 @@ Kinds:
 * ``frozen``  -- hash of the successor charter the witness froze for (``true`` in older stores)
 * ``record``  -- key = sigil, value = the full ``Record`` as a dict
 * ``stamp``   -- key = a redeemed stamp serial
-* ``charter`` -- key = a constellation id, value = the longest verified charter
-  chain the witness learned for it (by gossip or ADOPT). A restarted witness
+* ``charter`` -- key = a constellation id the registry file names, value = the
+  longest verified charter chain the witness learned for it (by gossip or ADOPT;
+  extensions of the file's chains only). A restarted witness
   merges these into the registry file's chains, so it never starts with a
   registry older than its own membership (stores written before have none)
 
@@ -84,25 +85,32 @@ class WitnessStore:
 def restore_charters(registry, charters: dict) -> dict:
     """Merge the charter chains a store kept into ``registry``; returns ``{cid: length}`` kept.
 
-    Each chain is verified again on entry. One that does not verify, or forks from
-    the registry file's, is ignored: the registry stays as the file has it, and a
+    Only chains of constellations the registry file already names are restored (the
+    store keeps no others, see ``charter_entries``; rows an older version wrote for
+    others are ignored, so gossip's constellation cap never becomes permanent). Each
+    chain is verified again on entry. One that does not verify, is malformed, or forks
+    from the registry file's, is ignored: the registry stays as the file has it, and a
     witness that then lacks its own charter version refuses to vote (fail closed).
     """
     saved = {}
     for cid, chain in charters.items():
+        if cid not in registry:
+            continue
         try:
             registry.add_chain(cid, chain)
-        except (ValueError, KeyError, TypeError):
+        except (ValueError, KeyError, TypeError, AttributeError):
             continue
         saved[cid] = len(chain)
     return saved
 
 
-def charter_entries(registry, saved: dict) -> list:
-    """``charter`` entries for every chain ``registry`` holds beyond what ``saved`` says the
-    store has (and updates ``saved``)."""
+def charter_entries(registry, saved: dict, keep) -> list:
+    """``charter`` entries for every chain of a constellation in ``keep`` (those the registry
+    file names) that ``registry`` holds beyond what ``saved`` says the store has (and updates
+    ``saved``). A chain only gossip introduced is not persisted: wallets hand it over again
+    with the evidence that needs it."""
     out = []
-    for cid in registry.ids():
+    for cid in sorted(keep):
         chain = registry.chain(cid)
         if len(chain) > saved.get(cid, 0):
             out.append(("charter", cid, chain))

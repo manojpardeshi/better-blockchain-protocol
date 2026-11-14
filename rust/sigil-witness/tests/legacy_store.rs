@@ -98,3 +98,20 @@ fn frozen_true_and_records_without_candidates_load() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn unknown_kinds_are_skipped() {
+    // A store written by a later version (with kinds this one does not know) still opens.
+    let dir = std::env::temp_dir().join(format!("sigil-unknown-{}-{}", std::process::id(), rand::random::<u64>()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("later.redb");
+    let pk = KeyPair::from_py_seed(b"w0").pk;
+    write_raw(&path, &[
+        ("pk".to_string(), String::new(), Json::str(&pk).canonical()),
+        ("from-the-future".into(), "k".into(), Json::Int(1).canonical()),
+    ]);
+    let (store, loaded) = Store::open(&path).unwrap();
+    assert_eq!(loaded.pk.as_deref(), Some(pk.as_str()));
+    store.close();
+    let _ = std::fs::remove_dir_all(&dir);
+}

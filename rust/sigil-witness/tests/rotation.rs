@@ -355,5 +355,14 @@ fn chain_learned_by_gossip_survives_a_restart() {
     close(o);
     let o = open(&p, "g0", &w.reg0, &w.cid, true);
     assert_eq!(o.registry().chain(&w.cid).len(), 2);
+    // A constellation the registry file does not name is learned, but not kept across a
+    // restart (gossip's constellation cap must not become permanent).
+    let other = world("deneb", &["d0"]);
+    let msg = obj([("charters", obj([(other.cid.as_str(), Json::Arr(other.reg0.raw_chain(&other.cid).to_vec()))]))]);
+    ok(o.gossip(&msg), &o);
+    assert!(o.registry().contains(&other.cid));
+    close(o);
+    let o = open(&p, "g0", &w.reg0, &w.cid, true);
+    assert!(!o.registry().contains(&other.cid));
     close(o);
 }

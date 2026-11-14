@@ -122,6 +122,34 @@ class CharterMemoryTests(unittest.TestCase):
         w2 = Witness(keys[0], self.stale(h), h.net.clock, store=self.wstore("w0"))
         self.assertEqual(len(w2.registry.chain(h.X)), 1)
 
+    def test_only_chains_the_registry_file_names_are_kept(self):
+        """Gossip of a constellation the registry file does not name is not persisted (the
+        gossip cap must not become permanent), and stored rows for one are not restored."""
+        h, keys = self.rotated_home()
+        other = Home()
+        kp = KeyPair.generate()
+        w = Witness(kp, self.stale(h), h.net.clock, store=self.wstore("unrelated"))
+        srv = WitnessServer(w)
+        self.addCleanup(srv.httpd.server_close)
+        srv.dispatch("gossip", {"charters": {other.X: other.net.registry.chain(other.X),
+                                             h.X: h.net.registry.chain(h.X)}})
+        rows = {k for kind, k, _v in w.store.db.execute("SELECT kind, key, value FROM log") if kind == "charter"}
+        self.assertEqual(rows, {h.X})
+        w.store.append([("charter", other.X, other.net.registry.chain(other.X))])   # as an older branch wrote
+        w.store.close()
+        w2 = Witness(kp, self.stale(h), h.net.clock, store=self.wstore("unrelated"))
+        self.assertNotIn(other.X, w2.registry)
+        self.assertEqual(len(w2.registry.chain(h.X)), 2)
+
+    def test_corrupt_charter_row_does_not_stop_a_start(self):
+        h, keys = self.rotated_home()
+        h.net.witnesses(h.X)[0].store.close()
+        s = self.wstore("w0")
+        s.append([("charter", h.X, [{"body": "x", "sigs": {}}]), ("charter", "zz", {"a": 1})])
+        s.close()
+        w = Witness(keys[0], self.stale(h), h.net.clock, store=self.wstore("w0"))
+        self.assertEqual((w.cid, w.version), (h.X, 1))
+
 
 if __name__ == "__main__":
     unittest.main()

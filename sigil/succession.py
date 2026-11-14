@@ -127,6 +127,7 @@ class Standby:
         self.heard: dict[str, int] = {}        # member pk -> when it last answered our challenge
         self.since: int | None = None          # start of our observation window
         self._charters_saved: dict[str, int] = {}  # cid -> chain length the store holds
+        self._charters_keep = set(registry.ids())  # constellations the registry file names
         self.store = store
         if store is not None:
             self._restore()
@@ -163,7 +164,7 @@ class Standby:
         (as ``Witness.remember_charters``)."""
         if self.store is not None:
             saved = dict(self._charters_saved)
-            entries = charter_entries(self.registry, saved)
+            entries = charter_entries(self.registry, saved, self._charters_keep)
             if entries:
                 self._persist(*entries)
             self._charters_saved = saved
@@ -219,7 +220,10 @@ class Standby:
                 mirror[sigil] = kept
         since = int(self.clock())
         saved = dict(self._charters_saved)
-        charters = charter_entries(self.registry, saved) if self.store is not None else []
+        charters = []
+        if self.store is not None and cid in self._charters_keep:
+            charters = [("charter", cid, self.registry.chain(cid))]  # always our own chain
+            saved[cid] = len(charters[0][2])
         self._persist(*charters, ("standby", "", {"constellation": cid, "version": version, "since": since}),
                       *(("mirror", f"{version}|{s}", log) for s, log in mirror.items()))
         self._charters_saved = saved

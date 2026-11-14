@@ -166,7 +166,8 @@ pub struct Standby {
     pub store: Arc<Store>,
     clock: Clock,
     /// Use Ed25519 batch verification for death proofs and gossip.
-    pub batch_verify: bool,
+    pub batch_verify: bool,    /// The constellations the registry file names: only their chains are persisted.
+    keep: HashSet<String>,
 }
 
 impl Standby {
@@ -176,6 +177,7 @@ impl Standby {
     /// with the handover of a later version.
     pub fn open(kp: KeyPair, mut registry: Registry, cid: &str, store: Arc<Store>, loaded: Loaded, clock: Clock, wait: bool) -> Result<Standby, String> {
         // Charter chains learned before the restart: the registry file may predate them.
+        let keep: HashSet<String> = registry.ids().map(str::to_string).collect();
         restore_charters(&mut registry, &loaded.charters);
         if !registry.contains(cid) {
             return Err(format!("constellation {cid} is not in the registry"));
@@ -233,6 +235,7 @@ impl Standby {
             store,
             clock,
             batch_verify: true,
+            keep,
         };
         if fresh && !wait {
             let reg = s.registry();
@@ -313,7 +316,9 @@ impl Standby {
         let mut entries: Vec<Entry> = Vec::with_capacity(mirror.len() + 2);
         // The charter chain of the version we stand by for: a restart from an older registry
         // file must still know it.
-        entries.push(charter_entry(&registry, cid));
+        if self.keep.contains(cid) {
+            entries.push(charter_entry(&registry, cid));
+        }
         entries.push((
             "standby".into(),
             String::new(),
@@ -579,7 +584,7 @@ impl Standby {
         let out = g.merge(&mut reg, msg, self.batch_verify).map_err(Error::BadRequest);
         let mut seq = 0;
         if let Some(changed) = reg.into_changed() {
-            let entries = charter_entries(&base, &changed);
+            let entries = charter_entries(&base, &changed, &self.keep);
             if !entries.is_empty() {
                 seq = self.store.submit(entries);
             }
