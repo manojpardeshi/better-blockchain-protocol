@@ -578,6 +578,68 @@ class Regressions(unittest.TestCase):
         with self.assertRaises(InvalidDossier):
             self.b.accept_completed(Dossier(), tid)
 
+    def test_cli_receive_of_a_malformed_dossier_is_refused_cleanly(self):
+        """REVIEW FINDING (Low): a payment file whose dossier ``transitions`` is not an object
+        raised TypeError out of ``sigil receive`` (an uncaught traceback)."""
+        tmp = tempfile.mkdtemp(prefix="sigil-cli-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        wallet_store.save(self.b, os.path.join(tmp, "w"))
+        path = os.path.join(tmp, "pay.json")
+        with open(path, "w") as f:
+            json.dump({"dossier": {"transitions": 5, "seals": {}, "charters": {}}, "refs": []}, f)
+        self.addCleanup(setattr, cli, "_network", cli._network)
+        cli._network = lambda _p: self.net
+
+        class A:
+            wallet, directory, payment, deep = os.path.join(tmp, "w"), "x", path, False
+        with self.assertRaises(InvalidDossier):
+            cli.cmd_receive(A())
+
+    def test_note_release_replaces_an_unverifiable_release(self):
+        """REVIEW FINDING (Medium-Low). A standby member kept, from a handover, a release it could
+        not verify (it cites a home it does not know); once it knows the home, a genuine release
+        for the same tid must be stored in its place (it used to be refused: the slot was taken)."""
+        from sigil.charter import Registry
+        from sigil.succession import Standby
+        from sigil.crypto import KeyPair
+        net = Network()
+        K = [KeyPair.generate() for _ in range(4)]
+        X = net.create_constellation("orion", 4, successor={"keys": K, "dead_man": 600})
+        Y = self.net.registry.chain(self.Y)
+        a_w = Wallet("a", net, X)
+        x = a_w.issue("X", 10)
+        ah = next(iter(a_w.holdings.values()))
+        q_w = Wallet("q", self.net, self.Y)
+        q_w.issue("Q", 1)
+        qh = next(iter(q_w.holdings.values()))
+        header = model.header([[ah["sigil"], 0], [qh["sigil"], 0]], model.body([ah["ref"], qh["ref"]], []))
+        tid = model.transition_id(header)
+        a_w.dossier.merge(q_w.dossier)
+        unl = a_w.authorise(header, model.body([ah["ref"], qh["ref"]], []))
+        bind = {"kind": "bind", "gen": 0, "auth": {"home": X, "lock": ah["parcel"]["lock"], "salt": ah["parcel"]["salt"],
+                                                   "unlock": unl[ah["sigil"]], "header": header}}
+        # q spent elsewhere at Y: a genuine seal-kind death proof, and a plausible fake.
+        me = q_w.address()
+        hq, bq, tq = q_w.prepare([qh["ref"]], [model.parcel(self.Y, qh["parcel"]["asset"], 1, me["lock"], me["salt"])])
+        from sigil.wallet import request_seal
+        u = q_w.authorise(hq, bq)
+        seal = request_seal(self.net, {"sigil": qh["sigil"], "header": hq, "home": self.Y,
+                                       "lock": qh["parcel"]["lock"], "salt": qh["parcel"]["salt"], "unlock": u[qh["sigil"]]})
+        parcel = {k: qh["parcel"][k] for k in ("home", "lock", "salt")}
+        proof = {"kind": "seal", "sigil": qh["sigil"], "gen": 0, "parcel": parcel, "seal": seal}
+        fakeseal = dict(seal, votes=[dict(v, sig="00" * 64) for v in seal["votes"]])
+        rel = {"kind": "release", "gen": 0, "tid": tid, "header": header, "proof": proof}
+        fake = dict(rel, proof=dict(proof, seal=fakeseal))
+        reg = Registry()
+        reg.add_chain(X, net.registry.chain(X))         # it does not know Y
+        m = Standby(K[0], reg, net.clock)
+        m.enter(X, 0, [{ah["sigil"]: [bind, fake]}])
+        self.assertEqual([e["kind"] for e in m.mirror[ah["sigil"]]], ["bind", "release"])
+        reg.add_chain(self.Y, Y)
+        self.assertTrue(m.note_release(ah["sigil"], rel))
+        self.assertEqual(m.mirror[ah["sigil"]], [bind, rel])
+        self.assertFalse(m.note_release(ah["sigil"], rel))
+
     def test_swap_settles_when_a_crash_lost_the_counterpartys_unlock(self):
         """FINDING (wallet, Medium-High). Both parties released their kill switches; alice holds
         every unlock (her cosign was saved), bob's crash lost alice's kill-switch unlock (his

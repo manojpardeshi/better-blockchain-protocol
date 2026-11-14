@@ -198,13 +198,16 @@ def cmd_receive(args):
     # A multi-party transition (a swap) we authorised and the other party completed: record it
     # from their dossier (our wallet may lack an unlock it needs, e.g. after a crash).
     done = []
-    for tid in [t for t in dossier.transitions if t in w.pending]:
+    try:
+        mine = [t for t in dossier.transitions if isinstance(t, str) and t in w.pending]
+    except TypeError as e:
+        raise InvalidDossier(f"malformed payment: {e}") from e
+    for tid in mine:
         try:
             w.accept_completed(dossier, tid)
-        except (KeyError, TypeError) as e:
+        except (KeyError, TypeError, AttributeError) as e:
             raise InvalidDossier(f"malformed payment: {e}") from e
         done.append(tid)
-    if done:
         wallet_store.save(w, args.wallet)
     new = [r for r, i in zip(refs, ids) if i not in w.holdings]
     if not new and done:

@@ -270,8 +270,11 @@ class Standby:
         if not ok:
             raise Rejected("invalid release evidence")
         log = self.mirror.get(sigil, [])
-        if any(e.get("kind") == "release" and e.get("tid") == t for e in log):
+        held = [e for e in log if e.get("kind") == "release" and e.get("tid") == t]
+        if any(proves_dead(e["header"], t, e["proof"], self.registry) for e in held):
             return False
+        # Releases kept from a handover that we could not verify give way to one that verifies.
+        log = [e for e in log if not (e.get("kind") == "release" and e.get("tid") == t)]
         log = log + [{"kind": "release", "gen": entry["gen"], "tid": t, "header": h, "proof": proof}]
         self._persist(("mirror", f"{self.version}|{sigil}", log))
         self.mirror[sigil] = log
