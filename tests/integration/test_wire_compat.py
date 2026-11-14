@@ -194,8 +194,10 @@ class WireCompatTests(unittest.TestCase):
         cls.plain = twin("plain", c["keys"][0])
         cls.stamped = twin("stamped", c["keys"][1], ["--stamps"])
         cls.limited = twin("limited", c["keys"][2], ["--rate-limit", "1", "--rate-burst", "3"])
-        # A constellation with a successor committee, for the standby calls (no probing).
-        s = cls.s = new_constellation(d, "heir", 4, committee=4, dead_man=1)
+        # Keep the standbys alive throughout wire checks. The twins start and answer
+        # sequentially, so a short dead-man window can expire between their replies.
+        # Dead-man transition behavior is covered by test_succession.py.
+        s = cls.s = new_constellation(d, "heir", 4, committee=4, dead_man=86400)
         cls.skeys = [load_key(k) for k in s["keys"]]
         cls.ckeys = [load_key(k) for k in s["committee"]]
         cls.standby = twin("standby", s["committee"][0], role="standby", cid=s["cid"], registry=s["registry"])
@@ -207,9 +209,6 @@ class WireCompatTests(unittest.TestCase):
         for t in (cls.plain, cls.stamped, cls.limited, cls.standby, cls.heirw):
             for dmn in t:
                 wait_http(dmn.url, proc=dmn.proc, log=dmn.log)
-        # The standby twins report `dead` once dead_man (1 s) has passed with no member heard;
-        # compare their info only once both are past that point, not on either side of it.
-        time.sleep(2)
         cls.owner = KeyPair.from_seed(b"\x07" * 32)
         cls.rec = Recorder()
 
@@ -256,7 +255,9 @@ class WireCompatTests(unittest.TestCase):
             for path in ("/v0/info", "/v0/charters", "/v0/proofs", f"/v0/charters/{cid}",
                          f"/v0/charters/{'ab' * 32}", "/v0/charters/not-a-cid", "/v0/charters/",
                          "/v0/charters/a/b", f"/v0/charters/{cid}/", f"/v0/charters/{cid}?x=1"):
-                r.send(f"{role} GET {path}", t, role, path)
+                info = r.send(f"{role} GET {path}", t, role, path)
+                if t is SB and path == "/v0/info":
+                    self.assertIs(info["ok"]["dead"], False, "standby fixture must remain live")
             r.send(f"{role} GET unknown", t, role, "/v0/nope")
             r.send(f"{role} GET root", t, role, "/")
             r.send(f"{role} POST unknown", t, role, "/v0/nope", {})
