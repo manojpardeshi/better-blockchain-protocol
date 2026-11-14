@@ -56,9 +56,11 @@ def evaluate(scenario):
         spend = amount(member["variable_spend_cost"], f"{name}.variable_spend_cost")
         fixed = amount(member["allocated_fixed_cost_per_stamp"], f"{name}.allocated_fixed_cost_per_stamp")
         cost_floor = sale + spend + fixed
+        effective_revenue = price if paid else Decimal(0)
         rows.append({"id": name, "paid_stamp_gate": paid, "stamp_price": str(price),
                      "estimated_cost_per_redeemed_stamp": str(cost_floor),
-                     "price_minus_estimated_cost": str(price - cost_floor),
+                     "effective_revenue_per_redeemed_stamp": str(effective_revenue),
+                     "effective_margin_per_redeemed_stamp": str(effective_revenue - cost_floor),
                      "sale_is_open": not paid})
 
     return {

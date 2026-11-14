@@ -25,7 +25,9 @@ recovery.
 
 For each witness, the worksheet adds the estimated variable cost of one stamp
 sale, one redeemed SPEND, and an allocation of fixed cost per redeemed stamp.
-It compares that sum with the stamp price. The [current witness code](../sigil/witness.py)
+It compares that sum with effective revenue per redeemed stamp. The
+quoted `stamp_price` counts as revenue only when `paid_stamp_gate` is true.
+The [current witness code](../sigil/witness.py)
 redeems and persists a stamp **before** later SPEND validation, so rejected
 attempts can consume stamps and cost resources. The [reference wallet](../sigil/wallet.py)
 asks every member for a vote, consuming up to *n* stamps for a one input payment
@@ -33,8 +35,9 @@ when all members require them. Each witness sells its own stamps.
 
 The public `/v0/sell_stamp` endpoint currently blind signs without collecting
 payment ([WIRE admission control](WIRE.md)). Setting `paid_stamp_gate` to `false`
-marks a witness as having no effective stamp price against a caller who can ask
-for free stamps, regardless of the entered `stamp_price`. The worksheet does not
+marks a witness as having zero effective revenue and a negative margin against a
+caller who can ask for free stamps, regardless of the quoted `stamp_price`.
+The worksheet does not
 model network floods, invalid or reused stamps, Sybil addresses, or availability.
 Rate limits and network controls remain necessary.
 

@@ -21,11 +21,16 @@ class EconomicsWorksheetTests(unittest.TestCase):
         self.assertEqual(result["least_assumed_collectible_bonds"], ["a", "b"])
         self.assertEqual(result["collateral_minus_exposure"], "1")
         self.assertEqual(result["stamp_rows"][0]["estimated_cost_per_redeemed_stamp"], "0.6")
-        self.assertEqual(result["stamp_rows"][0]["price_minus_estimated_cost"], "0.4")
+        self.assertEqual(result["stamp_rows"][0]["effective_revenue_per_redeemed_stamp"], "1")
+        self.assertEqual(result["stamp_rows"][0]["effective_margin_per_redeemed_stamp"], "0.4")
 
     def test_open_sale_is_reported_even_with_nominal_price(self):
         result = evaluate({"max_concurrent_loss": "0", "witnesses": [member("a", "0", gate=False)]})
-        self.assertTrue(result["stamp_rows"][0]["sale_is_open"])
+        row = result["stamp_rows"][0]
+        self.assertTrue(row["sale_is_open"])
+        self.assertEqual(row["stamp_price"], "1")
+        self.assertEqual(row["effective_revenue_per_redeemed_stamp"], "0")
+        self.assertEqual(row["effective_margin_per_redeemed_stamp"], "-0.6")
 
     def test_rejects_duplicate_members_and_negative_amounts(self):
         with self.assertRaisesRegex(ValueError, "unique"):
