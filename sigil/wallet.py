@@ -148,10 +148,14 @@ class Wallet:
         self.home = home
         # Trust is the owner's choice, never a payer's: by default the wallet
         # trusts its home plus the constellations its network was configured
-        # with *now*. Charters a received dossier introduces later are learned
-        # (to verify seals) but never trusted unless the owner calls ``trust``.
+        # with (its directory: ``configured()``), never what its registry merely
+        # learned, since gossip admits any valid genesis chain from anyone. Charters
+        # a received dossier introduces are learned (to verify seals) but never
+        # trusted unless the owner calls ``trust``. (The in-process ``Network``
+        # has no gossip: its registry is the operator's own directory.)
         if trusted is None:
-            trusted = set(network.registry.ids()) | ({home} if home else set())
+            configured = getattr(network, "configured", None)
+            trusted = (configured() if configured else set(network.registry.ids())) | ({home} if home else set())
         self.policy = TrustPolicy(network.registry, trusted)
         self.verifier = Verifier(self.policy)
         self.keys: dict[str, KeyPair] = {}
@@ -885,15 +889,24 @@ class Wallet:
 
     # ----------------------------------------------------------------- stamps
 
-    def buy_stamps(self, cid: str, count: int) -> None:
+    def buy_stamps(self, cid: str, count: int) -> dict:
+        """Buy ``count`` stamps from every stamp-selling witness of ``cid``; returns how many each sold.
+
+        A seller that refuses, does not answer or returns an invalid blind signature is
+        skipped (with the stamps it did sell kept), so one bad seller never stops the others.
+        """
+        sold = {}
         for w in self.network.all_witnesses(cid):
             if w.stamps is None:
                 continue
+            got = sold[w.pk] = 0
             for _ in range(count):
                 try:
                     self.stamps[w.pk].append(buy_stamp(w.stamps.public, w.sell_stamp))
-                except (Rejected, ValueError):
-                    break  # unreachable, or a bad blind signature: the other witnesses still sell
+                except (Rejected, ValueError):  # ValueError: an invalid blind signature
+                    break
+                got = sold[w.pk] = got + 1
+        return sold
 
     def _stamp_for(self, w):
         pool = self.stamps.get(w.pk)

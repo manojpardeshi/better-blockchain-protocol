@@ -549,16 +549,27 @@ impl Standby {
     }
 
     /// Challenge each member at `urls` for a heartbeat (outside any lock); count valid answers.
+    /// Members are asked at once and each answer is recorded as it arrives, so a member that
+    /// stalls its reply (up to the client deadline) never delays hearing the others.
     pub fn probe(&self, urls: &[String]) -> usize {
-        let mut n = 0;
-        for url in urls {
-            let challenge = hex::encode(rand::random::<[u8; 16]>());
-            let body = obj([("challenge", Json::str(&challenge))]);
-            if let Ok(hb) = crate::client::post(url, "heartbeat", &body, std::time::Duration::from_secs(5)) {
-                n += self.observe(&hb, &challenge) as usize;
-            }
-        }
-        n
+        let mut seen = std::collections::BTreeSet::new();
+        let urls: Vec<&String> = urls.iter().filter(|u| seen.insert(u.as_str())).collect();
+        std::thread::scope(|scope| {
+            let asks: Vec<_> = urls
+                .into_iter()
+                .map(|url| {
+                    scope.spawn(move || {
+                        let challenge = hex::encode(rand::random::<[u8; 16]>());
+                        let body = obj([("challenge", Json::str(&challenge))]);
+                        match crate::client::post(url, "heartbeat", &body, std::time::Duration::from_secs(5)) {
+                            Ok(hb) => self.observe(&hb, &challenge) as usize,
+                            Err(_) => 0,
+                        }
+                    })
+                })
+                .collect();
+            asks.into_iter().map(|a| a.join().unwrap_or(0)).sum()
+        })
     }
 
     /// `/v0/gossip`: admit what verifies; the registry learns new charter versions.

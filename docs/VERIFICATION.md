@@ -510,8 +510,15 @@ the model level, and the fixed design is model-checked (`MC_wallet`,
 `MC_wallet_live`). Fixes, in brief:
 
 * **W1, W2.** A wallet's default trust is its home plus the constellations its
-  network was configured with at creation; charters a dossier introduces are
-  learned but never trusted unless the owner calls `Wallet.trust`. The policy
+  network was configured with (`RemoteNetwork.configured()`: the directory's
+  constellations and committees). Before the fix it was every constellation in
+  the registry, and `RemoteNetwork` added every chain any witness served. Since
+  gossip admits any valid genesis chain, an outsider could plant one on an
+  honest witness and have new wallets trust it: one parcel moved there could
+  then be "spent" to any number of default wallets (W1b,
+  `tests/test_default_trust.py`). A client now learns only the chains of the
+  constellations it asks about (`GET /v0/charters/<cid>`). Charters a dossier
+  introduces are learned but never trusted unless the owner calls `Wallet.trust`. The policy
   (`trusted`, convicted witnesses) is saved and restored, and a saved policy of
   "trust anything" is refused on load.
 * **W3.** `receive` merges only the verified ancestry, and `Dossier.merge`
@@ -540,6 +547,7 @@ the model level, and the fixed design is model-checked (`MC_wallet`,
 | # | Severity | Where | Bug | Impact | Test |
 |---|---|---|---|---|---|
 | W1 | critical | `wallet_store.load` | the trust policy (`trusted`) is not persisted; a reloaded wallet trusts every charter in the registry, and `verify_parcel` adds any chain a dossier carries | counterfeit: one parcel moved to an attacker's one-witness constellation is "spent" to any number of victims | `TrustPolicyTests.test_restarted_wallet_keeps_its_trust_policy` |
+| W1b | critical | `Wallet.__init__`, `RemoteNetwork.refresh_charters` | default trust was every constellation in the registry, and the registry learned every chain any witness served, which gossip fills with anyone's genesis chains | as W1, for every wallet created after an outsider gossiped its constellation to one honest witness | `DefaultTrust.test_double_spend_through_a_planted_constellation` |
 | W2 | critical | `cli cmd_init` | CLI wallets are created with no trust policy at all | as W1, for every CLI wallet | `TrustPolicyTests.test_cli_wallet_does_not_trust_constellations_named_by_a_payer` |
 | W3 | high | `Wallet.receive` → `Dossier.merge` | every entry of a received dossier, verified or not, overwrites the wallet's own transitions and seals | any payer can make the wallet's own coins unprovable: its next payments are consumed but rejected by recipients | `DossierIntegrityTests` |
 | W3b | high | `Wallet.receive` | a parcel is accepted if its lock merely *mentions* one of our keys (`any(sig(us), sig(payer))`) | the payer claws the payment back; `balance` counts it | `ReceiveLockTests.test_receive_rejects_a_parcel_the_payer_can_still_spend` |
@@ -605,7 +613,7 @@ wallets over HTTP. They are not part of the default `unittest discover`; CI's
   persisting before answering, not checking expiry) and Byzantine faults
   beyond *f* are caught, which shows the invariants are not vacuous.
 
-They found eighteen bugs (and a second round eight more, below), none of them a safety violation of the witness
+They found nineteen bugs (and a second round eight more, below), none of them a safety violation of the witness
 protocol; each was pinned as an expected failure, shown to fail on the old
 code, and now runs as a regression test.
 
@@ -625,6 +633,7 @@ code, and now runs as a regression test.
 | soak | every swap left a new one-unit kill-switch asset behind | the unit a swap returns is the next kill switch |
 | soak | a wallet's dossier kept the history of everything it ever spent | `Wallet.prune` after a payment is handed over; consumed sigils are remembered in `spent` |
 | chaos | a malformed STATUS reply from one Byzantine witness crashed honest wallets | `RemoteWitness.status` checks the shape; a bad reply counts as no answer |
+| chaos | every other reply was trusted too: a junk INFO, SPEND, charters, FREEZE, mirror ack, error reply, deeply nested JSON or a signed vote with a non-integer `version` crashed wallets, rotations and successions; a junk member blinded a standby member's whole probe round (so a live version could look dead); replies were read without a size cap or deadline | every client call checks its reply's shape (`tests/test_byzantine_replies.py`, a junk proxy per method); replies are capped and must arrive within 4 timeouts (Python and the Rust prober); the chaos runs now include garbage replies |
 | chaos | a pledge released under §4 rule 3 came back after a succession (the committee had mirrored it) | rule 3 also asks every standby member (new `POST /v0/status` on standby members); the pledge stays and the wallet completes the transition |
 | chaos | a swap interrupted after its kill switches were released never settled | each party keeps the others' unlocks (`Wallet.cosign`); a kill switch already pledged to the same tid is re-signed; a settling transition is retried with the unlocks held |
 | chaos | a failed succession attempt fenced a minority and halted a live home | two-phase succession: `dead` in standby info is read first, SUCCEED sent only once a quorum agrees |

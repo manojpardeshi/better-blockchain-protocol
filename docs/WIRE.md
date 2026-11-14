@@ -2,7 +2,18 @@
 
 Transport for the witness protocol of [SPEC.md](SPEC.md) §5. v0 uses JSON over HTTP/1.1 because it is easy to inspect and has no dependencies. A binary encoding over HTTP/2 or QUIC is planned for the Rust witness (Phase 2), carrying the same messages.
 
-Nothing a witness sends is trusted. Clients verify votes, seals, charters and proofs exactly as they do in-process.
+Nothing a witness sends is trusted. Clients verify votes, seals, charters and proofs exactly as they do in-process. Before that, the reference client (`RemoteWitness`, `RemoteStandby`) treats each of the following as no answer (`Unreachable`):
+
+* a reply larger than its cap: 256 KiB for an ordinary call (a STATUS holds at most one vote per generation), 16 MiB for a charter chain or a gossip pull, and 256 MiB for the operator calls, whose snapshots hold every binding a member has;
+* an exchange (connect, request, status line, headers and body) not finished within 4 socket timeouts, or 60 for the operator calls. A watchdog shuts the socket down at the deadline, so a trickled status line or header, or endless `100 Continue` lines, cannot hold a client;
+* a redirect, which is never followed;
+* a body that is not JSON or not `{"ok": …}`. Memory is bounded by the caps alone: no reply is refused for its content's density, since snapshots, mirror logs, proofs and charters carry what clients sent. Parsed JSON can take about twenty times its size, so at most about 5 MiB for an ordinary reply;
+* an `ok` result not of the shape the table below gives for that call, for example a vote with a missing or non-integer `gen`, an INFO whose stamp key is not hex, or a FREEZE snapshot that is not an object of lists;
+* a malformed error reply, such as a `conflict` whose `vote` is neither a vote nor null. Any error reply to a GET also counts as no answer.
+
+STATUS votes that are not vote objects are dropped, beyond the first 256 too, and a gossip pull keeps only well-shaped collections. So one Byzantine witness within *f* looks, at worst, like one that is down. A standby member asks every member for a heartbeat at once, so a member that stalls its reply never delays hearing the others. The Rust standby member's probe reads at most 64 KiB, within the same 4-timeout deadline.
+
+A wallet trusts by default only its home and the constellations its directory names (`RemoteNetwork.configured()`), and a client learns only the chain of a constellation it asks about (`GET /v0/charters/<cid>`). It never trusts a chain merely because a witness served it: gossip admits any valid genesis chain from anyone, so an outsider could otherwise plant a constellation whose every key it holds.
 
 ## Calls
 
@@ -10,6 +21,7 @@ Nothing a witness sends is trusted. Clients verify votes, seals, charters and pr
 |---|---|---|---|
 | GET | `/v0/info` | — | `{pk, constellation, version, frozen, stamps: {n, e} \| null}` |
 | GET | `/v0/charters` | — | `{cid: [charter, …]}`: every charter chain the witness knows |
+| GET | `/v0/charters/<cid>` | — | `[charter, …]`: the chain of constellation `cid`, `[]` if unknown. Clients ask for the chains they are configured with this way, since gossip admits any valid genesis chain, so `/v0/charters` can grow past what a client reads |
 | POST | `/v0/spend` | `{request}` (SPEC §5.1; `request.mirror` carries the mirror acks a version with a successor committee needs, §5.5) | vote |
 | POST | `/v0/release` | `{sigil, proof}` (SPEC §5.2) | new generation (int) |
 | POST | `/v0/status` | `{sigil}` (SPEC §5.3) | `{gen, tid, votes}` |
@@ -48,7 +60,7 @@ A standby member of a successor committee (SPEC §5.5) is served like a witness 
 | Method | Path | Body | `ok` result |
 |---|---|---|---|
 | GET | `/v0/info` | — | `{pk, role: "standby", constellation, version, fenced, dead, frozen: false, stamps: null}` |
-| GET | `/v0/charters`, `/v0/proofs`; POST `/v0/gossip` | as for a witness | as for a witness |
+| GET | `/v0/charters`, `/v0/charters/<cid>`, `/v0/proofs`; POST `/v0/gossip` | as for a witness | as for a witness |
 | POST | `/v0/mirror` | `{request}`: a SPEND request plus the `version` it is for | mirror ack `{constellation, version, member, sigil, gen, tid, sig}` |
 | POST | `/v0/note_release` | `{sigil, entry}`: a release entry `{kind: "release", gen, tid, header, proof}` for a binding it holds | `true` if new, `false` if held already |
 | POST | `/v0/status` | `{sigil}` | `{bindings: [[gen, tid], …]}`: every binding of the sigil in its mirror log (holders ask before releasing a pledge, SPEC §4 rule 3) |
@@ -106,7 +118,7 @@ On a witness, gossip uses the witness's own charter registry, so a verified rota
 
 A wallet builds its store as `GossipStore(network.registry)`, so newly learned charters reach its `TrustPolicy`. It then calls `store.apply(wallet.policy)` to convict every proven equivocator, and from then on that witness's votes no longer count toward seals. `equivocations_in(votes)` extracts proofs from any votes the wallet sees, such as STATUS replies or death proofs.
 
-**Caps.** A message holds at most 64 charter chains, 1024 versions per chain, 64 proofs and 16 forks, within the 1 MiB body limit. A message over any cap is refused as a whole with `bad_request`. A charter names at most 128 witnesses and encodes to at most 64 KiB (SPEC §3.7); a chain holding a larger one does not verify, so it is dropped like any invalid item. A store accepts at most 10 000 new constellations, while extensions of known constellations are always accepted. A client reads at most 16 MiB from one witness per pull.
+**Caps.** A message holds at most 64 charter chains, 1024 versions per chain, 64 proofs and 16 forks, within the 1 MiB body limit. A message over any cap is refused as a whole with `bad_request`. A charter names at most 128 witnesses and encodes to at most 64 KiB (SPEC §3.7); a chain holding a larger one does not verify, so it is dropped like any invalid item. A store accepts at most 10 000 new constellations, while extensions of known constellations are always accepted. A client reads at most 16 MiB from one witness per pull. If a witness holds more chains than that, the client asks for the chains of the constellations it is configured with one by one (`GET /v0/charters/<cid>`).
 
 **Threats.**
 * *Spam.* Genesis charters need no signatures, so anyone can mint constellations. The constellation cap bounds how many, the charter caps how large each version is (before them, one message registered a 14,000-witness charter), and the rate limit how fast. Proofs against keys outside every known charter are refused, so throwaway keys cannot grow the store. Verification costs at most the signatures that fit in one 1 MiB body.

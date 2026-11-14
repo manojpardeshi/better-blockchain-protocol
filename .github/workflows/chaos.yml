@@ -41,7 +41,7 @@ jobs:
         run: |
           python -m tests.integration.chaos.run \
             --seeds "${{ inputs.seeds || '1-10' }}" --minutes "${{ inputs.minutes || '60' }}" \
-            --set 'byz_modes="equivocate,lie,withhold"' --out chaos-stats.json
+            --out chaos-stats.json
       - uses: actions/upload-artifact@v4
         if: always()
         with:

@@ -103,8 +103,9 @@ class Config:
         n_const = r.choice([2, 2, 3])
         sizes = [r.choice([4, 4, 5, 7]) for _ in range(n_const)]
         cfg = cls(seed=seed, sizes=sizes, kinds=r.choice(["mixed", "mixed", "mixed", "rust", "python"]),
-                  byz_modes=r.choice(["equivocate,lie,withhold", "equivocate,lie,withhold",
-                                      "equivocate,lie,withhold,garbage"]),
+                  # Every Byzantine witness may also answer garbage (still drawn, so the other
+                  # choices of a seed stay what they were when garbage was a third of the runs).
+                  byz_modes=r.choice(["equivocate,lie,withhold,garbage"] * 3),
                   committee=r.random() < 0.7, rotation=r.random() < 0.6, succession=r.random() < 0.5,
                   skew=r.choice(["none", "within", "within", "beyond_f"]),
                   byz=r.choice([0, 0, 1]), byz_other=r.choice([0, 0, 1]),

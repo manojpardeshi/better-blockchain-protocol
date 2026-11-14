@@ -91,6 +91,8 @@ def proc_stats(pid: int) -> dict | None:
         fds = len(os.listdir(f"/proc/{pid}/fd"))
     except (FileNotFoundError, ProcessLookupError, PermissionError):
         return None
+    if "VmRSS" not in status:  # a zombie: it exited (e.g. stopped by a rotation) and is not reaped yet
+        return None
     return {"rss": int(status["VmRSS"].split()[0]) * 1024, "threads": int(status["Threads"]), "fds": fds}
 
 

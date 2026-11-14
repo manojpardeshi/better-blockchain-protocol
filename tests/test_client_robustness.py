@@ -56,7 +56,7 @@ class MalformedReplies(unittest.TestCase):
                 with self.subTest(reply=reply, status=status):
                     url = self.serve(reply, status)
                     for cls in (RemoteWitness, RemoteStandby):
-                        if cls is RemoteStandby and b'"stamps": {' in reply:
+                        if cls is RemoteStandby and b'"stamps"' in reply:
                             continue  # a standby member's stamps are never read
                         with self.assertRaises(Rejected):
                             cls(url, 2)
@@ -106,9 +106,12 @@ class MalformedReplies(unittest.TestCase):
         self.assertEqual(portable_snapshot(snap), {"s1": [{"kind": "bind"}], "s3": [{"x": [[[]]]}]})
         deep = {"s": [{"x": json.loads("[" * 300 + "]" * 300)}]}
         self.assertEqual(portable_snapshot(deep), {})
-        from sigil.server import _handover_reply
+        w = RemoteWitness.__new__(RemoteWitness)   # the reply check, without a server
+        w.url = "u"
         with self.assertRaises(Unreachable):
-            _handover_reply("u", {"sig": 5, "snapshot": {}})
+            w._sig_snapshot("freeze", {"sig": 5, "snapshot": {}})
+        self.assertEqual(w._sig_snapshot("freeze", {"sig": "x", "snapshot": snap | {"s2": []}})[1],
+                         {"s1": [{"kind": "bind"}], "s3": [{"x": [[[]]]}]})
 
 
 if __name__ == "__main__":

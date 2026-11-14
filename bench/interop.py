@@ -556,7 +556,10 @@ class Interop:
         alice = self.W("alice", net, G)
         store = GossipStore(net.registry)
         out = gossip_round(net, store)
-        assert out["peers"] == 4 and out["learned"]["proofs"] == 1 and out["learned"]["charters"] == 1
+        # The network learned only G's chain (refresh_charters asks for what it is configured with),
+        # so the round also learns the chains of the other constellations the witnesses know.
+        assert out["peers"] == 4 and out["learned"]["proofs"] == 1 and out["learned"]["charters"] >= 1, out
+        assert store.registry.latest(G)["version"] == 1, "the rotation spread"
         gossip_round(net, store)
         for w in ws:
             got = w.proofs()
