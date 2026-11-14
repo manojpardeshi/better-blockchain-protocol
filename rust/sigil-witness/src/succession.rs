@@ -432,9 +432,16 @@ impl Standby {
             return rejected("not standing by for this constellation version");
         }
         let mut log = st.mirror.get(sigil).cloned().unwrap_or_default();
-        if log.iter().any(|e| e.get("kind").and_then(Json::as_str) == Some("release") && e.get("tid").and_then(Json::as_str) == Some(t)) {
+        let is_rel = |e: &Json| e.get("kind").and_then(Json::as_str) == Some("release") && e.get("tid").and_then(Json::as_str) == Some(t);
+        let null = Json::Null;
+        let registry = self.registry();
+        if log.iter().filter(|e| is_rel(e)).any(|e| {
+            proves_dead(e.get("header").unwrap_or(&null), t, e.get("proof").unwrap_or(&null), &registry, self.batch_verify)
+        }) {
             return Ok(Json::Bool(false));
         }
+        // Releases kept from a handover that we could not verify give way to one that verifies.
+        log.retain(|e| !is_rel(e));
         log.push(obj([
             ("kind", "release".into()),
             ("gen", Json::Int(gen)),

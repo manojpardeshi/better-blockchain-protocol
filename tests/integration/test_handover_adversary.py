@@ -352,9 +352,46 @@ class HandoverAdversary(unittest.TestCase):
         proof = {"kind": "seal", "sigil": q, "gen": 0, "parcel": {k: pq[k] for k in ("home", "lock", "salt")},
                  "seal": seal}
         rel = {"kind": "release", "gen": 0, "tid": tsw, "header": Tsw, "proof": proof}
-        snap = {a: [self.bind(Tsw, a, pa, 0), rel, dict(rel, proof=dict(proof, pad="x"))]}
+        # A Byzantine predecessor's junk release for the same tid, ordered first: it cites a made-up
+        # home (so no member can verify it) with padding, but fails the charter-free checks.
+        junk = dict(rel, proof=dict(proof, parcel=dict(proof["parcel"], home="ee" * 32), pad="p" * 100_000))
+        variant = dict(rel, proof=dict(proof, pad="x"))
+        snap = {a: [self.bind(Tsw, a, pa, 0), junk, rel, variant]}
         st, car = self.compare([snap], [a], "standby")
-        self.assertEqual(car.get(a), snap[a][:2], "the release (once) is carried for a later adopter")
+        self.assertEqual(car.get(a), [snap[a][0], rel, variant], "the plausible releases are carried, not the junk")
+        # A member that learns lyra and is then sent the release verifies it; the unverifiable ones
+        # it kept give way to it.
+        # A plausible fake (votes by keys that are not lyra's members) is all it holds at first.
+        fakes = [KeyPair.from_seed(bytes([40 + i]) * 32) for i in range(3)]
+        fake = dict(rel, proof=dict(proof, seal=model.seal_from_votes(
+            [self.vote(k, q, 0, tq, cid=ly["cid"]) for k in fakes])))
+        pair, replies = self.handover([{a: [snap[a][0], fake]}], "standby")
+        chain = json.load(open(ly["registry"]))[ly["cid"]]
+        for dmn in pair:
+            http(dmn.url, "/v0/gossip", {"charters": {ly["cid"]: chain}})
+            code, rep, _ = http(dmn.url, "/v0/note_release", {"sigil": a, "entry": rel})
+            self.assertEqual((code, rep.get("ok")), (200, True), dmn.kind)
+            code, rep, _ = http(dmn.url, "/v0/note_release", {"sigil": a, "entry": rel})
+            self.assertEqual((code, rep.get("ok")), (200, False), dmn.kind)
+        rcar, pcar = (self.carried(dmn, "standby") for dmn in pair)
+        self.assertEqual(rcar, pcar)
+        self.assertEqual(pcar[a], [snap[a][0], rel])
+        # Evidence from a version of lyra the member does not know yet is kept too (structurally checked).
+        b1 = charter_body("lyra", 1, [k.pk for k in lkeys], charter_hash(chain[0]["body"]))
+        votes1 = []
+        for k in lkeys[:3]:
+            v = {"constellation": ly["cid"], "version": 1, "witness": k.pk, "sigil": q, "gen": 0, "tid": tq,
+                 "time": 1_700_000_000}
+            v["sig"] = k.sign("vote", model.vote_payload(v))
+            votes1.append(v)
+        rel1 = dict(rel, proof=dict(proof, seal=model.seal_from_votes(votes1)))
+        snap1 = {a: [self.bind(Tsw, a, pa, 0), rel1]}
+        for dmn in self.twins("standby"):   # it knows lyra version 0 only
+            http(dmn.url, "/v0/gossip", {"charters": {ly["cid"]: chain}})
+            code, rep, _ = http(dmn.url, "/v0/standby", {"constellation": self.cid, "version": 1, "snapshots": [snap1]},
+                                headers=self.tok)
+            self.assertEqual(code, 200, rep)
+            self.assertEqual(self.carried(dmn, "standby").get(a), snap1[a], dmn.kind)
         # A witness that knows lyra verifies it: the binding is dead, a is free at generation 1.
         pair = self.twins("witness")
         for dmn in pair:

@@ -23,7 +23,7 @@ from .crypto import KeyPair
 from .encoding import canonical
 from .locks import evaluate
 from .model import heartbeat_payload, sigil_of, transition_id, vote_payload
-from .proofs import acked_by, proves_dead, verify_seal, verify_vote
+from .proofs import acked_by, proves_dead, unverifiable_death, verify_seal, verify_vote
 from .stamps import StampMint
 from .store import WitnessStore
 
@@ -48,6 +48,7 @@ CONTESTED = "!contested"
 MAX_AUTH_BYTES = 32 << 10    # enc({home, lock, salt, unlock, header}) of a SPEND
 MAX_PROOF_BYTES = 128 << 10  # enc(proof) of a RELEASE (a death proof for 128 witnesses fits)
 MAX_GEN = 16                 # a sigil is newly bound only below this generation (so at most 16 times)
+MAX_UNVERIFIED_RELEASES = 4  # per tid, releases a standby member keeps that it cannot verify (§5.5)
 MAX_GEN_VALUE = 1 << 62      # no authorisation names a generation at or above this (SPEC §5.1 step 3)
 
 
@@ -137,9 +138,10 @@ def classify_evidence(sigil: str, log: list, cid: str, registry, voter: str | No
     for a transaction bound in this evidence; everything else is junk anyone could add.
     With ``voter``, only that key's votes are checked and kept (ADOPT needs only its own).
 
-    Without ``voter`` (STANDBY) ``kept`` also holds, for a binding it keeps, the first release
-    whose death proof cites a home whose charter chain this member does not know (it cannot
-    verify it; a later adopter that knows the chain can), within ``MAX_PROOF_BYTES``; and a vote
+    Without ``voter`` (STANDBY) ``kept`` also holds, for a binding it keeps and no verified release
+    of, up to ``MAX_UNVERIFIED_RELEASES`` releases whose death proof passes every check that needs
+    no charter but names a charter version this member does not know (``unverifiable_death``: a
+    later adopter that knows it can verify it), within ``MAX_PROOF_BYTES``; and a vote
     only if its sigil has a kept binding or its signer is in ``members`` (the version handed
     over, so a re-used key's own votes travel): votes on made-up sigils are padding.
     """
@@ -180,7 +182,9 @@ def classify_evidence(sigil: str, log: list, cid: str, registry, voter: str | No
                 if transition_id(h) == t and proves_dead(h, t, e.get("proof"), registry):
                     ev.dead.add(t)
                     releases.append((t, e))
-                elif voter is None and transition_id(h) == t and _cites_unknown_home(e.get("proof"), registry):
+                elif (voter is None and transition_id(h) == t
+                      and unverifiable_death(h, t, e.get("proof"), registry)
+                      and _too_big(e.get("proof"), MAX_PROOF_BYTES) is False):
                     unknown.append((t, e))
             except (KeyError, TypeError, ValueError):
                 pass
@@ -191,23 +195,13 @@ def classify_evidence(sigil: str, log: list, cid: str, registry, voter: str | No
     ev.log = [e for e in log if id(e) in useful]
     bound_sigil = bool(ev.binds)
     useful |= {id(e) for e in votes if voter is not None or bound_sigil or e["vote"]["witness"] in (members or ())}
-    once: set = set()
+    count: dict = {}
     for t, e in unknown:
-        if t in bound_tids and t not in ev.dead and t not in once:
-            once.add(t)
+        if t in bound_tids and t not in ev.dead and count.get(t, 0) < MAX_UNVERIFIED_RELEASES:
+            count[t] = count.get(t, 0) + 1
             useful.add(id(e))
     ev.kept = [e for e in log if id(e) in useful]
     return ev
-
-
-def _cites_unknown_home(proof, registry) -> bool:
-    """Does a death proof (within the size cap) cite a home whose chain ``registry`` lacks?"""
-    if not isinstance(proof, dict) or not isinstance(proof.get("parcel"), dict):
-        return False
-    home = proof["parcel"].get("home")
-    if not isinstance(home, str) or registry.chain(home):
-        return False
-    return _too_big(proof, MAX_PROOF_BYTES) is False
 
 
 class Witness:

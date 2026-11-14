@@ -25,7 +25,7 @@ use crate::gossip::{check_message, CowRegistry, GossipStore};
 use crate::json::{obj, Json};
 use crate::locks::evaluate;
 use crate::model::{heartbeat_payload, sigil_of, transition_id, vote_payload};
-use crate::proofs::{acked_by, proves_dead, verify_seal, verify_vote};
+use crate::proofs::{acked_by, proves_dead, unverifiable_death, verify_seal, verify_vote};
 use crate::stamps::StampKey;
 use crate::store::{Entry, Loaded, Store};
 
@@ -40,6 +40,9 @@ pub const MAX_PROOF_BYTES: usize = 128 << 10;
 /// A sigil is newly bound only below this generation, so at most this many times
 /// (`witness.MAX_GEN`).
 pub const MAX_GEN: i128 = 16;
+/// Per tid, releases a standby member keeps from a handover that it cannot verify
+/// (`witness.MAX_UNVERIFIED_RELEASES`, SPEC §5.5).
+pub const MAX_UNVERIFIED_RELEASES: usize = 4;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Error {
@@ -968,9 +971,10 @@ pub(crate) struct Evidence {
 /// sigil. Releases and seals are kept only for a transaction bound in this evidence (an honest
 /// witness logs one only for a transaction it bound); everything else is junk.
 /// With `voter`, only that key's votes are checked and kept (ADOPT needs only its own).
-/// Without `voter` (STANDBY), `kept` also holds, for a kept binding, the first release whose
-/// death proof cites a home whose chain this member does not know (a later adopter that knows it
-/// can verify it), within `MAX_PROOF_BYTES`; and a vote only if its sigil has a kept binding or
+/// Without `voter` (STANDBY), `kept` also holds, for a kept binding with no verified release, up
+/// to `MAX_UNVERIFIED_RELEASES` releases whose death proof passes every charter-free check but
+/// names a charter version this member does not know ([`unverifiable_death`]), within
+/// `MAX_PROOF_BYTES`; and a vote only if its sigil has a kept binding or
 /// its signer is in `members` (the version handed over: a re-used key's own votes travel).
 pub(crate) fn classify_evidence(
     sigil: &str,
@@ -1038,7 +1042,11 @@ pub(crate) fn classify_evidence(
                 if transition_id(h) == t && proves_dead(h, t, proof, registry, batch) {
                     dead.insert(t.to_string());
                     releases.push((i, t.to_string()));
-                } else if voter.is_none() && transition_id(h) == t && cites_unknown_home(proof, registry) {
+                } else if voter.is_none()
+                    && transition_id(h) == t
+                    && unverifiable_death(h, t, proof, registry)
+                    && proof.canonical().len() <= MAX_PROOF_BYTES
+                {
                     unknown.push((i, t.to_string()));
                 }
             }
@@ -1057,9 +1065,11 @@ pub(crate) fn classify_evidence(
         }
     }
     let mut extra = vec![false; log.len()];
-    let mut once: HashSet<&String> = HashSet::new();
+    let mut count: HashMap<&String, usize> = HashMap::new();
     for (i, t) in &unknown {
-        if bound.contains(t) && !dead.contains(t) && once.insert(t) {
+        let n = count.entry(t).or_insert(0);
+        if bound.contains(t) && !dead.contains(t) && *n < MAX_UNVERIFIED_RELEASES {
+            *n += 1;
             extra[*i] = true;
         }
     }
@@ -1080,16 +1090,6 @@ pub(crate) fn classify_evidence(
         }
     }
     Evidence { binds, dead, sealed, votes, log: out_log, kept }
-}
-
-/// Does a death proof (within the size cap) cite a home whose chain `registry` lacks?
-fn cites_unknown_home(proof: &Json, registry: &Registry) -> bool {
-    if proof.as_obj().is_none() {
-        return false;
-    }
-    let Some(parcel) = proof.get("parcel").filter(|p| p.as_obj().is_some()) else { return false };
-    let Some(home) = parcel.get("home").and_then(Json::as_str) else { return false };
-    registry.chain(home).is_empty() && proof.canonical().len() <= MAX_PROOF_BYTES
 }
 
 /// `(v["gen"], v["tid"])` of one of our votes.
