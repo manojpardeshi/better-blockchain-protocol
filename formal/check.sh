@@ -170,7 +170,8 @@ else
              MC_proofs_witness.cfg MC_proofs_witness2.cfg
              MC_rot.cfg MC_rot_mutant.cfg MC_rot_sibling.cfg MC_rot_sibling4.cfg MC_rot_sibling_witness.cfg MC_rot_sibling_witness2.cfg MC_rot_sibling_witness3.cfg MC_rot_sibling_v1_mutant.cfg
              MC_ckpt.cfg MC_ckpt_forget_mutant.cfg MC_ckpt_noextend_mutant.cfg MC_ckpt_nocheck_mutant.cfg
-             MC_ckpt_sealonly_mutant.cfg MC_ckpt_witness.cfg MC_ckpt_witness2.cfg
+             MC_ckpt_settleany_mutant.cfg MC_ckpt_settlerewind_mutant.cfg MC_ckpt_settleforeign_mutant.cfg
+             MC_ckpt_reuse.cfg MC_ckpt_witness.cfg MC_ckpt_witness2.cfg
              MC_expiry.cfg MC_expiry_mutant.cfg MC_expiry_skew_mutant.cfg
              MC_deep.cfg MC_deep_mutant.cfg
              MC_wallet.cfg MC_wallet_live.cfg MC_wallet_code.cfg

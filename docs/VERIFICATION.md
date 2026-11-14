@@ -258,11 +258,15 @@ from TLC 1.8.0 on 4 cores. All of these run from `formal/check.sh`.
 | `MC_rot_sibling_v1_mutant` | `MC_rot.tla` | the first sibling rule (`AdoptMode = "sibling_v1"`) on an instance where a sealed generation lies above a lone binding | Ty, Tb, Tu, Tg | **violated (expected)**, Bugs 3/4 | — |
 | `MC_rot_sibling_top` | `MC_rot.tla` | the implemented rule (top of the evidence) on the same instance | Ty, Tb, Tu, Tg | opt-in (`SIGIL_TLC_EXTRA`): the state space exceeds the CI budget; `MC_rotp_cex` checks this instance in the proved spec, and `SigilRotProofs.tla` proves the rule for every instance | — |
 | `MC_rot_sibling_witness`, `…_witness2`, `…_witness3` | `MC_rot.tla` | non-vacuity: Tg completes after rotation; a contested record is released; a contested record is settled by a seal | same + Tg | **violated (expected)** | — |
-| `MC_ckpt` | `MC_ckpt.tla` (on `SigilRotProofs` via `MC_rotp`) | **compaction** (SPEC §5.7): settlement on completion certificates, an adversarial driver choosing any checkpoint set per charter, the signer rules at FREEZE, checkpointed sigils left out of snapshots and adopted from the set; Safety, cross-version Lemma 1, sound death proofs, honest non-equivocation, `CkSound` | 3 versions (v0 n=4 q=3 with eager Byz, v1 and v2 n=1), sigil s, Ta={(s,0)}, Tg={(s,1)}, gens 0..1 | hold | 6,508 (depth 19) |
+| `MC_ckpt` | `MC_ckpt.tla` (on `SigilRotProofs` via `MC_rotp`) | **compaction** (SPEC §5.7): settlement on completion certificates, an adversarial driver choosing any checkpoint set per charter, the signer rules at FREEZE, checkpointed sigils left out of snapshots and adopted from the set; Safety, cross-version Lemma 1, sound death proofs, honest non-equivocation, `CkSound`, `StatusSound` (what STATUS reports for a settled or checkpointed record is a real complete binding) and `SettledHeld` (SETTLE never changes a binding) | 3 versions (v0 n=4 q=3 with eager Byz, v1 and v2 n=1), sigil s, Ta={(s,0)}, Tg={(s,1)}, gens 0..1 | hold | 3,808 (depth 19) |
+| `MC_ckpt_reuse` | `MC_ckpt.tla` | as `MC_ckpt`, with h1's key re-used in all three versions (it adopts with its own earlier votes) | v0 = {h1,h2,h3,z}, v1 = v2 = {h1} | hold | 5,666 (depth 17) |
 | `MC_ckpt_ks` *(opt-in)*, `MC_ckpt_sib` *(opt-in)* | `MC_ckpt.tla` | as `MC_ckpt`, on the kill-switch instance (Tb={(s,0),(x,0)}, Ty={(x,0)}) and on the four-transition rotation instance | sigils s, x | opt-in (`SIGIL_TLC_EXTRA`): more than 1.2 M distinct states after 18 min with no violation, not run to completion | — |
 | `MC_ckpt_forget_mutant` | `MC_ckpt.tla` | the adopter **forgets** checkpointed sigils (what "drop consumed records" would do) | as `MC_ckpt` | **violated (expected)**: v1 votes Tg on the consumed sigil, a double spend | 2,089 (depth 10) |
 | `MC_ckpt_noextend_mutant` | `MC_ckpt.tla` | no **extension rule**: a member freezes for a charter whose checkpoint drops a sigil it holds checkpointed | as `MC_ckpt` | **violated (expected)**: a double spend across three versions | 4,769 (depth 14) |
-| `MC_ckpt_nocheck_mutant`, `MC_ckpt_sealonly_mutant` | `MC_ckpt.tla` | members freeze without checking entries against their settled records / a witness settles on one input's seal instead of a completion certificate | as `MC_ckpt` / kill-switch instance | **violated (expected)**: `CkSound` (a checkpoint names a transition that is not complete, freezing the owner's sigil) | 727 / 28,141 |
+| `MC_ckpt_nocheck_mutant` | `MC_ckpt.tla` | members freeze without checking entries against their settled records | as `MC_ckpt` | **violated (expected)**: `CkSound` | depth 6 |
+| `MC_ckpt_settleany_mutant` | `MC_ckpt.tla` | the **first SETTLE**: any certificate (forgeable by retired keys) is accepted and overwrites the record (review finding 1) | as `MC_ckpt` | **violated (expected)**: `StatusSound` | depth 4 |
+| `MC_ckpt_settlerewind_mutant` | `MC_ckpt.tla` | SETTLE on a complete transition without the binding the record holds (finding 2) | as `MC_ckpt` | **violated (expected)**: `SettledHeld` | depth 5 |
+| `MC_ckpt_settleforeign_mutant` | `MC_ckpt.tla` | the record's binding, but a forged foreign seal makes a dead Tb look complete (finding 3) | kill-switch instance | **violated (expected)**: `StatusSound` | depth 4 |
 | `MC_ckpt_witness`, `MC_ckpt_witness2` | `MC_ckpt.tla` | non-vacuity: a checkpointed record reaches version 2; and v2 still seals transitions meanwhile | as `MC_ckpt` (+ Ty) | **violated (expected)** | — |
 | `MC_expiry` | `SigilExpiry.tla` | **owner-signed expiry** + the wallet unpledge rule: with drifting clocks and arbitrarily delayed requests, once the wallet drops a pledge the tid can never be sealed | n=4 q=3, skew 1, `max_skew` 2, time 0..7 | hold | 113,030 |
 | `MC_expiry_mutant`, `MC_expiry_skew_mutant` | `SigilExpiry.tla` | witness ignores expiry / wallet margin `max_skew < 2·skew` | same | **violated (expected)** | — |
@@ -302,11 +306,18 @@ completion certificate, and a settled record takes no further step), `Charter`
 entries for them, including what a Byzantine freezer adds, are ignored). Three
 versions are needed for the extension rule: a sigil checkpointed by v1 must
 still be covered when v1's members (whose records of it have no log) freeze for
-v2. Not modelled: succession (standby members carry the checkpoint set and apply
-the same extension rule at SUCCEED; a dead-man successor carries exactly the
-set), and re-used keys across the checkpoint (a checkpointed record keeps only
-its own vote for exactly its binding and never votes, so key re-use adds no
-step). Both rest on the refinement argument below.
+v2. `Settle` writes the certificate's binding into the record, as the first
+implementation did, and certificates are forgeable (retired keys sign anything):
+the implemented rule only accepts a record that already holds exactly that
+binding, with a transition that is really complete. The first version of this
+model guarded Settle with `Complete(t)` alone and checked only vote properties,
+so it could not see the review's findings 1–3 (rebinding, rewinding, and freezing
+an honest input with a forged foreign seal), none of which creates a second vote;
+`StatusSound` and `SettledHeld` and the three settle mutants close that gap.
+Re-used keys are covered by `MC_ckpt_reuse`. **Not modelled:** succession
+(standby members carry the checkpoint set and apply the extension rule at
+SUCCEED; a dead-man successor carries exactly the set) and the witness's
+registry being stale for a foreign home (SPEC §5.7's residual assumption).
 
 **Refinement argument (why the TLAPS theorems carry over).** Map a run of the
 protocol with settlement and checkpoints to a run of the uncompacted rotation and
@@ -328,7 +339,11 @@ set at every point. Safety, `OneSealAcrossVersions`, `DeathProofsSound` and
 defined from votes), so they hold for every compacted run. This is a paper
 argument, not a TLAPS proof; TLC checks the compacted spec directly on the
 instances above, and the two double-spend mutants show that steps (2) and (3)
-are where the argument needs the extension rule and the checkpoint set.
+are where the argument needs the extension rule and the checkpoint set. The
+argument covers the vote properties only: deep confirmation (SPEC §9) reads what
+current members report in STATUS, which is not a property of the vote set; for
+that, `StatusSound` and `SettledHeld` are checked by TLC on the instances above,
+and nothing is proved for succession.
 
 What the wallet model covers (`formal/SigilWallet.tla`, SPEC §4, §5.1–5.2):
 one parcel of an honest wallet whose home has 3 honest witnesses and 1

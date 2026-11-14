@@ -5,11 +5,18 @@
 (* a checkpoint is carried through a second rotation (configs MC_ckpt*.cfg). *)
 (*                                                                         *)
 (* What is added to the rotation spec:                                      *)
-(*   * Settle(w, s, t): an honest witness shown a settlement certificate     *)
-(*     (SPEC 3.12: t is COMPLETE, every input sealed) marks its record of s  *)
-(*     settled at <<GenOf(t, s), t>>.  A settled record never votes, never  *)
-(*     releases and never takes part in a contested release (the rotation   *)
-(*     spec's actions are guarded by Free(w, s)); it keeps its log.         *)
+(*   * Settle(w, s, t): the witness accepts a settlement certificate and     *)
+(*     marks its record of s settled at <<GenOf(t, s), t>>, writing that     *)
+(*     binding into the record as the first implementation did (gen, tid,   *)
+(*     candidates).  SettleRule is what it checks.  Certificates are         *)
+(*     FORGEABLE: retired keys (of this home or another) sign anything, so  *)
+(*     a rule that does not insist on current-version seals and on the     *)
+(*     binding the record holds accepts a certificate for any t.  The       *)
+(*     implemented rule (SPEC 5.7): the record already holds exactly        *)
+(*     <<GenOf(t, s), t>> and t is Complete (current-version seals cannot   *)
+(*     be forged under the fault bound).  A settled record never votes,     *)
+(*     never releases and never takes part in a contested release (the      *)
+(*     rotation spec's actions are guarded by Free(w, s)); it keeps its log.*)
 (*   * Charter(v, S): whoever drives the rotation fixes version v's charter, *)
 (*     including its checkpoint set S (any set of input entries, one per     *)
 (*     sigil): the driver is adversarial.                                   *)
@@ -29,8 +36,14 @@
 (*   FreezeOK   <- FreezeNoCheck   freezers do not check S against their    *)
 (*                                 settled records: CkSound (liveness of    *)
 (*                                 owners: S names only complete tids)      *)
-(*   SettleOK   <- SettleSealOnly  settle on one input's seal, not a        *)
-(*                                 completion certificate: CkSound          *)
+(*   SettleRule <- SettleAny       the first SETTLE: any certificate,       *)
+(*                                 forged by retired keys, overwrites the   *)
+(*                                 record (review finding 1): StatusSound   *)
+(*   SettleRule <- SettleNoBinding a complete t, but not the binding the    *)
+(*                                 record holds (finding 2): SettledHeld    *)
+(*   SettleRule <- SettleForgedForeign  the record's binding, but t made    *)
+(*                                 to look complete by a forged foreign    *)
+(*                                 seal (finding 3): StatusSound            *)
 EXTENDS MC_rotp
 
 CONSTANT M2     \* members of version 2
@@ -72,9 +85,11 @@ TidsKS == {"Tb", "Ty"}
 HdrKS  == [t \in TidsKS |-> Hdr(t)]
 
 \* ---- The rules (overridden by the mutants) ----
-\* SPEC 5.7 SETTLE: the certificate shows t complete.
-SettleOK(s, t) == Complete(t)
-SettleSealOnly(s, t) == Sealed(s, GenOf(t, s), t)
+\* SPEC 5.7 SETTLE: the record already holds exactly this binding, and t is complete.
+SettleRule(w, s, t)      == bnd[w][s] = t /\ gen[w][s] = GenOf(t, s) /\ Complete(t)
+SettleAny(w, s, t)       == TRUE
+SettleNoBinding(w, s, t) == Complete(t)
+SettleForgedForeign(w, s, t) == bnd[w][s] = t /\ gen[w][s] = GenOf(t, s)
 \* SPEC 5.7, rules for signers: (1) every entry matches a settled record;
 \* (2) every checkpointed record is in S (extension rule).
 FreezeOK(w, S) ==
@@ -109,9 +124,12 @@ Settle(w, s, t) ==
     /\ act[w] /\ ~frz[w]
     /\ Free(w, s)
     /\ s \in SigilsOf(t)
-    /\ SettleOK(s, t)
-    /\ stl' = [stl EXCEPT ![w][s] = <<GenOf(t, s), t>>]
-    /\ UNCHANGED <<vars, ckd, ck, chd>>
+    /\ SettleRule(w, s, t)
+    /\ stl'  = [stl  EXCEPT ![w][s] = <<GenOf(t, s), t>>]
+    /\ gen'  = [gen  EXCEPT ![w][s] = GenOf(t, s)]
+    /\ bnd'  = [bnd  EXCEPT ![w][s] = t]
+    /\ cand' = [cand EXCEPT ![w][s] = {}]
+    /\ UNCHANGED <<votes, act, kv, adv, frz, abst, lg, ld, fr, sb, sd, hev, ckd, ck, chd>>
 
 Charter(v, S) ==
     /\ v \in CkVers /\ v >= 1 /\ ~chd[v]
@@ -198,6 +216,20 @@ CSpec == CInit /\ [][CNext]_cvars
 CkSound ==
     \A v \in CkVers :
         (v >= 1 /\ \E w \in Honest : v \in adv[w]) => \A e \in ck[v] : Complete(e[3])
+
+\* What STATUS reports for a settled or checkpointed record is a real, complete
+\* binding of that sigil (deep confirmation, SPEC 9, reads it).
+StatusSound ==
+    \A w \in Honest, s \in Sigils :
+        stl[w][s] # NoS => /\ <<s, stl[w][s][1]>> \in Header[stl[w][s][2]]
+                          /\ Complete(stl[w][s][2])
+\* SETTLE never changes a binding: a settled (not checkpointed) record holds a binding
+\* it bound itself, and reports exactly it.
+SettledHeld ==
+    \A w \in Honest, s \in Sigils :
+        (stl[w][s] # NoS /\ ~ckd[w][s]) =>
+            /\ stl[w][s] = <<gen[w][s], bnd[w][s]>>
+            /\ <<gen[w][s], bnd[w][s]>> \in lg[w][s]
 
 \* ---- Non-vacuity probes (each must be VIOLATED, MC_ckpt_witness*.cfg) ----
 \* A checkpointed record reaches version 2 (carried through two rotations).
