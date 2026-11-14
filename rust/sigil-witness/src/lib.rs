@@ -20,6 +20,7 @@ pub mod json;
 pub mod locks;
 pub mod model;
 pub mod proofs;
+pub mod probe_url;
 pub mod ratelimit;
 pub mod server;
 pub mod stamps;

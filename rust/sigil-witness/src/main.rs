@@ -40,7 +40,7 @@ use sigil_witness::json::{obj, parse, Json};
 use sigil_witness::stamps::load_mint;
 use sigil_witness::store::Store;
 use sigil_witness::witness::system_clock;
-use sigil_witness::{load_admin_token, load_key, load_registry, ratelimit, server, write_private, KeyPair, Standby, Witness};
+use sigil_witness::{load_admin_token, load_key, load_registry, probe_url, ratelimit, server, write_private, KeyPair, Standby, Witness};
 
 #[derive(Parser)]
 #[command(name = "sigil-witness", about = "Sigil v0 witness (Rust)", version)]
@@ -93,7 +93,7 @@ enum Cmd {
         /// On a fresh store, wait for /v0/standby into a later charter version.
         #[arg(long)]
         wait: bool,
-        /// Member URLs to probe for heartbeats.
+        /// Member HTTP origins to probe for heartbeats (http://host:port; private network only).
         #[arg(long, num_args = 0..)]
         members: Vec<String>,
         /// Probe the members every this many seconds.
@@ -382,6 +382,7 @@ struct StandbyArgs {
 }
 
 fn standby(a: StandbyArgs) -> Result<(), String> {
+    probe_url::validate_probe_urls(&a.members).map_err(|e| format!("--members: {e}"))?;
     let (cid, host, port) = (a.cid.as_str(), a.host.as_str(), a.port);
     let kp = load_key(&a.key)?;
     let reg = load_registry(&a.registry)?;

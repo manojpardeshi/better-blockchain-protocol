@@ -392,13 +392,16 @@ async fn sb_call(State(app): State<StandbyApp>, Path(method): Path<String>, head
             };
             match urls {
                 None => Err(bad_request("urls must be a list of strings")),
-                Some(urls) => {
-                    blocking(move || {
-                        let n = s.probe(&urls);
-                        (Ok(obj([("answered", Json::Int(n as i128))])), 0)
-                    })
-                    .await
-                }
+                Some(urls) => match crate::probe_url::validate_probe_urls(&urls) {
+                    Err(e) => Err(bad_request(&e)),
+                    Ok(()) => {
+                        blocking(move || {
+                            let n = s.probe(&urls);
+                            (Ok(obj([("answered", Json::Int(n as i128))])), 0)
+                        })
+                        .await
+                    }
+                },
             }
         }
         other => Err(bad_request(&format!("unknown method '{other}'"))),
