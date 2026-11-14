@@ -8,14 +8,14 @@ Nothing a witness sends is trusted. Clients verify votes, seals, charters and pr
 
 | Method | Path | Body | `ok` result |
 |---|---|---|---|
-| GET | `/v0/info` | — | `{pk, constellation, version, frozen, stamps: {n, e} \| null}` |
+| GET | `/v0/info` | — | `{pk, constellation, version, frozen, stamps: {n, e} \| null, features}`; `features` lists protocol features the daemon understands (`"checkpoint"`, SPEC §5.7); a daemon from before compaction has no such key |
 | GET | `/v0/charters` | — | `{cid: [charter, …]}`: every charter chain the witness knows |
 | POST | `/v0/spend` | `{request}` (SPEC §5.1; `request.mirror` carries the mirror acks a version with a successor committee needs, §5.5) | vote |
 | POST | `/v0/release` | `{sigil, proof}` (SPEC §5.2) | new generation (int) |
 | POST | `/v0/status` | `{sigil}` (SPEC §5.3) | `{gen, tid, votes}` |
 | POST | `/v0/sell_stamp` | `{blinded: hex}` | blind signature (hex) |
 | POST | `/v0/heartbeat` | `{challenge}`: a string of 1 to 128 characters (SPEC §5.5) | `{constellation, version, witness, challenge, sig}`; only an active, unfrozen witness answers |
-| POST | `/v0/settle` | `{settlement}`: a settlement certificate `{header, inputs: [{parcel: {home, lock, salt}, seal}]}` (SPEC §3.12, §5.7), at most 512 KiB encoded | `{settled: [sigil, …]}`: the inputs living here that are now settled at the certificate's binding |
+| POST | `/v0/settle` | `{settlement}`: a settlement certificate `{header, inputs: [{parcel: {home, lock, salt}, seal}]}` (SPEC §3.12, §5.7), at most 512 KiB encoded, every seal from its home's current version | `{settled: [sigil, …]}`: the inputs living here that the witness held bound to exactly the certificate's binding, now settled (rate limited like every public call) |
 | POST | `/v0/freeze` (admin) | `{charter, checkpoint?}`: the next charter's body (SPEC §5.4) and, if it carries `checkpoint`, its checkpoint set `[[sigil, gen, tid], …]` (§5.7) | `{sig, snapshot}`; the snapshot leaves out the sigils of the checkpoint set |
 | POST | `/v0/adopt` (admin) | `{constellation, version, snapshots: [snapshot, …], checkpoint?}` (SPEC §5.4; `checkpoint` is required when the charter carries one) | `{constellation, version}` |
 | POST | `/v0/settled` (admin) | `{}` | `{settled: [[sigil, gen, tid], …], checkpointed: [[sigil, gen, tid], …]}`, sorted by sigil (SPEC §5.7) |

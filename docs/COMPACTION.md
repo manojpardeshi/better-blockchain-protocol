@@ -70,12 +70,17 @@ A **settlement certificate** for transition `t` is its header and, for each inpu
 has one; the reference wallet sends it to every witness of every input's home right
 after a transition completes (`SETTLE`).
 
-A witness that verifies a certificate marks the record of every input homed with it
-**settled** at `(g_k, t)`: it never votes again on that sigil (it returns a vote it
-already holds for exactly `(g_k, t)`), never releases it, and keeps its log for the
-next handover. Settling is pure abstention, so it is safe whatever the certificate
-says; the certificate is checked so that an honest witness never settles a sigil whose
-transition could still die (liveness: the owner's kill-switch recovery).
+A witness that verifies a certificate marks **settled** the record of every input
+homed with it that it already holds bound to exactly `(g_k, t)`: it never votes again on
+that sigil (it returns the vote it holds), never releases it, and keeps its log for the
+next handover. SETTLE never creates, changes or rewinds a binding, and every seal must be
+from its home's current charter version. A first version overwrote the record with
+whatever a valid certificate said, from any version: an independent review showed that
+retired keys could then rebind a consumed sigil to a forged transition (deep
+confirmation accepted the forgery and the next checkpoint carried it), freeze unspent
+sigils, rewind a re-spent record, and freeze an honest owner's input by forging a foreign
+seal. None of that produces a second vote, which is why the vote-level argument below
+did not see it: those are attacks on what STATUS reports and on owners' liveness.
 
 ### 3.2 Checkpoints in the charter (SPEC §3.7, §5.4, §5.5, §5.7)
 
@@ -113,6 +118,14 @@ omitted was verified by the payee itself and is still in its possession, so it c
 still prove the coin to the next payee.
 
 ## 4. Why it is safe
+
+**What this section covers, and what it does not.** The argument below is about votes:
+no double consumption, one seal per `(s, g)` across versions, no honest equivocation. Deep
+confirmation (§9) also relies on what current members *report* in STATUS, which is not a
+property of the vote set; it holds because a settled or checkpointed record reports a
+binding the witness held (SETTLE never changes one) or a checkpoint entry that a quorum of
+signers checked against bindings they held settled. The TLC model checks this
+(`StatusSound`, `SettledHeld`); succession is not modelled.
 
 **Settlement and checkpointed records only remove votes.** A settled record never
 creates a vote and never releases. Every behaviour of a witness with settled records is

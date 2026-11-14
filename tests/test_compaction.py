@@ -374,6 +374,28 @@ class CheckpointTests(Base):
         with self.assertRaises(RuntimeError):
             plan_checkpoint(cur, [a, b])
         self.assertEqual(checkpoint_entries({"b": (0, "t"), "a": (1, "u")}), [["a", 1, "u"], ["b", 0, "t"]])
+        # One member answering with nothing (a Byzantine one) does not block compaction:
+        # the entries a quorum (3 of 4) holds in common are offered.
+        e = [["a", 0, "t1"], ["b", 0, "t2"]]
+        honest = {"settled": e, "checkpointed": []}
+        self.assertEqual(plan_checkpoint({"name": "c"}, [honest, honest, {"settled": [], "checkpointed": []}, honest],
+                                         need=3), e)
+
+    def test_drivers_gate_checkpoints_on_the_feature(self):
+        """Review finding 4: an older daemon accepts a charter with a checkpoint but ignores the
+        set (it would treat checkpointed sigils as fresh): drivers add one only if every member
+        that will adopt or stand by announces the feature, and refuse to drop an existing one."""
+        from sigil.server import FEATURES, _gate_checkpoint
+
+        class M:
+            def __init__(self, f):
+                self.features = f
+        ck = [["a", 0, "t"]]
+        self.assertIn("checkpoint", FEATURES)
+        self.assertEqual(_gate_checkpoint(ck, {}, [M(["checkpoint"]), M(["checkpoint"])]), ck)
+        self.assertEqual(_gate_checkpoint(ck, {}, [M(["checkpoint"]), M([])]), [])
+        with self.assertRaises(RuntimeError):
+            _gate_checkpoint(ck, {"checkpoint": checkpoint_hash(ck)}, [M([])])
 
 
 class SuccessionCheckpointTests(Base):

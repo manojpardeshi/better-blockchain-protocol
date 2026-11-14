@@ -1152,6 +1152,7 @@ impl Witness {
             ("version", version),
             ("frozen", Json::Bool(st.frozen)),
             ("stamps", self.stamps.as_ref().map(StampKey::public_json).unwrap_or(Json::Null)),
+            ("features", Json::Arr(vec![Json::str("checkpoint")])),
         ])
     }
 

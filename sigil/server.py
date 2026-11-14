@@ -35,6 +35,10 @@ from .witness import Conflict, Rejected, Witness
 MAX_BODY = 1 << 20
 MAX_ADMIN_BODY = 256 << 20  # ADOPT carries every predecessor's evidence; read only once authorised
 MAX_RESPONSE = 16 << 20   # largest gossip snapshot a client reads from one witness
+# Protocol features a daemon announces in /v0/info. "checkpoint": it understands charter
+# checkpoints (SPEC §5.7); a driver puts a checkpoint in a charter only if every member that
+# must adopt or stand by for it announces this, since an older version would ignore the set.
+FEATURES = ["checkpoint"]
 ADMIN_METHODS = ("freeze", "adopt", "settled")
 
 
@@ -187,7 +191,7 @@ class WitnessServer:
     def info(self) -> dict:
         w = self.witness
         return {"pk": w.pk, "constellation": w.cid, "version": w.version, "frozen": w.frozen,
-                "stamps": _pub_out(w.stamps.public) if w.stamps is not None else None}
+                "stamps": _pub_out(w.stamps.public) if w.stamps is not None else None, "features": FEATURES}
 
     def check_admin(self, header) -> None:
         """Refuse a rotation call unless it carries this server's admin token."""
@@ -278,7 +282,7 @@ class StandbyServer(WitnessServer):
         self._stopping = threading.Event()
 
     def info(self) -> dict:
-        return dict(self.standby.info(), frozen=False, stamps=None)
+        return dict(self.standby.info(), frozen=False, stamps=None, features=FEATURES)
 
     def probe(self, urls: list) -> int:
         """Challenge each member at ``urls``; network calls happen outside the lock."""
@@ -394,6 +398,7 @@ class RemoteWitness:
         info = self._get("info")
         self.pk, self.cid, self.version = info["pk"], info["constellation"], info["version"]
         self.stamps = _RemoteStamps(_pub_in(info["stamps"])) if info["stamps"] else None
+        self.features = info.get("features") if isinstance(info.get("features"), list) else []
 
     def __repr__(self):
         return f"RemoteWitness({self.url}, {self.pk[:8]})"
@@ -524,6 +529,7 @@ class RemoteStandby(RemoteWitness):
         info = self._get("info")
         self.pk, self.cid, self.version = info["pk"], info["constellation"], info["version"]
         self.stamps = None
+        self.features = info.get("features") if isinstance(info.get("features"), list) else []
 
     def __repr__(self):
         return f"RemoteStandby({self.url}, {self.pk[:8]})"
@@ -565,6 +571,19 @@ class RemoteStandby(RemoteWitness):
 
     def info(self) -> dict:
         return self._get("info")
+
+
+def _gate_checkpoint(ck: list, cur: dict, joining: list) -> list:
+    """Put a checkpoint in the next charter only if every member that will adopt or stand by
+    for it announces the feature: an older daemon accepts such a charter but ignores the set,
+    and would then treat the checkpointed sigils as fresh. Without the current version's own
+    checkpoint the next charter may simply carry none; with one it must carry it, so the
+    rotation is refused."""
+    if all("checkpoint" in getattr(m, "features", []) for m in joining):
+        return ck
+    if cur.get("checkpoint") is not None:
+        raise RuntimeError("a new member or standby member does not support checkpoints (SPEC §5.7)")
+    return []
 
 
 class RemoteNetwork:
@@ -669,7 +688,9 @@ class RemoteNetwork:
                 olds.append(RemoteWitness(url, self.timeout, admin_token=token(url)))
             except Rejected:
                 continue
-        ck = plan_checkpoint(cur, settled_answers([w for w in olds if w.pk in cur["witnesses"]]), compact)
+        ck = plan_checkpoint(cur, settled_answers([w for w in olds if w.pk in cur["witnesses"]]), compact,
+                             quorum(len(cur["witnesses"])))
+        ck = _gate_checkpoint(ck, cur, new + standbys)
         nxt = charter_body(cur["name"], cur["version"] + 1, [w.pk for w in new], charter_hash(cur), succ,
                            checkpoint_hash(ck) if ck else None)
         sigs, snapshots = {}, []
@@ -714,7 +735,7 @@ class RemoteNetwork:
                 members.append(RemoteStandby(url, self.timeout, admin_token=token(url)))
             except Rejected:
                 continue
-        ck = plan_checkpoint(cur, settled_answers(members), compact=False)
+        ck = _gate_checkpoint(plan_checkpoint(cur, settled_answers(members), compact=False), cur, new + standbys)
         nxt = charter_body(cur["name"], cur["version"] + 1, [w.pk for w in new], charter_hash(cur), succ,
                            checkpoint_hash(ck) if ck else None)
         # Two phases: a member that signs fences at once (SPEC §5.5), so asking members one by

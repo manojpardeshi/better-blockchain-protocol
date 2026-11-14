@@ -16,14 +16,17 @@ from .succession import Standby
 from .witness import Rejected, Witness
 
 
-def plan_checkpoint(cur: dict, answers: list, compact: bool = True) -> list:
+def plan_checkpoint(cur: dict, answers: list, compact: bool = True, need: int | None = None) -> list:
     """The checkpoint set to offer for the version after ``cur`` (SPEC §5.7).
 
     ``answers`` are members' SETTLED answers. The current version's own set (checked
     against ``cur``'s hash) is always kept: members refuse a charter that drops one
-    of its sigils. With ``compact`` it is extended by every entry all answering
-    members hold settled; settled records only accumulate, so each of them accepts.
-    A malformed answer counts as holding nothing settled (it costs compaction only).
+    of its sigils. With ``compact`` it is extended by the entries held settled by every
+    member of the ``need`` answering members (default: all of them) whose settled sets
+    have the most in common, so a member answering with little (a Byzantine one) does not
+    block compaction: members lacking an entry refuse to freeze, and a quorum of the others
+    still can. Settled records only accumulate, so the chosen members accept. A malformed
+    answer counts as holding nothing settled (it costs compaction only).
     """
     prev: list = []
     ck = cur.get("checkpoint")
@@ -37,7 +40,7 @@ def plan_checkpoint(cur: dict, answers: list, compact: bool = True) -> list:
             raise RuntimeError("no member answered with the current checkpoint set")
     if not compact or not answers:
         return [list(e) for e in prev]
-    common = None
+    sets = []
     for a in answers:
         try:
             got = {(e[0], e[1], e[2]) for e in a["settled"]
@@ -45,7 +48,15 @@ def plan_checkpoint(cur: dict, answers: list, compact: bool = True) -> list:
                    and isinstance(e[1], int) and not isinstance(e[1], bool) and e[1] >= 0}
         except (KeyError, TypeError, IndexError):
             got = set()
-        common = got if common is None else common & got
+        sets.append(got)
+    need = len(sets) if need is None else min(max(need, 1), len(sets))
+    # Greedy: start from the largest set, add the set that keeps the most in common.
+    sets.sort(key=len, reverse=True)
+    common, rest = set(sets[0]), sets[1:]
+    for _ in range(need - 1):
+        best = max(rest, key=lambda x: len(common & x))
+        rest.remove(best)
+        common &= best
     merged = {e[0]: tuple(e) for e in prev}
     for e in sorted(common or ()):
         merged.setdefault(e[0], e)
@@ -158,7 +169,7 @@ class Network:
         chain = self.registry.chain(cid)
         cur = chain[-1]["body"]
         ckeys, succ = self._committee_keys(successor)
-        ck = plan_checkpoint(cur, settled_answers(self.witnesses(cid)), compact)
+        ck = plan_checkpoint(cur, settled_answers(self.witnesses(cid)), compact, quorum(len(cur["witnesses"])))
         nxt = charter_body(cur["name"], cur["version"] + 1, [k.pk for k in new_keys], charter_hash(cur), succ,
                            checkpoint_hash(ck) if ck else None)
         sigs, snapshots = {}, []

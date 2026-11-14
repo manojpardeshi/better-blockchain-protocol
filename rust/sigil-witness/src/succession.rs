@@ -643,6 +643,7 @@ impl Standby {
             ("dead", Json::Bool(self.dead_locked(&st))),
             ("frozen", Json::Bool(false)),
             ("stamps", Json::Null),
+            ("features", Json::Arr(vec![Json::str("checkpoint")])),
         ])
     }
 }
