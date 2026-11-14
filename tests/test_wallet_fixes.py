@@ -5,6 +5,7 @@ import json
 import os
 import tempfile
 import unittest
+from unittest import mock
 
 from sigil import InvalidDossier, KeyPair, Network, Wallet
 from sigil import model, wallet_store
@@ -132,11 +133,11 @@ class GenerationLimitTests(unittest.TestCase):
     def test_threshold_is_below_the_limit(self):
         self.assertLess(Wallet.REFRESH_GEN, MAX_GEN)
 
-    def test_aged_coin_is_refreshed_before_it_is_spent(self):
+    def test_refresh_moves_an_aged_coin(self):
         h = self.coin()
         h["gen"] = Wallet.REFRESH_GEN  # as after that many aborts
         old = h["sigil"]
-        self.alice.select(self.usd, 10)
+        self.assertEqual(self.alice.refresh(), [old])
         new = self.coin()
         self.assertNotEqual(new["sigil"], old)
         self.assertEqual((new["gen"], new["parcel"]["amount"]), (0, 100))
@@ -163,13 +164,49 @@ class GenerationLimitTests(unittest.TestCase):
         request_seal(self.net, betrayal[3][0])
         with self.assertRaises(SealFailed):
             self.alice.seal(header, body, unlocks)
-        self.alice.abort(header)
+        self.assertEqual(self.alice.abort(header), [old])
         new = self.coin()
         self.assertNotEqual(new["sigil"], old)
         self.assertEqual(new["gen"], 0)
         self.assertNotIn(old, self.alice.pledged)
         self.alice.pay(self.bob, self.usd, 100)
         self.assertEqual(self.bob.balance(self.usd), 100)
+
+    def test_select_sends_nothing(self):
+        """Selecting coins of one asset never spends coins (aged or not) of another."""
+        gold = self.alice.issue("GOLD", 5)
+        (g,) = [h for h in self.alice.holdings.values() if h["parcel"]["asset"] == gold]
+        g["gen"] = Wallet.REFRESH_GEN
+        self.alice.select(self.usd, 10)
+        self.assertIn(model.parcel_id(g["ref"]), self.alice.holdings)
+        self.assertEqual(g["gen"], Wallet.REFRESH_GEN)
+
+    def test_abort_does_not_report_a_coin_the_refresh_left_pledged(self):
+        Y = self.net.create_constellation("lyra")
+        mal = Wallet("mallory", self.net, Y)
+        gold = mal.issue("GOLD", 10)
+        self.coin()["gen"] = Wallet.REFRESH_GEN - 1
+        old = self.coin()["sigil"]
+        header, body, _ = propose_swap(self.alice, self.usd, 100, mal, gold, 10)
+        unlocks = {**self.alice.authorise(header, body), **mal.authorise(header, body)}
+        me = mal.address()
+        betrayal = manual_spend(mal, [body["inputs"][1]], [model.parcel(Y, gold, 10, me["lock"], me["salt"])])
+        request_seal(self.net, betrayal[3][0])
+        with self.assertRaises(SealFailed):
+            self.alice.seal(header, body, unlocks)
+        real = self.alice.seal
+        with mock.patch.object(self.alice, "seal", side_effect=SealFailed(old, [], [])):
+            released = self.alice.abort(header)     # the refresh's own seal fails
+        self.assertIn(old, self.alice.pledged)       # pledged to the refresh now
+        self.assertEqual(released, [])
+        self.alice.seal = real
+
+    def test_kill_switch_is_refreshed_too(self):
+        k = self.alice.kill_switch()
+        k["gen"] = Wallet.REFRESH_GEN
+        self.assertEqual(self.alice.refresh(), [k["sigil"]])
+        (new,) = [h for h in self.alice.holdings.values() if h["sigil"] in self.alice.kill_switches]
+        self.assertEqual(new["gen"], 0)
 
 
 if __name__ == "__main__":

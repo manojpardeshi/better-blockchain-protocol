@@ -149,6 +149,8 @@ def cmd_pay(args):
         raise CliError("address file must hold {home, lock, salt}")
     if args.amount <= 0:
         raise CliError("amount must be positive")
+    w.refresh()  # coins close to the generation limit move to fresh addresses first
+    wallet_store.save(w, args.wallet)
     try:
         refs, outputs = w.payment_outputs(args.asset, args.amount, addr)
     finally:
