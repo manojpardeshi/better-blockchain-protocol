@@ -400,7 +400,11 @@ class Witness:
     # ----------------------------------------------------------------- query
 
     def status(self, sigil: str) -> dict:
-        rec = self.records.get(sigil)
+        rec = self.records.get(sigil)  # an unhashable sigil is a bad request, first
+        # A witness that has not joined (awaiting ADOPT) knows nothing yet: "unbound" from it
+        # would read as an answer from a current member (SPEC §4 rule 3), so it answers nothing.
+        if self.cid is None:
+            raise Rejected("witness not active")
         if rec is None:
             return {"gen": 0, "tid": None, "votes": []}
         return {"gen": rec.gen, "tid": rec.tid, "votes": list(rec.votes)}

@@ -122,6 +122,8 @@ fn freeze_and_adopt_survive_restarts() {
     let n = open(&p, "n0", &reg1, &w.cid, true);
     assert_eq!((n.cid(), n.version()), (None, None));
     assert_eq!(n.spend(&ra).0, Err(Error::Rejected("witness not active".into())));
+    // Nor does it answer STATUS: its "unbound" would read as a current member's (rule 3).
+    assert_eq!(n.status(&Json::str(&sa)).0, Err(Error::Rejected("witness not active".into())));
     close(n);
     // Without --adopt a fresh store refuses to start on a rotated constellation.
     let (store, loaded) = Store::open(&dir.path("fresh.redb")).unwrap();

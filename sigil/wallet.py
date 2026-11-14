@@ -716,6 +716,16 @@ class Wallet:
         keys, members = self._members(home, reachable=False)
         if not keys or set(members) != keys:
             return False  # some current member is not even listed
+        # A listed entry outside the current charter (a retired member, during or after a
+        # rotation) does not count as an answer, but one that does answer must be clean too:
+        # it may hold a vote the current members have not inherited yet.
+        for w in self.network.all_witnesses(home):
+            if w.pk in keys or w.pk in self.network.down:
+                continue
+            st = _status(w, sigil)
+            if st is not None and ((st["gen"] == gen and st["tid"] == tid) or any(
+                    v["gen"] == gen and v["tid"] == tid for v in st["votes"])):
+                return False
         for ws in members.values():
             for w in ws:  # every entry claiming the key must answer, and none may hold it
                 st = None if w.pk in self.network.down else _status(w, sigil)

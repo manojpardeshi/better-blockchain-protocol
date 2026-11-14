@@ -401,6 +401,8 @@ class WireCompatTests(unittest.TestCase):
         r.send("adopt info", AD, W, "/v0/info")
         r.send("adopt unknown version", AD, W, "/v0/adopt", {"constellation": cid, "version": 1, "snapshots": []}, headers=tok)
         r.send("adopt spend before adopt", AD, W, "/v0/spend", {"request": good})
+        # A witness that has not joined answers no STATUS (it would read as "unbound" from a member).
+        r.send("adopt status before adopt", AD, W, "/v0/status", {"sigil": good["sigil"]}, expect=403)
         r.send("adopt learns v1", AD, W, "/v0/gossip", {"charters": {cid: chain0 + [a]}}, expect=200)
         r.send("adopt version 0", AD, W, "/v0/adopt", {"constellation": cid, "version": 0, "snapshots": []}, headers=tok)
         r.send("adopt snapshots not a list", AD, W, "/v0/adopt", {"constellation": cid, "version": 1, "snapshots": {}}, headers=tok)

@@ -617,6 +617,10 @@ impl Witness {
             return (Err(Error::BadRequest("unhashable sigil".into())), 0);
         }
         let st = self.state.lock().expect("state lock");
+        // A witness that has not joined (awaiting ADOPT) answers nothing (witness.py status).
+        if st.member.is_none() {
+            return (Err(Error::Rejected("witness not active".into())), 0);
+        }
         let out = match sigil.as_str().and_then(|s| st.records.get(s)) {
             None => obj([("gen", Json::Int(0)), ("tid", Json::Null), ("votes", Json::Arr(vec![]))]),
             Some(r) => obj([("gen", Json::Int(r.gen)), ("tid", r.tid.clone().into()), ("votes", Json::Arr(r.votes.clone()))]),

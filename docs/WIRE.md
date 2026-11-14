@@ -12,7 +12,7 @@ Nothing a witness sends is trusted. Clients verify votes, seals, charters and pr
 | GET | `/v0/charters` | — | `{cid: [charter, …]}`: every charter chain the witness knows |
 | POST | `/v0/spend` | `{request}` (SPEC §5.1; `request.mirror` carries the mirror acks a version with a successor committee needs, §5.5) | vote |
 | POST | `/v0/release` | `{sigil, proof}` (SPEC §5.2) | new generation (int) |
-| POST | `/v0/status` | `{sigil}` (SPEC §5.3) | `{gen, tid, votes}` |
+| POST | `/v0/status` | `{sigil}` (SPEC §5.3) | `{gen, tid, votes}`; `rejected` ("witness not active") from a witness that has not joined a charter version (awaiting ADOPT), whose "unbound" would otherwise read as a member's answer |
 | POST | `/v0/sell_stamp` | `{blinded: hex}` | blind signature (hex) |
 | POST | `/v0/heartbeat` | `{challenge}`: a string of 1 to 128 characters (SPEC §5.5) | `{constellation, version, witness, challenge, sig}`; only an active, unfrozen witness answers |
 | POST | `/v0/freeze` (admin) | `{charter}`: the next charter's body (SPEC §5.4) | `{sig, snapshot}` |
