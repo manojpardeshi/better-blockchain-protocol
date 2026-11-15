@@ -42,7 +42,7 @@ Status legend: ⬜ not started · 🟨 in progress · ✅ done
 | ✅ | Constellation succession (dead-man takeover): successor committees, mirror before vote, fenced standby members (SPEC §5.5), Python and Rust, TLAPS-proved safety (`formal/SigilSuccProofs.tla`) |
 | ⬜ | Arbiter objects for shared state (AMMs, auctions) |
 | ⬜ | Issuer redemption: re-mint coins with short histories |
-| ⬜ | Stamp pricing and bond sizing |
+| 🟨 | Stamp pricing and bond sizing: the [operator worksheet](ECONOMICS.md) makes assumptions explicit, but measured costs, paid stamp issuance, exposure limits and collectible bonds are still needed |
 
 ## Phase 5: Public testnet and audit (#12)
 | | Item |
