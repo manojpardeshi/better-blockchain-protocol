@@ -9,11 +9,12 @@ processes.
 """
 
 import unittest
+from unittest.mock import patch
 
 from sigil import Network, Wallet
 from sigil.charter import Registry, charter_body, charter_hash, taken_over, verify_chain
 from sigil.crypto import KeyPair
-from sigil.server import RemoteNetwork, RemoteStandby, RemoteWitness, StandbyServer, WitnessServer
+from sigil.server import RemoteNetwork, RemoteStandby, RemoteWitness, StandbyServer, Unreachable, WitnessServer
 from sigil.succession import Standby
 from sigil.witness import Rejected, Witness
 
@@ -103,6 +104,17 @@ class SuccessionOverHttp(unittest.TestCase):
         # MIRROR needs no token, but only owner-authorised bindings for this version.
         with self.assertRaises(Rejected):
             RemoteStandby(self.committee_urls[0]).mirror_bind({"sigil": "x", "home": self.X, "version": 0})
+
+    def test_network_probe_reports_standby_refusal(self):
+        # A Rust standby rejects public HTTPS member URLs. The operator must see
+        # that configuration error, not a count of zero live witnesses.
+        with patch.object(RemoteStandby, "probe", side_effect=Rejected("only http:// URLs")):
+            with self.assertRaisesRegex(Rejected, "only http:// URLs"):
+                self.net.probe(self.X, TOKEN)
+        # A partial count is just as misleading if one standby did not answer.
+        with patch.object(RemoteStandby, "probe", side_effect=Unreachable("probe timed out")):
+            with self.assertRaisesRegex(Unreachable, "probe timed out"):
+                self.net.probe(self.X, TOKEN)
 
     def test_cooperative_rotation_over_http(self):
         alice, bob = Wallet("alice", self.net, self.X), Wallet("bob", self.net, self.X)
