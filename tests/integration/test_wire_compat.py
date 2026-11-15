@@ -41,20 +41,21 @@ TYPE_FUZZ = [None, 5, "x", [], {}, True, -1]
 def wire_endpoints() -> dict:
     """``{(role, method, path): admin}`` for every endpoint row of the WIRE.md tables."""
     out, role = {}, "witness"
-    for line in open(WIRE, encoding="utf-8"):
-        if line.startswith("## "):
-            role = "standby" if line.strip() == "## Succession" else "witness"
-        if not line.startswith("| GET") and not line.startswith("| POST"):
-            continue
-        cells = [c.strip() for c in line.strip().strip("|").split("|")]
-        method = cells[0]
-        # e.g. "`/v0/charters`, `/v0/proofs`; POST `/v0/gossip`": a later verb applies onwards
-        for part in re.split(r";\s*", cells[1]):
-            m = re.match(r"(GET|POST)\s+(.*)", part)
-            if m:
-                method, part = m.group(1), m.group(2)
-            for path in re.findall(r"`(/v0/[a-z_]+)`", part):
-                out[(role, method, path)] = "(admin)" in part
+    with open(WIRE, encoding="utf-8") as wire:
+        for line in wire:
+            if line.startswith("## "):
+                role = "standby" if line.strip() == "## Succession" else "witness"
+            if not line.startswith("| GET") and not line.startswith("| POST"):
+                continue
+            cells = [c.strip() for c in line.strip().strip("|").split("|")]
+            method = cells[0]
+            # e.g. "`/v0/charters`, `/v0/proofs`; POST `/v0/gossip`": a later verb applies onwards
+            for part in re.split(r";\s*", cells[1]):
+                m = re.match(r"(GET|POST)\s+(.*)", part)
+                if m:
+                    method, part = m.group(1), m.group(2)
+                for path in re.findall(r"`(/v0/[a-z_]+)`", part):
+                    out[(role, method, path)] = "(admin)" in part
     return out
 
 
