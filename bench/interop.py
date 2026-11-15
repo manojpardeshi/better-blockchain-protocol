@@ -607,8 +607,16 @@ class Interop:
             assert first is not None and DEFAULT_BURST - 2 <= first <= DEFAULT_BURST + 100, (c.witnesses[i]["kind"], first)
             assert body == {"error": "rejected", "message": "rate limited", "vote": None}, body
             assert int(headers["Retry-After"]) >= 1
-            # Rotation calls are not rate limited (the admin token decides), and a limited
-            # client gets a clean Rejected from the reference client.
+            c.kill(i, signal.SIGTERM)
+        # Loopback with an explicit limit. One token refills per 1,000 seconds, so the
+        # bucket cannot refill between the 429, the admin call, and the client call.
+        slow = ["--rate-limit", "0.001", "--rate-burst", "3"]
+        Q, qidx = self.constellation("tight", ["rust", "python"], {"rust": slow, "python": slow})
+        for i in qidx:
+            url = c.url(i)
+            codes = [post(url, "/v0/status", {"sigil": "00" * 32})[0] for _ in range(6)]
+            assert codes.count(429) >= 2, (c.witnesses[i]["kind"], codes)
+            # Rotation calls bypass the limit; the admin token still decides.
             assert post(url, "/v0/freeze", {})[:2] == (403, {"error": "rejected", "message": "bad admin token", "vote": None})
             try:
                 w = RemoteWitness.__new__(RemoteWitness)  # a client without the /v0/info call
@@ -617,13 +625,7 @@ class Interop:
                 raise AssertionError("not limited")
             except Rejected as e:
                 assert str(e) == "rate limited", e
-            c.kill(i, signal.SIGTERM)
-        # Loopback with an explicit limit, and the size caps (both kinds of witness, same answers).
-        Q, qidx = self.constellation("tight", ["rust", "python"], {"rust": ["--rate-limit", "1", "--rate-burst", "3"],
-                                                                    "python": ["--rate-limit", "1", "--rate-burst", "3"]})
-        for i in qidx:
-            codes = [post(c.url(i), "/v0/status", {"sigil": "00" * 32})[0] for _ in range(6)]
-            assert codes.count(429) >= 2, (c.witnesses[i]["kind"], codes)
+        # Size caps (both kinds of witness, same answers).
         for i in c.indices(self.Z):
             url = c.url(i)
             salt = "e" * (MAX_AUTH_BYTES + 1)  # refused before the lock is even looked at
