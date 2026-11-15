@@ -67,6 +67,14 @@ def preflight(reps: int, output: str) -> None:
         raise RuntimeError(f"output directory does not exist: {parent}")
     if os.path.isdir(output):
         raise RuntimeError(f"output path is a directory: {output}")
+    try:
+        fd, probe_path = tempfile.mkstemp(prefix=".sigil-preflight-", dir=parent)
+    except OSError as e:
+        raise RuntimeError(f"cannot create a temporary file in output directory {parent}: {e}") from e
+    try:
+        os.close(fd)
+    finally:
+        os.unlink(probe_path)
 
 
 def write_results(output: str, results: dict) -> None:

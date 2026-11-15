@@ -53,6 +53,19 @@ class BenchmarkRunnerTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "taskset cannot pin to CPUs 0: operation not permitted"):
                 run_all.preflight(1, self.output)
 
+    def test_preflight_rejects_unwritable_output_directory(self):
+        succeeded = subprocess.CompletedProcess([], 0, "", "")
+        with (mock.patch.object(run_all.sys, "platform", "linux"),
+              mock.patch("builtins.open", mock.mock_open(read_data="model name: test CPU\n")),
+              mock.patch.object(run_all.shutil, "which", return_value="/usr/bin/taskset"),
+              mock.patch.object(run_all.os, "sched_getaffinity", return_value={0, 1, 2, 3}, create=True),
+              mock.patch.object(run_all.os.path, "isfile", return_value=True),
+              mock.patch.object(run_all.os, "access", return_value=True),
+              mock.patch.object(run_all.subprocess, "run", return_value=succeeded),
+              mock.patch.object(run_all.tempfile, "mkstemp", side_effect=PermissionError("read only"))):
+            with self.assertRaisesRegex(RuntimeError, "cannot create a temporary file in output directory"):
+                run_all.preflight(1, self.output)
+
     def test_atomic_write_preserves_old_result_on_serialization_failure(self):
         with open(self.output, "w") as f:
             f.write("old result")
