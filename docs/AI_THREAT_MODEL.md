@@ -302,7 +302,7 @@ today because the first one can never reach a quorum, but it is a standing reaso
 not to treat STATUS as evidence. An AI adversary is ideal for this kind of attack:
 it can hold exactly the right lie across exactly the right partition and rotation.
 
-The open "pathological split" problem (whitepaper §10.7) is the same family: if
+The open "pathological split" problem (whitepaper §10.8) is the same family: if
 votes split without any quorum and some witnesses are unreachable forever, no death
 proof exists and the honest party's input stays locked. An AI that controls network
 timing maximises how often this happens.
@@ -314,7 +314,7 @@ timing maximises how often this happens.
   prefer re-authorising the *same* tid over signing a new one, and keep the pledge
   unless the owner holds signed evidence (a death proof).
 * **P2:** bond counter-parties and retry swaps against fresh witnesses to shrink the
-  pathological-split window (whitepaper §10.7); a formal treatment is open.
+  pathological-split window (whitepaper §10.8); a formal treatment is open.
 
 ---
 
@@ -447,7 +447,7 @@ lists additional fair-exchange requirements for separate processes.
   one's own inputs and change and obtaining the counter-party's unlocks before
   releasing one's own.
 * **P2:** bond counter-parties; a complete fix for the unreachable-forever split of
-  §10.7 is still open.
+  §10.8 is still open.
 
 ---
 
@@ -472,7 +472,7 @@ Auditor independence, availability, and actual bond value still need an operator
 policy. Arbitrary proof-only equivocation locks would retain the old flaw.
 
 Second, the **parameters are unspecified** (ROADMAP Phase 4:
-"Stamp pricing and bond sizing" ⬜). Nothing today says how large a bond must be
+"Stamp pricing and bond sizing"). Nothing today says how large a bond must be
 relative to the value a constellation homes, or how stamps are priced against
 spam cost. An AI adversary optimises against whatever numbers are chosen:
 under-priced stamps → spam; under-sized bonds → profitable double-spend where
@@ -802,7 +802,7 @@ Being honest about the ceiling:
    counter-party could bind the honest input and vanish without leaving a death
    proof. Kill-switch inputs now turn that hostage into a bounded free option,
    but cannot remove the option itself.
-   And the whitepaper §10.7 split (equivocation plus witnesses unreachable forever)
+   And the whitepaper §10.8 split (equivocation plus witnesses unreachable forever)
    can still lock an honest input. An AI that owns network timing maximises both.
    A complete fix for the second is open.
 5. **Traffic/metadata analysis and dossier graph linkage.** Until recursive proofs
