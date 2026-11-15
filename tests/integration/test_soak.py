@@ -144,17 +144,20 @@ class Soak:
         t0 = time.perf_counter()
         tid = src.transact(refs, outputs)
         t1 = time.perf_counter()
-        blob = src.dossier.ancestry([tid]).to_json()
+        # A delta dossier (SPEC 6.1): the payee says which transitions it holds.
+        blob = src.dossier.ancestry([tid], have=dst.held_history()).to_json()
         t2 = time.perf_counter()
         before = len(dst.verifier._ok)
         d = Dossier.from_json(blob)
         dst.receive(d, [model.ref(tid, 0)])
         t3 = time.perf_counter()
+        full = len(src.dossier.ancestry([tid]).to_json()) if record else 0   # what a full dossier would be
         for r in refs:
             cid = src.dossier.output(r)["home"]
             self.sealed[cid] = self.sealed.get(cid, 0) + 1
         if record:
-            self.hops.append({"t": self.t(), "kind": kind, "ntx": len(d), "bytes": len(blob), "seal": t1 - t0,
+            self.hops.append({"t": self.t(), "kind": kind, "ntx": len(d), "bytes": len(blob), "bytes_full": full,
+                              "ntx_full": len(src.dossier.ancestry([tid])), "seal": t1 - t0,
                               "pack": t2 - t1, "verify": t3 - t2, "new": len(dst.verifier._ok) - before,
                               "series_age": round(time.monotonic() - self.series_started, 1)})
             self.ops.append((self.t(), kind, t3 - t0))
@@ -272,11 +275,14 @@ class Soak:
             c.witnesses[i]["pending"] = False
         dt = time.perf_counter() - t0
         adopted = sum(store_bytes(c.witnesses[i]["store"]) for i in new)
+        snaps, ck = getattr(self.net, "last_handover", ([], []))
+        handover = sum(len(json.dumps(x)) for x in snaps) + len(json.dumps(ck))
         self.stop_old(old)
         self.write_urls()
         self.events.append((self.t(), "rotation", {"version": v, "kinds": kinds, "seconds": round(dt, 2),
-                                                   "new_store_bytes": adopted}))
-        log(f"rotated vega to v{v} {kinds} in {dt:.1f}s")
+                                                   "new_store_bytes": adopted, "handover_bytes": handover,
+                                                   "checkpointed": len(ck)}))
+        log(f"rotated vega to v{v} {kinds} in {dt:.1f}s, handover {handover / MIB:.1f} MiB, {len(ck)} checkpointed")
 
     def succession(self):
         c, H = self.c, self.H
@@ -518,6 +524,8 @@ with open(out_file, "a", buffering=1) as out:
             "hop_ntx_max": max((h["ntx"] for h in hops), default=0),
             "hop_bytes_max": max((h["bytes"] for h in hops), default=0),
             "hop_bytes_per_tx": percentiles([h["bytes"] / h["ntx"] for h in hops]),
+            "hop_bytes": percentiles([h["bytes"] for h in hops]),
+            "hop_bytes_full": percentiles([h.get("bytes_full", h["bytes"]) for h in hops]),
             "hop_verify_per_new_tx": percentiles([h["verify"] / h["new"] for h in hops if h["new"] > 0]),
             "fresh_verify_per_tx": percentiles([h["verify"] / h["ntx"] for h in fresh]),
             "pack_per_tx": percentiles([h["pack"] / h["ntx"] for h in hops]),

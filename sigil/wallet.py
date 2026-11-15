@@ -17,7 +17,7 @@ from .network import Network
 from .proofs import proves_dead, verify_ack, verify_seal, verify_vote
 from .stamps import buy_stamp
 from .validate import Dossier, InvalidDossier, TrustPolicy, Verifier
-from .witness import CONTESTED, Conflict, Rejected
+from .witness import CONTESTED, MAX_GEN, Conflict, Rejected
 
 
 class SealFailed(Exception):
@@ -128,6 +128,12 @@ def _status(w, sigil: str) -> dict | None:
 
 
 class Wallet:
+    # A sigil is newly bound only below MAX_GEN (SPEC §5.1), and every abort moves a coin one
+    # generation on. From this generation the wallet moves the coin to a fresh address of its
+    # own (generation 0) before anything else, leaving room for the move itself to fail and be
+    # aborted a few times before the limit.
+    REFRESH_GEN = MAX_GEN - 4
+
     def __init__(self, name: str, network: Network, home: str | None = None, *, trusted=None,
                  deep_threshold: int | None = None, clock=None, pledge_ttl: int = 600,
                  max_skew: int = 120, on_pledge=None, deep_after_succession: bool = True):
@@ -148,10 +154,14 @@ class Wallet:
         self.home = home
         # Trust is the owner's choice, never a payer's: by default the wallet
         # trusts its home plus the constellations its network was configured
-        # with *now*. Charters a received dossier introduces later are learned
-        # (to verify seals) but never trusted unless the owner calls ``trust``.
+        # with (its directory: ``configured()``), never what its registry merely
+        # learned, since gossip admits any valid genesis chain from anyone. Charters
+        # a received dossier introduces are learned (to verify seals) but never
+        # trusted unless the owner calls ``trust``. (The in-process ``Network``
+        # has no gossip: its registry is the operator's own directory.)
         if trusted is None:
-            trusted = set(network.registry.ids()) | ({home} if home else set())
+            configured = getattr(network, "configured", None)
+            trusted = (configured() if configured else set(network.registry.ids())) | ({home} if home else set())
         self.policy = TrustPolicy(network.registry, trusted)
         self.verifier = Verifier(self.policy)
         self.keys: dict[str, KeyPair] = {}
@@ -167,6 +177,7 @@ class Wallet:
         self.legacy_keys: set[str] = set()
         self.spent: set[str] = set()          # sigils we held and consumed: never credited again
         self.auto_prune = True                # pay() drops history it no longer needs (see prune)
+        self.auto_settle = True               # completed transitions are SETTLEd at their homes (SPEC §5.7)
         self.kill_switches: set[str] = set()  # sigils of kill-switch parcels (multi-party transitions)
         # sigil -> {"gen", "tid", "proof"} of each transition we aborted: re-presented to
         # any witness that still holds the old binding (it missed the RELEASE, or a
@@ -184,10 +195,22 @@ class Wallet:
         """Trust another constellation (the owner's decision)."""
         self.policy.trust(cid)
 
-    def _size(self, cid: str) -> int:
-        """Members of a constellation's current charter (not just those reachable)."""
+    def _members(self, cid: str, *, reachable: bool = True) -> tuple[set, dict]:
+        """The keys of ``cid``'s current charter, and the listed witnesses claiming each.
+
+        Only a key of the current charter counts: a stale directory may still list
+        retired members, or list one member twice, and neither may stand in for a
+        current member's answer. Returns ``(keys, {pk: [witness, ...]})``; ``keys``
+        is empty if the charter is unknown.
+        """
         charter = self.network.registry.latest(cid)
-        return len(charter["witnesses"]) if charter else len(self.network.all_witnesses(cid))
+        keys = set(charter["witnesses"]) if charter else set()
+        src = self.network.witnesses(cid) if reachable else self.network.all_witnesses(cid)
+        by_pk: dict[str, list] = defaultdict(list)
+        for w in src:
+            if w.pk in keys and w not in by_pk[w.pk]:
+                by_pk[w.pk].append(w)
+        return keys, dict(by_pk)
 
     # ------------------------------------------------------------- receiving
 
@@ -212,6 +235,12 @@ class Wallet:
         parcels of at least ``deep_threshold``.
         """
         received = []
+        # A delta dossier (SPEC §6.1) leaves out history we already hold: verify against
+        # the union, our own entries winning, so everything below sees the full ancestry.
+        try:
+            dossier = Dossier().merge(self.dossier).merge(dossier)
+        except (AttributeError, TypeError, KeyError, ValueError) as e:
+            raise InvalidDossier(f"malformed dossier: {type(e).__name__}") from e
         # The threshold applies to the whole payment per asset, so splitting
         # one large payment into many small parcels cannot dodge it.
         parcels = [self.verifier.verify_parcel(dossier, r) for r in refs]
@@ -239,11 +268,22 @@ class Wallet:
                 raise InvalidDossier("parcel was already spent")
             # Fail closed: "at most f report a binding" only means something when a
             # quorum answered; silent witnesses might be the ones holding it.
-            answers = [st for w in self.network.witnesses(p["home"]) if (st := _status(w, s)) is not None]
-            if len(answers) < quorum(self._size(p["home"])):
+            # One answer per distinct key of the home's current charter.
+            keys, members = self._members(p["home"])
+            if not keys:
+                raise InvalidDossier("the parcel's home has no known charter")
+            answered, bound = set(), set()
+            for pk, ws in members.items():
+                for w in ws:
+                    st = _status(w, s)
+                    if st is None:
+                        continue
+                    answered.add(pk)
+                    if st.get("tid") is not None:
+                        bound.add(pk)
+            if len(answered) < quorum(len(keys)):
                 raise InvalidDossier("too few of the parcel's witnesses answered to confirm it is unspent")
-            bound = sum(1 for st in answers if st.get("tid") is not None)
-            if bound > faults(self._size(p["home"])):
+            if len(bound) > faults(len(keys)):
                 raise InvalidDossier("parcel's sigil is already consumed")
             # Only the verified ancestry, and never over entries we already hold.
             self.dossier.merge(dossier.ancestry([r["tx"]]))
@@ -253,6 +293,11 @@ class Wallet:
                 self.issued.add(s)
             received.append(p)
         return received
+
+    def held_history(self) -> set:
+        """The transitions we hold in our dossier: a payer may leave them out of the dossier
+        it hands us (SPEC §6.1). Only what we still hold, never what we pruned."""
+        return set(self.dossier.transitions)
 
     def sealed_by_succeeded_version(self, dossier: Dossier, tids) -> bool:
         """Does the ancestry of ``tids`` hold a seal by a version that was taken over?
@@ -293,10 +338,8 @@ class Wallet:
                 heal = None if seal is None else {
                     "kind": "seal", "sigil": s, "gen": g, "seal": seal,
                     "parcel": {"home": p["home"], "lock": p["lock"], "salt": p["salt"]}}
-                ok = 0
-                for w in self.network.witnesses(home):
-                    if w.pk not in current:
-                        continue
+                ok = set()  # distinct current members vouching (a key listed twice counts once)
+                for w in (w for ws in self._members(home)[1].values() for w in ws):
                     st = _status(w, s)
                     if st is not None and st["tid"] == CONTESTED and heal is not None:
                         # After a rotation the evidence may not show which sibling
@@ -309,8 +352,8 @@ class Wallet:
                     if st is None:
                         continue
                     if st["gen"] == g and st["tid"] == tid:
-                        ok += 1
-                if ok <= faults(len(current)):
+                        ok.add(w.pk)
+                if len(ok) <= faults(len(current)):
                     raise InvalidDossier(f"deep confirmation failed for {s[:12]} in {tid[:12]}")
                 self._confirmed.add((s, g, tid))
 
@@ -384,7 +427,11 @@ class Wallet:
                         freed.append(s)
                 continue
             if self.unpledge_if_unbound(s):
-                self.pending.pop(tid, None)
+                # Only once no input is pledged to it any more: another input of the same
+                # transition may still be bound (e.g. a swap whose kill switch never reached a
+                # witness), and without the pending transition it could never be settled.
+                if not any(p[1] == tid for p in self.pledged.values()):
+                    self.pending.pop(tid, None)
                 freed.append(s)
             elif tid in self.pending:
                 self._settle(tid)
@@ -402,6 +449,12 @@ class Wallet:
             return
         except ValueError:
             pass  # not provably dead: try to complete it
+        if self._missing_unlocks(p):
+            # We could never record this transition (a holder verifies every owner's unlock),
+            # so we do not sign or bind for it again: once our pledges expire it is released
+            # or aborted (our kill switch spent elsewhere is its death proof), and a party
+            # holding every unlock can still finish it and hand it over (accept_completed).
+            return
         try:
             # The other parties' unlocks of a multi-party transition (cosign) re-seal their
             # inputs: a witness already bound to this tid votes again on them even once expired.
@@ -415,6 +468,8 @@ class Wallet:
     def _reseal(self, tid: str) -> None:
         """Seal a pending transition again with the unlocks already signed (no new pledge)."""
         p = self.pending[tid]
+        if self._missing_unlocks(p):
+            return
         unlocks = {**p.get("others", {}), **p.get("mine", {})}
         try:
             self.seal(p["header"], p["body"], unlocks)
@@ -422,6 +477,13 @@ class Wallet:
             return
         self.finalise(p["header"], p["body"], unlocks)
         self.completed.append(tid)
+
+    def _missing_unlocks(self, p: dict) -> bool:
+        """Does a pending transition consume another party's input whose unlock we lack?
+        (Lost, e.g., in a crash before a ``cosign`` was saved.)"""
+        mine = {h["sigil"] for h in self.holdings.values()}
+        others = p.get("others", {})
+        return any(s not in mine and s not in others for s, _g in p["header"]["inputs"])
 
     def cosign(self, header: dict, unlocks: dict) -> None:
         """Keep the other parties' unlocks of a multi-party transition we authorised.
@@ -440,6 +502,42 @@ class Wallet:
         p["others"] = others
         if self.on_pledge is not None:
             self.on_pledge(self)
+
+    def refresh(self, sigils=None) -> list:
+        """Move each coin at ``REFRESH_GEN`` or above to a fresh address of our own.
+
+        A coin aborted that often would soon reach MAX_GEN, where no witness binds it
+        again and the funds are stuck. The move is an ordinary spend to ourselves (a kill
+        switch comes back as the new kill switch); if it fails, the coin keeps its pledge
+        and is settled like any other. It runs only where asked: ``abort`` refreshes the
+        coins it released, and an application (the CLI before each payment) calls it.
+        ``sigils`` limits it to those coins. Returns the sigils moved.
+        """
+        moved = []
+        busy = {s for p in self.pending.values() for s, _g in p["header"]["inputs"]}
+        for h in list(self.holdings.values()):
+            s, p = h["sigil"], h["parcel"]
+            if (sigils is not None and s not in sigils) or h["gen"] < self.REFRESH_GEN or h["gen"] >= MAX_GEN:
+                continue
+            if s in self.pledged or s in busy:
+                continue
+            if p["lock"].get("op") != "sig" or p["lock"].get("pk") not in self.keys:
+                continue  # only a coin we can unlock alone
+            a = self.address(p["home"])
+            out = model.parcel(p["home"], p["asset"], p["amount"], a["lock"], a["salt"])
+            try:
+                hd, bd, _ = self.prepare([h["ref"]], [out], memo="refresh")
+                unlocks = self.authorise(hd, bd, release_kill=True)
+                try:
+                    self.seal(hd, bd, unlocks)
+                except SealFailed:
+                    self.unpledge_if_unbound(s)
+                    raise
+                self.finalise(hd, bd, unlocks)
+            except (SealFailed, ValueError):
+                continue
+            moved.append(s)
+        return moved
 
     def select(self, asset: str, amount: int) -> tuple[list, int]:
         self.release_expired_pledges()
@@ -465,7 +563,7 @@ class Wallet:
         addr = to.address(home)
         refs, outputs = self.payment_outputs(asset, amount, addr)
         tid = self.transact(refs, outputs)
-        to.receive(self.dossier.ancestry([tid]), [model.ref(tid, 0)])
+        to.receive(self.dossier.ancestry([tid], have=to.held_history()), [model.ref(tid, 0)])
         if self.auto_prune:
             self.prune()
         return tid
@@ -582,7 +680,11 @@ class Wallet:
 
     def seal(self, header: dict, body: dict, unlocks: dict, only=None) -> list:
         """Seal the inputs of a transition (all of them, or the sigils in ``only``)."""
-        seals = []
+        seals, failed = [], None
+        # Only a multi-party transition goes on past a failed input (see below); a transition of
+        # ours alone stops at once, binding nothing more to a tid that may never complete.
+        mine = {h["sigil"] for h in self.holdings.values()}
+        multi = any(s not in mine for s, _g in header["inputs"])
         for r, (s, _g) in zip(body["inputs"], header["inputs"]):
             if only is not None and s not in only:
                 continue
@@ -590,10 +692,55 @@ class Wallet:
             self._represent_release(s, p["home"], _g)
             req = {"sigil": s, "header": header, "home": p["home"], "lock": p["lock"],
                    "salt": p["salt"], "unlock": unlocks.get(s, locks.empty_unlock())}
-            seals.append(request_seal(self.network, req, self._stamp_for))
+            try:
+                seals.append(request_seal(self.network, req, self._stamp_for))
+            except SealFailed as e:
+                # Go on with the other inputs, and fail at the end: binding the inputs we can
+                # unlock lets a counter-party finish the transition (e.g. a swap whose other
+                # party lost our kill switch's unlock in a crash), instead of both waiting.
+                if not multi:
+                    raise
+                if failed is None:
+                    failed = e
+        if failed is not None:
+            raise failed
         for seal in seals:
             self.dossier.add_seal(seal)
         return seals
+
+    def accept_completed(self, dossier: Dossier, tid: str) -> str:
+        """Finish a pending transition from a counter-party's dossier holding it complete.
+
+        A multi-party transition needs every owner's unlock in the dossier. If ours lost one
+        (e.g. a crash before a ``cosign`` was saved), the other party, which holds them all,
+        completes the transition (our ``seal`` still binds our inputs for it) and hands it over:
+        it is verified like any received history before we record it.
+        """
+        if tid not in self.pending:
+            raise ValueError("no such pending transition")
+        try:
+            anc = dossier.ancestry([tid])
+        except (KeyError, TypeError, AttributeError) as e:
+            raise InvalidDossier(f"dossier does not hold transition {str(tid)[:12]}") from e
+        view = Dossier()
+        view.merge(self.dossier)
+        view.merge(anc)
+        try:
+            self.verifier.verify_transition(view, tid)
+            ours = [o for o in anc.transitions[tid]["body"]["outputs"] if model.sigil_of(o) in self.issued]
+        except (KeyError, TypeError, ValueError, AttributeError) as e:
+            raise InvalidDossier(f"malformed transition: {e}") from e
+        # Deep confirmation as for a receipt (SPEC §9): large amounts, or history a succeeded
+        # version sealed.
+        totals: dict = defaultdict(int)
+        for o in ours:
+            totals[o["asset"]] += o["amount"] if isinstance(o.get("amount"), int) else 0
+        if ((self.deep_threshold is not None and any(v >= self.deep_threshold for v in totals.values()))
+                or (self.deep_after_succession and self.sealed_by_succeeded_version(view, [tid]))):
+            self.deep_confirm(view, [tid])
+        self.dossier.merge(anc)
+        tx = anc.transitions[tid]
+        return self.finalise(tx["header"], tx["body"], tx["unlocks"])
 
     def finalise(self, header: dict, body: dict, unlocks: dict) -> str:
         """Record a sealed transition and update holdings."""
@@ -613,6 +760,9 @@ class Wallet:
         for r, (s, _g) in zip(body["inputs"], header["inputs"]):
             self.holdings.pop(model.parcel_id(r), None)
             self.spent.add(s)
+            # A consumed sigil can never be signed for again (it is no longer held, and
+            # ``spent`` keeps it from being credited): its pledge has nothing left to guard.
+            self.pledged.pop(s, None)
         for i, o in enumerate(body["outputs"]):
             if model.sigil_of(o) in self.issued:
                 r = model.ref(tid, i)
@@ -620,7 +770,46 @@ class Wallet:
                 self.holdings[model.parcel_id(r)] = {"ref": r, "parcel": p, "sigil": model.sigil_of(p), "gen": 0}
                 if p["asset"] in kill_assets and p["amount"] == 1:
                     self.kill_switches.add(model.sigil_of(p))
+        if self.auto_settle:
+            self.settle(header, body)
         return tid
+
+    def settlement(self, header: dict, body: dict) -> dict | None:
+        """The settlement certificate of a completed transition (SPEC §3.12), or None
+        while some input's seal is missing from our dossier."""
+        tid = model.transition_id(header)
+        inputs = []
+        for r, (s, _g) in zip(body["inputs"], header["inputs"]):
+            seal = self.dossier.seals.get(model.seal_key(s, tid))
+            if seal is None:
+                return None
+            p = self.dossier.output(r)
+            inputs.append({"parcel": {"home": p["home"], "lock": p["lock"], "salt": p["salt"]}, "seal": seal})
+        return {"header": header, "inputs": inputs} if inputs else None
+
+    def settle(self, header: dict, body: dict) -> int:
+        """Show every witness of every input's home that the transition is complete
+        (SPEC §5.7), so they can settle and later checkpoint its inputs. Best effort:
+        a witness that does not answer just keeps the full record. Returns how many
+        witnesses settled something."""
+        cert = self.settlement(header, body)
+        if cert is None:
+            return 0
+        homes = {e["parcel"]["home"] for e in cert["inputs"]}
+        chains = {c: self.network.registry.chain(c) for c in homes if self.network.registry.chain(c)}
+        n = 0
+        for home in homes:
+            for w in self.network.witnesses(home):
+                if len(chains) > 1 and hasattr(w, "gossip"):
+                    try:  # the seals of the other homes verify against their charters
+                        w.gossip({"charters": chains})
+                    except (Rejected, ValueError, KeyError, TypeError):
+                        pass
+                try:
+                    n += bool(w.settle(cert).get("settled"))
+                except (Rejected, AttributeError):
+                    continue
+        return n
 
     def transact(self, refs: list, outputs: list, *, extra_unlocks: dict | None = None, memo: str = "") -> str:
         header, body, _ = self.prepare(refs, outputs, memo)
@@ -641,6 +830,10 @@ class Wallet:
         newly bind the sigil; and every member of the home answered and
         none holds a binding or vote for it, nor (with a successor committee)
         does any standby member hold it in its mirror log.
+
+        "Every member" means one answer from each distinct key of the home's
+        *current* charter: an entry for a retired key, or a second entry for one
+        member, never stands in for a member that did not answer.
         """
         pledge = self.pledged.get(sigil)
         h = next((h for h in self.holdings.values() if h["sigil"] == sigil), None)
@@ -650,17 +843,27 @@ class Wallet:
         if int(self.clock()) <= expires + self.max_skew:
             return False  # a request still in flight could bind it
         home = h["parcel"]["home"]
-        answered = 0
+        keys, members = self._members(home, reachable=False)
+        if not keys or set(members) != keys:
+            return False  # some current member is not even listed
+        # A listed entry outside the current charter (a retired member, during or after a
+        # rotation) does not count as an answer, but one that does answer must be clean too:
+        # it may hold a vote the current members have not inherited yet.
         for w in self.network.all_witnesses(home):
-            st = None if w.pk in self.network.down else _status(w, sigil)
-            if st is None:
-                return False  # unreachable: it might hold a vote
-            if (st["gen"] == gen and st["tid"] == tid) or any(
-                    v["gen"] == gen and v["tid"] == tid for v in st["votes"]):
+            if w.pk in keys or w.pk in self.network.down:
+                continue
+            st = _status(w, sigil)
+            if st is not None and ((st["gen"] == gen and st["tid"] == tid) or any(
+                    v["gen"] == gen and v["tid"] == tid for v in st["votes"])):
                 return False
-            answered += 1
-        if answered < self._size(home):
-            return False  # some member could not even be contacted
+        for ws in members.values():
+            for w in ws:  # every entry claiming the key must answer, and none may hold it
+                st = None if w.pk in self.network.down else _status(w, sigil)
+                if st is None:
+                    return False  # unreachable: it might hold a vote
+                if (st["gen"] == gen and st["tid"] == tid) or any(
+                        v["gen"] == gen and v["tid"] == tid for v in st["votes"]):
+                    return False
         # A binding the successor committee mirrored is inherited by the members of a
         # successor if the home is taken over (SPEC §5.4/§5.5): it is not dead either.
         charter = self.network.registry.latest(home)
@@ -709,13 +912,15 @@ class Wallet:
             # Drop the pledge only once the input is really spendable at g + 1: a
             # quorum of the home answers unbound at a generation <= g + 1. Otherwise
             # keep the pledge and the pending transition so abort can be retried.
-            free = sum(1 for w in self.network.witnesses(home)
-                       if (st := _status(w, s)) is not None and st["tid"] is None and st["gen"] <= pledge[0] + 1)
-            if free < quorum(self._size(home)):
+            keys, members = self._members(home)
+            free = {pk for pk, ws in members.items() for w in ws
+                    if (st := _status(w, s)) is not None and st["tid"] is None and st["gen"] <= pledge[0] + 1}
+            if not keys or len(free) < quorum(len(keys)):
                 continue
             # Best effort: tell the home's successor committee too, so a successor
             # sees the binding died instead of finding the sigil contested (SPEC §5.5).
             for m in (self.network.committee(h["parcel"]["home"]) if hasattr(self.network, "committee") else []):
+                self._share_charters(m, proof)  # it can only verify a proof from charters it knows
                 try:
                     m.note_release(s, {"kind": "release", "gen": pledge[0], "tid": tid, "header": header,
                                        "proof": proof})
@@ -727,7 +932,10 @@ class Wallet:
             released.append(s)
         if not any(p[1] == tid for p in self.pledged.values()):
             self.pending.pop(tid, None)
-        return released
+        # A coin that has now been aborted close to the generation limit moves on at once.
+        # A coin whose move did not complete is pledged to the move: not free, not reported.
+        self.refresh(set(released))
+        return [s for s in released if s not in self.pledged]
 
     def _represent_release(self, sigil: str, home: str, gen: int) -> None:
         """Before spending ``sigil`` at ``gen``, release it again at every witness that
@@ -816,10 +1024,24 @@ class Wallet:
 
     # ----------------------------------------------------------------- stamps
 
-    def buy_stamps(self, cid: str, count: int) -> None:
+    def buy_stamps(self, cid: str, count: int) -> dict:
+        """Buy ``count`` stamps from every stamp-selling witness of ``cid``; returns how many each sold.
+
+        A seller that refuses, does not answer or returns an invalid blind signature is
+        skipped (with the stamps it did sell kept), so one bad seller never stops the others.
+        """
+        sold = {}
         for w in self.network.all_witnesses(cid):
-            if w.stamps is not None:
-                self.stamps[w.pk].extend(buy_stamp(w.stamps.public, w.sell_stamp) for _ in range(count))
+            if w.stamps is None:
+                continue
+            got = sold[w.pk] = 0
+            for _ in range(count):
+                try:
+                    self.stamps[w.pk].append(buy_stamp(w.stamps.public, w.sell_stamp))
+                except (Rejected, ValueError):  # ValueError: an invalid blind signature
+                    break
+                got = sold[w.pk] = got + 1
+        return sold
 
     def _stamp_for(self, w):
         pool = self.stamps.get(w.pk)

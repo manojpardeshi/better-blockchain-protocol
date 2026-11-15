@@ -224,7 +224,16 @@ member of a version with a committee restarted with a registry file nobody
 updated): it found no committee and voted without acks, which the model does
 not allow. It now creates no vote until it knows its charter (Python and Rust,
 `test_a_witness_without_its_own_charter_votes_on_nothing` and
-`without_its_own_charter_nothing_is_voted_or_signed`).
+`without_its_own_charter_nothing_is_voted_or_signed`). Failing closed made such a member useless
+until someone gossiped the chain again, so the charter chains a witness or
+standby member learns (gossip, ADOPT, STANDBY) are now persisted in its store
+and merged into the registry file's at start (`tests/test_charter_memory.py`,
+Rust `adopted_member_votes_after_a_restart_with_an_old_registry_file`,
+`chain_learned_by_gossip_survives_a_restart`,
+`standby_member_keeps_its_charter_across_a_restart_with_an_old_registry_file`,
+and the restarts in the integration test of a cooperative rotation with a
+committee). A stored chain is verified again on load; one that does not
+verify or forks from the file's is ignored, which only fails closed again.
 
 **Code that stores less than the model.** ADOPT keeps in the new record's log
 only verified bind entries and the verified releases and seals of transactions
@@ -233,8 +242,26 @@ models, so the code may forward fewer releases or seals than the model. Every
 such entry was either unverifiable (never modelled) or about a transaction no
 binding in that evidence names, which no decision at that ADOPT reads; at a
 later ADOPT its absence is what the model produces when the Byzantine member
-that supplied it omits it, a run the proofs cover. The code therefore still
-refines the proved specs (rotation and succession).
+that supplied it omits it, a run the proofs cover. STANDBY filters a standby
+member's handover with the same classification (SPEC §5.5, the shared
+`classify_evidence`, Python and Rust, used by `Standby.enter`): the
+succession spec keeps every handed-over entry in the member's mirror log, the
+code the verified binds, the verified releases and seals of bound transactions,
+a bounded number of releases whose death proof names a charter the member does
+not know (a later adopter can verify them), and verified votes of members on a
+bound sigil or by members of the version handed over. Every binding the
+model's mirror holds with a valid owner authorisation is kept, so the bindings
+behind every vote reach the successor exactly as in the model. Votes are kept
+because ADOPT reads an adopter's own votes out of the evidence and the mirror
+is the only carrier of a retired key's votes across more than one version
+(dropping them let a key re-used two versions later vote a sibling of its own
+vote; review regression `tests/test_review_fixes.py`). What is dropped is
+either never modelled (unverifiable, or a vote by a non-member) or an entry
+the successor's own ADOPT would drop from that evidence anyway, and handing it
+on or not changes no ADOPT outcome. A mirror log that keeps fewer such entries
+is what the model produces when the Byzantine predecessor that supplied them
+omits them. The code therefore still refines the proved specs (rotation and
+succession).
 
 ---
 
@@ -258,6 +285,16 @@ from TLC 1.8.0 on 4 cores. All of these run from `formal/check.sh`.
 | `MC_rot_sibling_v1_mutant` | `MC_rot.tla` | the first sibling rule (`AdoptMode = "sibling_v1"`) on an instance where a sealed generation lies above a lone binding | Ty, Tb, Tu, Tg | **violated (expected)**, Bugs 3/4 | — |
 | `MC_rot_sibling_top` | `MC_rot.tla` | the implemented rule (top of the evidence) on the same instance | Ty, Tb, Tu, Tg | opt-in (`SIGIL_TLC_EXTRA`): the state space exceeds the CI budget; `MC_rotp_cex` checks this instance in the proved spec, and `SigilRotProofs.tla` proves the rule for every instance | — |
 | `MC_rot_sibling_witness`, `…_witness2`, `…_witness3` | `MC_rot.tla` | non-vacuity: Tg completes after rotation; a contested record is released; a contested record is settled by a seal | same + Tg | **violated (expected)** | — |
+| `MC_ckpt` | `MC_ckpt.tla` (on `SigilRotProofs` via `MC_rotp`) | **compaction** (SPEC §5.7): settlement on completion certificates, an adversarial driver choosing any checkpoint set per charter, the signer rules at FREEZE, checkpointed sigils left out of snapshots and adopted from the set; Safety, cross-version Lemma 1, sound death proofs, honest non-equivocation, `CkSound`, `StatusSound` (what STATUS reports for a settled or checkpointed record is a real complete binding) and `SettledHeld` (SETTLE never changes a binding) | 3 versions (v0 n=4 q=3 with eager Byz, v1 and v2 n=1), sigil s, Ta={(s,0)}, Tg={(s,1)}, gens 0..1 | hold | 3,808 (depth 19) |
+| `MC_ckpt_reuse` | `MC_ckpt.tla` | as `MC_ckpt`, with h1's key re-used in all three versions (it adopts with its own earlier votes) | v0 = {h1,h2,h3,z}, v1 = v2 = {h1} | hold | 5,666 (depth 17) |
+| `MC_ckpt_ks` *(opt-in)*, `MC_ckpt_sib` *(opt-in)* | `MC_ckpt.tla` | as `MC_ckpt`, on the kill-switch instance (Tb={(s,0),(x,0)}, Ty={(x,0)}) and on the four-transition rotation instance | sigils s, x | opt-in (`SIGIL_TLC_EXTRA`): more than 1.2 M distinct states after 18 min with no violation, not run to completion | — |
+| `MC_ckpt_forget_mutant` | `MC_ckpt.tla` | the adopter **forgets** checkpointed sigils (what "drop consumed records" would do) | as `MC_ckpt` | **violated (expected)**: v1 votes Tg on the consumed sigil, a double spend | 2,089 (depth 10) |
+| `MC_ckpt_noextend_mutant` | `MC_ckpt.tla` | no **extension rule**: a member freezes for a charter whose checkpoint drops a sigil it holds checkpointed | as `MC_ckpt` | **violated (expected)**: a double spend across three versions | 4,769 (depth 14) |
+| `MC_ckpt_nocheck_mutant` | `MC_ckpt.tla` | members freeze without checking entries against their settled records | as `MC_ckpt` | **violated (expected)**: `CkSound` | depth 6 |
+| `MC_ckpt_settleany_mutant` | `MC_ckpt.tla` | the **first SETTLE**: any certificate (forgeable by retired keys) is accepted and overwrites the record (review finding 1) | as `MC_ckpt` | **violated (expected)**: `StatusSound` | depth 4 |
+| `MC_ckpt_settlerewind_mutant` | `MC_ckpt.tla` | SETTLE on a complete transition without the binding the record holds (finding 2) | as `MC_ckpt` | **violated (expected)**: `SettledHeld` | depth 5 |
+| `MC_ckpt_settleforeign_mutant` | `MC_ckpt.tla` | the record's binding, but a forged foreign seal makes a dead Tb look complete (finding 3) | kill-switch instance | **violated (expected)**: `StatusSound` | depth 4 |
+| `MC_ckpt_witness`, `MC_ckpt_witness2` | `MC_ckpt.tla` | non-vacuity: a checkpointed record reaches version 2; and v2 still seals transitions meanwhile | as `MC_ckpt` (+ Ty) | **violated (expected)** | — |
 | `MC_expiry` | `SigilExpiry.tla` | **owner-signed expiry** + the wallet unpledge rule: with drifting clocks and arbitrarily delayed requests, once the wallet drops a pledge the tid can never be sealed | n=4 q=3, skew 1, `max_skew` 2, time 0..7 | hold | 113,030 |
 | `MC_expiry_mutant`, `MC_expiry_skew_mutant` | `SigilExpiry.tla` | witness ignores expiry / wallet margin `max_skew < 2·skew` | same | **violated (expected)** | — |
 | `MC_deep` | `SigilDeep.tla` | **deep confirmation** (SPEC §9): `f+1` current-charter confirmations ⇒ the binding is real, against a retired-key forgery; and the true binding is always confirmable | current n=4 f=1, threshold 2 | hold | 4 |
@@ -284,6 +321,56 @@ are monotone in votes), and it also keeps the state space tractable. The
 adversarial *forged-snapshot* dimension of rotation (a lying predecessor
 handing new members fabricated logs) is exercised by the pre-existing Python
 explorer `tests/test_model_check_extended.py`, not re-modelled here.
+
+What the compaction model covers (`formal/MC_ckpt.tla`, SPEC §5.7,
+docs/COMPACTION.md). It reuses the proved rotation spec's actions (Spend,
+Release, the contested release and W9 seal settlement, the lone and contested
+ADOPT rules, own votes) and adds: `Settle` (a record is settled only on a
+completion certificate, and a settled record takes no further step), `Charter`
+(the driver fixes each version's checkpoint set, any set of input entries),
+`CFreeze` (the signer rules, the snapshot without the checkpointed sigils) and
+`CAdopt` (checkpoint entries become settled records with no log; snapshot
+entries for them, including what a Byzantine freezer adds, are ignored). Three
+versions are needed for the extension rule: a sigil checkpointed by v1 must
+still be covered when v1's members (whose records of it have no log) freeze for
+v2. `Settle` writes the certificate's binding into the record, as the first
+implementation did, and certificates are forgeable (retired keys sign anything):
+the implemented rule only accepts a record that already holds exactly that
+binding, with a transition that is really complete. The first version of this
+model guarded Settle with `Complete(t)` alone and checked only vote properties,
+so it could not see the review's findings 1–3 (rebinding, rewinding, and freezing
+an honest input with a forged foreign seal), none of which creates a second vote;
+`StatusSound` and `SettledHeld` and the three settle mutants close that gap.
+Re-used keys are covered by `MC_ckpt_reuse`. **Not modelled:** succession
+(standby members carry the checkpoint set and apply the extension rule at
+SUCCEED; a dead-man successor carries exactly the set) and the witness's
+registry being stale for a foreign home (SPEC §5.7's residual assumption).
+
+**Refinement argument (why the TLAPS theorems carry over).** Map a run of the
+protocol with settlement and checkpoints to a run of the uncompacted rotation and
+succession specs (`SigilRotProofs.tla`, `SigilSuccProofs.tla`) with the same
+witnesses, votes and charter chain, in which every log is kept in full. (1) A
+settled or checkpointed record creates no vote and takes no release: the abstract
+witness declines the same requests, which those specs allow at every step
+(declining is abstention). (2) For a sigil outside every checkpoint so far, the
+concrete records, logs and snapshots equal the abstract ones, by induction over
+versions: by the extension rule (enforced by every honest signer, and a quorum of
+signers contains one), a sigil outside `S_{v+1}` was outside `S_v`, so its
+evidence was handed over in full at every earlier rotation or succession, and
+FREEZE omits only sigils in the next set. (3) For a sigil inside `S_{v+1}` the
+concrete adopter holds a checkpointed record, which takes no step, while the
+abstract adopter holds whatever the full evidence gives and declines everything
+on that sigil. Hence the concrete vote set is a subset of an abstract run's vote
+set at every point. Safety, `OneSealAcrossVersions`, `DeathProofsSound` and
+`HonestNoEquiv` are properties of the vote set alone (seals and death proofs are
+defined from votes), so they hold for every compacted run. This is a paper
+argument, not a TLAPS proof; TLC checks the compacted spec directly on the
+instances above, and the two double-spend mutants show that steps (2) and (3)
+are where the argument needs the extension rule and the checkpoint set. The
+argument covers the vote properties only: deep confirmation (SPEC §9) reads what
+current members report in STATUS, which is not a property of the vote set; for
+that, `StatusSound` and `SettledHeld` are checked by TLC on the instances above,
+and nothing is proved for succession.
 
 What the wallet model covers (`formal/SigilWallet.tla`, SPEC §4, §5.1–5.2):
 one parcel of an honest wallet whose home has 3 honest witnesses and 1
@@ -510,8 +597,15 @@ the model level, and the fixed design is model-checked (`MC_wallet`,
 `MC_wallet_live`). Fixes, in brief:
 
 * **W1, W2.** A wallet's default trust is its home plus the constellations its
-  network was configured with at creation; charters a dossier introduces are
-  learned but never trusted unless the owner calls `Wallet.trust`. The policy
+  network was configured with (`RemoteNetwork.configured()`: the directory's
+  constellations and committees). Before the fix it was every constellation in
+  the registry, and `RemoteNetwork` added every chain any witness served. Since
+  gossip admits any valid genesis chain, an outsider could plant one on an
+  honest witness and have new wallets trust it: one parcel moved there could
+  then be "spent" to any number of default wallets (W1b,
+  `tests/test_default_trust.py`). A client now learns only the chains of the
+  constellations it asks about (`GET /v0/charters/<cid>`). Charters a dossier
+  introduces are learned but never trusted unless the owner calls `Wallet.trust`. The policy
   (`trusted`, convicted witnesses) is saved and restored, and a saved policy of
   "trust anything" is refused on load.
 * **W3.** `receive` merges only the verified ancestry, and `Dossier.merge`
@@ -540,6 +634,7 @@ the model level, and the fixed design is model-checked (`MC_wallet`,
 | # | Severity | Where | Bug | Impact | Test |
 |---|---|---|---|---|---|
 | W1 | critical | `wallet_store.load` | the trust policy (`trusted`) is not persisted; a reloaded wallet trusts every charter in the registry, and `verify_parcel` adds any chain a dossier carries | counterfeit: one parcel moved to an attacker's one-witness constellation is "spent" to any number of victims | `TrustPolicyTests.test_restarted_wallet_keeps_its_trust_policy` |
+| W1b | critical | `Wallet.__init__`, `RemoteNetwork.refresh_charters` | default trust was every constellation in the registry, and the registry learned every chain any witness served, which gossip fills with anyone's genesis chains | as W1, for every wallet created after an outsider gossiped its constellation to one honest witness | `DefaultTrust.test_double_spend_through_a_planted_constellation` |
 | W2 | critical | `cli cmd_init` | CLI wallets are created with no trust policy at all | as W1, for every CLI wallet | `TrustPolicyTests.test_cli_wallet_does_not_trust_constellations_named_by_a_payer` |
 | W3 | high | `Wallet.receive` → `Dossier.merge` | every entry of a received dossier, verified or not, overwrites the wallet's own transitions and seals | any payer can make the wallet's own coins unprovable: its next payments are consumed but rejected by recipients | `DossierIntegrityTests` |
 | W3b | high | `Wallet.receive` | a parcel is accepted if its lock merely *mentions* one of our keys (`any(sig(us), sig(payer))`) | the payer claws the payment back; `balance` counts it | `ReceiveLockTests.test_receive_rejects_a_parcel_the_payer_can_still_spend` |
@@ -605,7 +700,7 @@ wallets over HTTP. They are not part of the default `unittest discover`; CI's
   persisting before answering, not checking expiry) and Byzantine faults
   beyond *f* are caught, which shows the invariants are not vacuous.
 
-They found eighteen bugs, none of them a safety violation of the witness
+They found nineteen bugs (and a second round eight more, below), none of them a safety violation of the witness
 protocol; each was pinned as an expected failure, shown to fail on the old
 code, and now runs as a regression test.
 
@@ -625,9 +720,46 @@ code, and now runs as a regression test.
 | soak | every swap left a new one-unit kill-switch asset behind | the unit a swap returns is the next kill switch |
 | soak | a wallet's dossier kept the history of everything it ever spent | `Wallet.prune` after a payment is handed over; consumed sigils are remembered in `spent` |
 | chaos | a malformed STATUS reply from one Byzantine witness crashed honest wallets | `RemoteWitness.status` checks the shape; a bad reply counts as no answer |
+| chaos | every other reply was trusted too: a junk INFO, SPEND, charters, FREEZE, mirror ack, error reply, deeply nested JSON or a signed vote with a non-integer `version` crashed wallets, rotations and successions; a junk member blinded a standby member's whole probe round (so a live version could look dead); replies were read without a size cap or deadline | every client call checks its reply's shape (`tests/test_byzantine_replies.py`, a junk proxy per method); replies are capped and must arrive within 4 timeouts (Python and the Rust prober); the chaos runs now include garbage replies |
 | chaos | a pledge released under §4 rule 3 came back after a succession (the committee had mirrored it) | rule 3 also asks every standby member (new `POST /v0/status` on standby members); the pledge stays and the wallet completes the transition |
 | chaos | a swap interrupted after its kill switches were released never settled | each party keeps the others' unlocks (`Wallet.cosign`); a kill switch already pledged to the same tid is re-signed; a settling transition is retried with the unlocks held |
 | chaos | a failed succession attempt fenced a minority and halted a live home | two-phase succession: `dead` in standby info is read first, SUCCEED sent only once a quorum agrees |
+
+Compaction (SPEC §5.7, §6.1) added `tests/test_compaction.py` (settlement, forged and
+partial certificates, the signer rules, forged checkpoint sets at ADOPT, a lying predecessor
+handing over evidence for a checkpointed sigil or omitting a settled one, the extension rule
+at FREEZE and SUCCEED, standby restarts, delta dossiers and a hostile copy of a held
+transition), SETTLE/SETTLED cases in the wire-compatibility suite (both twins answer
+identically), a `compaction` golden-vector script, and handover, checkpoint and delta-dossier
+measurements in the soak (docs/BENCHMARKS.md). The first 600 s soak with it failed once at the
+takeover with a duplicate witness key in the successor charter: the harness picked ports with
+`free_port`, which only asks the OS, so two members could be assigned one port and answer with
+one key; `Cluster` now never hands out a port another member was given.
+
+A second round extended the suites to adversaries the first did not cover:
+Byzantine standby members (`chaos/byzantine_standby.py`: acking without storing,
+lying on STATUS and on `dead`, signing any successor, junk and forged SUCCEED
+snapshots, refusing `note_release`, malformed replies; `chaos/test_byzantine_standby.py`,
+within *f*ₖ and, as the non-vacuity check, beyond it, where the lost binding is
+reported as two seals at one generation), malicious ADOPT and STANDBY handovers sent
+to Rust/Python twins (`test_handover_adversary.py`), admission control under a
+multi-threaded flood, connection caps and stamps with restarts
+(`test_admission_load.py`), and wallet crashes at every crash point of pay, receive,
+consolidate, both swap flows, abort and pledge release (`tests/test_wallet_crash.py`,
+in process, every witness call before and after it is served and every file write;
+`test_wallet_kill.py`, the CLI process killed with `os._exit` against real daemons).
+It found eight more bugs, none a safety violation of the witness protocol:
+
+| Suite | Bug | Fix |
+|---|---|---|
+| handover | one Byzantine predecessor's snapshot holding NaN, a >128-bit integer, a lone surrogate or deep nesting made every Rust adopter refuse the whole handover | both daemons refuse non-portable bodies identically (WIRE.md "Portable JSON"); the client drops non-portable snapshot entries |
+| handover | Python bound SPENDs the Rust witness cannot parse (expires ≥ 2¹²⁷) and authorised generations ≥ 2⁶², so the two inherited different records | Python refuses non-portable requests and generations ≥ 2⁶², as Rust |
+| handover | ADOPT made an empty record for every made-up sigil key, carried forward by every FREEZE | no record for a sigil with no verifiable evidence (Python and Rust) |
+| handover | STANDBY kept every junk entry and handed it to every later committee | STANDBY keeps only verifiable evidence (shared `classify_evidence`) |
+| byz standby | a member or witness answering `{}`, `[]` or a wrongly shaped info / FREEZE / SUCCEED / stamp reply crashed every client in the home | malformed replies count as no answer |
+| wallet crash | `release_expired_pledges` dropped a transition's pending entry when one input (a kill switch that never reached a witness) was released, stranding its other, bound inputs | the pending entry stays while any input is pledged to it |
+| wallet crash | a swap interrupted when one party's crash lost the other's kill-switch unlock could never settle | a party lacking another's unlock never signs or binds for the transition again, so its kill switch expires unbound and becomes the death proof both abort with; a party holding every unlock may complete first and hand the swap over (`Wallet.accept_completed`); `seal` binds every input it can before failing |
+| wallet crash | `sigil pay` killed after sealing but before (or while) writing the payment file lost the payment (or left a truncated file) | the payment is listed as completed until its file is written, atomically |
 
 The last two chaos fixes make the code stricter than the models (rule 3 asks
 more members before releasing; succession asks before signing), so the
@@ -730,3 +862,31 @@ Tooling: TLAPS (tlapm 1.6.0-pre, bundling Zenon/Z3/Isabelle) and TLC
 (tla2tools 1.7.4), both downloaded on first use into `~/.cache/sigil-tla`,
 pinned and SHA-256-verified, over TLS. Linux x86_64 for the proof; TLC needs
 only Java ≥ 11.
+
+**Why tlapm is pinned to a rolling build, and how to re-pin it.** tla2tools
+1.7.4 is an immutable release, but tlapm has no stable release that can check
+these proofs: `1.6.0-pre` is a rolling pre-release whose tarball upstream
+rebuilds in place under the same URL. `formal/check.sh` therefore pins one
+specific build by its SHA-256 (`TLAPM_SHA256`) and fails closed: if upstream
+rebuilds the tarball, the download no longer matches, `check.sh` reports
+`TLAPS: FAIL` and exits non-zero. On Linux x86_64 (the platform CI runs on) a
+missing or mismatched prover is always a failure, never a skip, so a green CI
+run always means the proofs were machine-checked by the pinned build. Only an
+explicit `SIGIL_SKIP_TLAPS=1`, or a platform tlapm does not support, skips
+the proofs, and the latter says so. CI's `actions/cache` entry keeps the
+verified tarball, which shields runs from an upstream rebuild only while the
+cache lives; the hash check runs on every use regardless.
+
+To re-pin (after an upstream rebuild breaks CI, or to take a newer build):
+
+1. Download the new tarball and compute its SHA-256 (`sha256sum`).
+2. Set `TLAPM_SHA256` in `formal/check.sh` to it (and `TLAPM_VERSION` if the
+   release name changed), then re-prove every proof module locally with the
+   new build: `formal/check.sh` (SigilProofs), `SIGIL_ROT_PROOF=1
+   formal/check.sh` and `SIGIL_SUCC_PROOF=1 formal/check.sh`. All must check
+   with no failed obligation; a prover change that fails one is a finding to
+   investigate, never a reason to weaken a proof.
+3. Update the cache key in `.github/workflows/test.yml` (every
+   `tla2tools-…-tlapm-…-<first 12 hex digits of the hash>` key, one per
+   formal job), so CI does not reuse the old tarball, and commit the hash and
+   the keys together.

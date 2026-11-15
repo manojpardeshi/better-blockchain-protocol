@@ -11,7 +11,7 @@ use sigil_witness::json::{obj, parse, Json};
 use sigil_witness::ratelimit::RateLimiter;
 use sigil_witness::store::{Loaded, Store};
 use sigil_witness::succession::Standby;
-use sigil_witness::testkit::spend_request;
+use sigil_witness::testkit::{spend_request, vote};
 use sigil_witness::witness::{Clock, Error, Witness};
 
 const DEAD: i128 = 100;
@@ -114,12 +114,12 @@ fn standby_survives_restarts() {
     assert_eq!(k.snapshot().get(&sa).and_then(Json::as_arr).map(Vec::len), Some(1));
     assert!(!k.dead(), "it just came back: it has not watched for dead_man seconds yet");
     assert_eq!(
-        k.succeed(&w.next, None).0,
+        k.succeed(&w.next, None, None).0,
         Err(Error::Rejected("the version is alive: no quorum of its members asked, and the dead-man period has not passed".into()))
     );
     now.fetch_add(DEAD as i64, Ordering::SeqCst);
     assert!(k.dead(), "no member answered for dead_man seconds");
-    let signed = ok(k.succeed(&w.next, None), &k.store);
+    let signed = ok(k.succeed(&w.next, None, None), &k.store);
     assert_eq!(signed.get("snapshot"), Some(&k.snapshot()));
     k.store.close();
     drop(k);
@@ -128,12 +128,12 @@ fn standby_survives_restarts() {
     let k = open_standby(&p, "lyrak0", &w, &now);
     assert!(k.fenced());
     assert_eq!(k.mirror_bind(&with_version(&ra, 0)).0, Err(Error::Rejected("fenced: this member signed a successor of the version".into())));
-    assert_eq!(ok(k.succeed(&w.next, None), &k.store), signed, "the same successor: answered again");
+    assert_eq!(ok(k.succeed(&w.next, None, None), &k.store), signed, "the same successor: answered again");
     let mut other = w.next.clone();
     if let Json::Obj(m) = &mut other {
         m.insert("witnesses".into(), Json::Arr(vec![Json::str(key("x").pk)]));
     }
-    assert_eq!(k.succeed(&other, None).0, Err(Error::Rejected("already signed a different successor".into())));
+    assert_eq!(k.succeed(&other, None, None).0, Err(Error::Rejected("already signed a different successor".into())));
     k.store.close();
     drop(k);
 
@@ -194,7 +194,78 @@ fn without_its_own_charter_nothing_is_voted_or_signed() {
     let k = Standby::open(key("cassk0"), w.reg.clone(), &w.cid, Store::memory(), loaded, clock(&now), false).unwrap();
     now.fetch_add(10 * DEAD as i64, Ordering::SeqCst);
     assert!(!k.dead());
-    assert_eq!(k.succeed(&w.next, None).0, Err(Error::Rejected("own charter version unknown".into())));
+    assert_eq!(k.succeed(&w.next, None, None).0, Err(Error::Rejected("own charter version unknown".into())));
+}
+
+#[test]
+fn standby_member_keeps_its_charter_across_a_restart_with_an_old_registry_file() {
+    // Version 1 (with committee `<tag>c0..3`) is signed by v0's committee after a dead-man
+    // period. A member of the new committee learns it by gossip and stands by for it; restarted
+    // from the registry file of version 0 it still knows the version it stands by for.
+    let dir = TempDir::new("oldreg");
+    let w = world("deneb");
+    let now = Arc::new(AtomicI64::new(1_700_000_000));
+    let cpks = Json::Arr((0..4).map(|i| Json::str(key(&format!("denebc{i}")).pk)).collect());
+    let mut next = w.next.clone();
+    if let Json::Obj(m) = &mut next {
+        m.insert("successor".into(), obj([("committee", cpks), ("dead_man", Json::Int(DEAD))]));
+    }
+    let mut sigs = Vec::new();
+    for i in 0..3 {
+        let seed = format!("denebk{i}");
+        let k = Standby::open(key(&seed), w.reg.clone(), &w.cid, Store::memory(), Default::default(), clock(&now), false).unwrap();
+        now.fetch_add(DEAD as i64 + 1, Ordering::SeqCst);
+        let r = k.succeed(&next, None, None).0.unwrap();
+        sigs.push((key(&seed).pk, r.get("sig").unwrap().clone()));
+    }
+    let mut chain = w.reg.raw_chain(&w.cid).to_vec();
+    chain.push(obj([("body", next.clone()), ("sigs", Json::Obj(sigs.into_iter().collect()))]));
+
+    let p = dir.path("c0.redb");
+    let (store, loaded) = Store::open(&p).unwrap();
+    let c = Standby::open(key("denebc0"), w.reg.clone(), &w.cid, store, loaded, clock(&now), true).unwrap();
+    let msg = obj([("charters", obj([(w.cid.as_str(), Json::Arr(chain))]))]);
+    ok(c.gossip(&msg), &c.store);
+    ok(c.enter(&Json::str(&w.cid), &Json::Int(1), &[], None), &c.store);
+    c.store.close();
+    drop(c);
+
+    let (store, loaded) = Store::open(&p).unwrap();
+    let c = Standby::open(key("denebc0"), w.reg.clone(), &w.cid, store, loaded, clock(&now), false).unwrap();
+    assert_eq!(c.member(), Some((w.cid.clone(), 1)));
+    assert_eq!(c.registry().chain(&w.cid).len(), 2);
+    now.fetch_add(DEAD as i64 + 1, Ordering::SeqCst);
+    assert!(c.dead(), "it knows version 1's charter, so it can watch it");
+    c.store.close();
+}
+
+#[test]
+fn standby_handover_keeps_only_what_adopt_keeps() {
+    // STANDBY keeps the verified binds and the verified releases and seals of bound
+    // transactions (SPEC §5.4/§5.5), each once: junk would be forwarded at every handover.
+    let w = world("rigel");
+    let now = Arc::new(AtomicI64::new(1_700_000_000));
+    let (ra, sa, ta) = spend_request(&w.owner, &w.cid, "aa", 0, 1 << 40, "a");
+    let auth = obj(["home", "lock", "salt", "unlock", "header"].map(|k| (k, ra.get(k).unwrap().clone())));
+    let bind = obj([("kind", "bind".into()), ("gen", Json::Int(0)), ("auth", auth)]);
+    let mut log = vec![bind.clone()];
+    for i in 0..3 {
+        log.push(obj([("kind", "bind".into()), ("gen", Json::Int(i)), ("auth", Json::Null)]));
+    }
+    log.push(obj([("kind", "release".into()), ("gen", Json::Int(0)), ("tid", Json::str(&ta)), ("header", ra.get("header").unwrap().clone()), ("proof", obj([]))]));
+    log.push(obj([("kind", "vote".into()), ("vote", obj([]))]));
+    // A verified vote by a member of version 0 is kept (a re-used key adopts it); a stranger's is not.
+    let member_vote = obj([("kind", "vote".into()), ("vote", vote(&key("rigelw0"), &w.cid, &sa, 0, &ta, 1))]);
+    log.push(member_vote.clone());
+    log.push(obj([("kind", "vote".into()), ("vote", vote(&key("stranger"), &w.cid, &sa, 0, &ta, 1))]));
+    log.push(obj([("kind", "mystery".into())]));
+    let snap = obj([(sa.as_str(), Json::Arr(log)), ("f".repeat(64).as_str(), Json::Arr(vec![obj([("kind", "mystery".into())])]))]);
+    let k = Standby::open(key("rigelk1"), w.reg.clone(), &w.cid, Store::memory(), Default::default(), clock(&now), true).unwrap();
+    ok(k.enter(&Json::str(&w.cid), &Json::Int(0), &[snap.clone(), snap], None), &k.store);
+    let mirror = k.snapshot();
+    assert_eq!(mirror.get(&sa), Some(&Json::Arr(vec![bind, member_vote])));
+    assert_eq!(mirror.get(&"f".repeat(64)), None);
+    assert_eq!(ok(k.mirror_bind(&with_version(&ra, 0)), &k.store).get("tid"), Some(&Json::str(&ta)), "the binding is mirrored");
 }
 
 async fn http(addr: std::net::SocketAddr, method: &str, path: &str, auth: Option<&str>, body: &str) -> (u16, Json) {

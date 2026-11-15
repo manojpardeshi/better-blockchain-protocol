@@ -207,6 +207,9 @@ class WireCompatTests(unittest.TestCase):
         for t in (cls.plain, cls.stamped, cls.limited, cls.standby, cls.heirw):
             for dmn in t:
                 wait_http(dmn.url, proc=dmn.proc, log=dmn.log)
+        # The standby twins report `dead` once dead_man (1 s) has passed with no member heard;
+        # compare their info only once both are past that point, not on either side of it.
+        time.sleep(2)
         cls.owner = KeyPair.from_seed(b"\x07" * 32)
         cls.rec = Recorder()
 
@@ -250,7 +253,9 @@ class WireCompatTests(unittest.TestCase):
         tok = {"Authorization": f"Bearer {self.token}"}
         # --- GET endpoints and unknown paths
         for t, role in ((P, W), (ST, W), (SB, S)):
-            for path in ("/v0/info", "/v0/charters", "/v0/proofs"):
+            for path in ("/v0/info", "/v0/charters", "/v0/proofs", f"/v0/charters/{cid}",
+                         f"/v0/charters/{'ab' * 32}", "/v0/charters/not-a-cid", "/v0/charters/",
+                         "/v0/charters/a/b", f"/v0/charters/{cid}/", f"/v0/charters/{cid}?x=1"):
                 r.send(f"{role} GET {path}", t, role, path)
             r.send(f"{role} GET unknown", t, role, "/v0/nope")
             r.send(f"{role} GET root", t, role, "/")
@@ -260,16 +265,18 @@ class WireCompatTests(unittest.TestCase):
         # --- generic cases of every POST endpoint
         for path, fields in (("/v0/spend", ["request"]), ("/v0/release", ["sigil", "proof"]),
                              ("/v0/status", ["sigil"]), ("/v0/sell_stamp", ["blinded"]),
-                             ("/v0/heartbeat", ["challenge"]), ("/v0/gossip", ["charters", "proofs", "forks"])):
+                             ("/v0/heartbeat", ["challenge"]), ("/v0/gossip", ["charters", "proofs", "forks"]),
+                             ("/v0/settle", ["settlement"])):
             r.generic(P, W, path, fields)
         r.generic(ST, W, "/v0/sell_stamp", ["blinded"])
-        for path, fields in (("/v0/freeze", ["charter"]), ("/v0/adopt", ["constellation", "version", "snapshots"])):
+        for path, fields in (("/v0/freeze", ["charter"]), ("/v0/adopt", ["constellation", "version", "snapshots"]),
+                             ("/v0/settled", [])):
             r.generic(P, W, path, fields, self.token, admin=True)
         for path, fields in (("/v0/mirror", ["request"]), ("/v0/note_release", ["sigil", "entry"]),
                              ("/v0/status", ["sigil"]), ("/v0/gossip", ["charters", "proofs", "forks"])):
             r.generic(SB, S, path, fields)
         for path, fields in (("/v0/standby", ["constellation", "version", "snapshots"]),
-                             ("/v0/succeed", ["charter", "sigs"]), ("/v0/probe", ["urls"])):
+                             ("/v0/succeed", ["charter", "sigs"]), ("/v0/probe", ["urls"]), ("/v0/settled", [])):
             r.generic(SB, S, path, fields, self.token, admin=True)
         # --- SPEND: every field of a request missing or of the wrong type
         p0, s0 = self.parcel("aa" * 16)
@@ -328,6 +335,32 @@ class WireCompatTests(unittest.TestCase):
         r.send("status after release", P, W, "/v0/status", {"sigil": sa}, expect=200)
         r.send("spend at gen 1 after release", P, W, "/v0/spend",
                {"request": self.req(self.hdr([(sa, 1)], "5"), sa, pa)}, expect=200)
+        # --- SETTLE (SPEC 5.7): a binding sealed by three members, then settled.
+        pz, sz = self.parcel("05" * 16)
+        Tz = self.hdr([(sz, 0)], "8")
+        tz = model.transition_id(Tz)
+        r.send("spend to be settled", P, W, "/v0/spend", {"request": self.req(Tz, sz, pz)}, expect=200)
+        tgz = {"home": pz["home"], "lock": pz["lock"], "salt": pz["salt"]}
+        seal_z = self.seal(self.wkeys[:3], cid, sz, 0, tz)
+        cert = {"header": Tz, "inputs": [{"parcel": tgz, "seal": seal_z}]}
+        for name, bad in (("short seal", dict(cert, inputs=[{"parcel": tgz, "seal": self.seal(self.wkeys[:2], cid, sz, 0, tz)}])),
+                          ("seal of another tid", dict(cert, inputs=[{"parcel": tgz, "seal": seal_y}])),
+                          ("wrong parcel", dict(cert, inputs=[{"parcel": tgt, "seal": seal_z}])),
+                          ("no inputs", dict(cert, inputs=[])), ("inputs not a list", dict(cert, inputs=5)),
+                          ("header without inputs", dict(cert, header={"body": "x"})),
+                          ("partial (one of two inputs)", {"header": Tb, "inputs": [{"parcel": tgt, "seal": seal_y}]}),
+                          ("bool generation", dict(cert, inputs=[{"parcel": tgz, "seal": dict(seal_z, gen=False)}])),
+                          ("over 512 KiB", dict(cert, pad="x" * (520 * 1024)))):
+            r.send(f"settle {name}", P, W, "/v0/settle", {"settlement": bad})
+        r.send("settle valid", P, W, "/v0/settle", {"settlement": cert}, expect=200)
+        r.send("settle again", P, W, "/v0/settle", {"settlement": cert}, expect=200)
+        r.send("spend settled: the vote it holds", P, W, "/v0/spend", {"request": self.req(Tz, sz, pz)}, expect=200)
+        r.send("spend settled: another tid", P, W, "/v0/spend", {"request": self.req(self.hdr([(sz, 1)], "9"), sz, pz)},
+               expect=409)
+        r.send("release settled", P, W, "/v0/release", {"sigil": sz, "proof": dp}, expect=403)
+        r.send("status settled", P, W, "/v0/status", {"sigil": sz}, expect=200)
+        r.send("settled list", P, W, "/v0/settled", {}, headers=tok, expect=200)
+        r.send("standby settled list", SB, S, "/v0/settled", {}, headers=tok, expect=200)
         # --- HEARTBEAT
         for ch, name in (("hello", "valid"), ("", "empty"), ("c" * 128, "128 chars"), ("c" * 129, "129 chars"),
                          ("é", "non-ascii")):
@@ -401,6 +434,8 @@ class WireCompatTests(unittest.TestCase):
         r.send("adopt info", AD, W, "/v0/info")
         r.send("adopt unknown version", AD, W, "/v0/adopt", {"constellation": cid, "version": 1, "snapshots": []}, headers=tok)
         r.send("adopt spend before adopt", AD, W, "/v0/spend", {"request": good})
+        # A witness that has not joined answers no STATUS (it would read as "unbound" from a member).
+        r.send("adopt status before adopt", AD, W, "/v0/status", {"sigil": good["sigil"]}, expect=403)
         r.send("adopt learns v1", AD, W, "/v0/gossip", {"charters": {cid: chain0 + [a]}}, expect=200)
         r.send("adopt version 0", AD, W, "/v0/adopt", {"constellation": cid, "version": 0, "snapshots": []}, headers=tok)
         r.send("adopt snapshots not a list", AD, W, "/v0/adopt", {"constellation": cid, "version": 1, "snapshots": {}}, headers=tok)

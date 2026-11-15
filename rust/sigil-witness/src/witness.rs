@@ -18,16 +18,16 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, RwLock};
 
-use crate::charter::{charter_hash, quorum, short, Registry, MAX_CHARTER_BYTES};
+use crate::charter::{charter_hash, checkpoint_hash, quorum, short, valid_checkpoint_set, Charter, Registry, MAX_CHARTER_BYTES};
 use crate::succession::well_formed_body;
 use crate::crypto::KeyPair;
 use crate::gossip::{check_message, CowRegistry, GossipStore};
 use crate::json::{obj, Json};
 use crate::locks::evaluate;
 use crate::model::{heartbeat_payload, sigil_of, transition_id, vote_payload};
-use crate::proofs::{acked_by, proves_dead, verify_seal, verify_vote};
+use crate::proofs::{acked_by, parse_settlement, proves_dead, unverifiable_death, verify_seal, verify_vote};
 use crate::stamps::StampKey;
-use crate::store::{Entry, Loaded, Store};
+use crate::store::{charter_entries, charter_entry, restore_charters, Entry, Loaded, Store};
 
 pub const CONTESTED: &str = "!contested";
 
@@ -40,6 +40,16 @@ pub const MAX_PROOF_BYTES: usize = 128 << 10;
 /// A sigil is newly bound only below this generation, so at most this many times
 /// (`witness.MAX_GEN`).
 pub const MAX_GEN: i128 = 16;
+/// `enc(settlement)` of a SETTLE (`witness.MAX_SETTLE_BYTES`, SPEC §5.7).
+pub const MAX_SETTLE_BYTES: usize = 512 << 10;
+
+/// `Record.settled` (SPEC §5, §5.7): a certificate showed the binding complete.
+pub const SETTLED: i128 = 1;
+/// `Record.settled`: the sigil is in our charter's checkpoint set (the record has no log).
+pub const CHECKPOINTED: i128 = 2;
+/// Per tid, releases a standby member keeps from a handover that it cannot verify
+/// (`witness.MAX_UNVERIFIED_RELEASES`, SPEC §5.5).
+pub const MAX_UNVERIFIED_RELEASES: usize = 4;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Error {
@@ -69,6 +79,8 @@ pub struct Record {
     pub votes: Vec<Json>,
     pub abstain: bool,
     pub candidates: Vec<Candidate>,
+    /// 0, [`SETTLED`] or [`CHECKPOINTED`]: a settled record never votes or releases again.
+    pub settled: i128,
 }
 
 impl Record {
@@ -87,11 +99,13 @@ impl Record {
                     self.candidates.iter().map(|(g, t, h)| Json::Arr(vec![Json::Int(*g), Json::str(t), h.clone()])).collect(),
                 ),
             ),
+            ("settled", Json::Int(self.settled)),
         ])
     }
 
     /// The inverse of [`Record::to_json`]. `candidates` may be missing (stores written before
-    /// rotation was ported): it is then empty.
+    /// rotation was ported): it is then empty. `settled` may be missing (stores written before
+    /// compaction): it is then 0.
     pub fn from_json(v: &Json) -> Option<Record> {
         let opt = |k: &str| v.get(k).filter(|x| !x.is_null()).cloned();
         let mut candidates = Vec::new();
@@ -114,6 +128,10 @@ impl Record {
             votes: v.get("votes")?.as_arr()?.clone(),
             abstain: v.get("abstain")? == &Json::Bool(true),
             candidates,
+            settled: match v.get("settled") {
+                None => 0,
+                Some(x) => x.as_int()?,
+            },
         })
     }
 }
@@ -205,7 +223,8 @@ pub struct Witness {
     pub store: Arc<Store>,
     clock: Clock,
     /// Use Ed25519 batch verification for seals, death proofs and equivocation proofs.
-    pub batch_verify: bool,
+    pub batch_verify: bool,    /// The constellations the registry file names: only their chains are persisted.
+    keep: HashSet<String>,
 }
 
 /// What a call returns, plus the store sequence its reply depends on.
@@ -258,13 +277,16 @@ impl Witness {
     /// ADOPT (`witnessd run --adopt`). A store that already joined is restored either way.
     pub fn open_with(
         kp: KeyPair,
-        registry: Registry,
+        mut registry: Registry,
         cid: &str,
         store: Arc<Store>,
         loaded: Loaded,
         clock: Clock,
         adopt: bool,
     ) -> Result<Witness, String> {
+        // Charter chains learned before the restart: the registry file may predate them.
+        let keep: HashSet<String> = registry.ids().map(str::to_string).collect();
+        restore_charters(&mut registry, &loaded.charters);
         if !registry.contains(cid) {
             return Err(format!("constellation {cid} is not in the registry"));
         }
@@ -312,6 +334,7 @@ impl Witness {
             store,
             clock,
             batch_verify: true,
+            keep,
         })
     }
 
@@ -455,6 +478,18 @@ impl Witness {
                 }
             }
         }
+        if let Some(r) = st.records.get(sigil).filter(|r| r.settled != 0) {
+            // Its transition is complete (SPEC §5.7): never a new vote, only the one we hold.
+            if r.gen == gen && r.tid.as_deref() == Some(tid.as_str()) {
+                if let Some(v) = &r.vote {
+                    return Ok(v.clone());
+                }
+            }
+            if r.tid.as_deref() != Some(tid.as_str()) {
+                return Err(Error::Conflict(r.vote.clone()));
+            }
+            return rejected("sigil consumed: its transition is complete");
+        }
         let mut rec = st.records.get(sigil).cloned().unwrap_or_default();
         if gen < rec.gen {
             return rejected("stale generation");
@@ -523,6 +558,9 @@ impl Witness {
             }
             let Some(s) = sigil.as_str() else { return rejected("nothing to release") };
             match st.records.get(s) {
+                Some(r) if r.tid.is_some() && r.settled != 0 => {
+                    return rejected("sigil consumed: its transition is complete")
+                }
                 Some(r) if r.tid.is_some() => r.clone(),
                 _ => return rejected("nothing to release"),
             }
@@ -559,7 +597,9 @@ impl Witness {
             return rejected("witness not active");
         }
         let mut rec = match st.records.get(sigil) {
-            Some(r) if r.gen == snapshot.gen && r.tid == snapshot.tid && r.candidates == snapshot.candidates => r.clone(),
+            Some(r) if r.gen == snapshot.gen && r.tid == snapshot.tid && r.candidates == snapshot.candidates && r.settled == 0 => {
+                r.clone()
+            }
             _ => return rejected("record changed; retry"),
         };
         if contested {
@@ -609,12 +649,107 @@ impl Witness {
         Ok(Json::Int(gen))
     }
 
+    /// SETTLE (SPEC §5.7): `cert` shows a transition complete; settle every input that lives
+    /// here. From then on we never vote on those sigils again (except to hand back a vote we
+    /// already hold for exactly that binding) and never release them: abstention, safe whatever
+    /// the certificate says. It is checked so that we never settle a sigil whose transition could
+    /// still die. Logs are kept for the next handover until a checkpoint covers the sigil.
+    pub fn settle(&self, cert: &Json) -> Outcome {
+        let r = self.settle_inner(cert);
+        (r, self.store.last_submitted())
+    }
+
+    fn settle_inner(&self, cert: &Json) -> Result<Json, Error> {
+        let Some((cid, _)) = self.state.lock().expect("state lock").active() else {
+            return rejected("witness not active");
+        };
+        if cert.canonical().len() > MAX_SETTLE_BYTES {
+            return rejected("settlement too large");
+        }
+        let Some((tid, inputs)) = parse_settlement(cert) else { return rejected("invalid settlement certificate") };
+        let mine: Vec<(String, i128)> = inputs.iter().filter(|i| i.2 == cid).map(|i| (i.0.clone(), i.1)).collect();
+        if mine.is_empty() {
+            return rejected("no input of this transition lives here");
+        }
+        // SETTLE never changes a binding: only a record we hold bound to exactly (g, tid).
+        let held: Vec<(String, i128)> = {
+            let st = self.state.lock().expect("state lock");
+            mine.iter()
+                .filter(|(s, g)| st.records.get(s).is_some_and(|r| r.gen == *g && r.tid.as_deref() == Some(tid.as_str())))
+                .cloned()
+                .collect()
+        };
+        if held.is_empty() {
+            return rejected("this witness holds no binding of this transition");
+        }
+        let registry = self.registry();
+        // Every seal from its home's current version: retired keys cannot complete a transition.
+        let current = |home: &str, seal: &Json| {
+            let latest = registry.chain(home).last().map(|c| c.version);
+            latest.is_some() && seal.get("version").and_then(Json::as_int) == latest
+        };
+        if !inputs.iter().all(|(_, _, home, seal)| current(home, seal)) {
+            return rejected("a seal is not from its home's current charter version");
+        }
+        if !inputs.iter().all(|(_, _, _, seal)| verify_seal(seal, &registry, &HashSet::new(), self.batch_verify)) {
+            return rejected("invalid settlement certificate");
+        }
+        let mut st = self.state.lock().expect("state lock");
+        if st.active().map(|(c, _)| c).as_deref() != Some(cid.as_str()) {
+            return rejected("witness not active");
+        }
+        let mut changed: Vec<(String, Record)> = Vec::new();
+        for (s, g) in &held {
+            let Some(r) = st.records.get(s) else { continue };
+            if r.settled != 0 || r.gen != *g || r.tid.as_deref() != Some(tid.as_str()) || changed.iter().any(|(c, _)| c == s) {
+                continue;
+            }
+            let mut rec = r.clone();
+            rec.settled = SETTLED;
+            changed.push((s.clone(), rec));
+        }
+        if !changed.is_empty() {
+            let mut entries: Vec<Entry> = vec![format_entry()];
+            entries.extend(changed.iter().map(|(s, r)| ("record".to_string(), s.clone(), r.to_json())));
+            self.store.submit(entries);
+            for (s, r) in changed {
+                st.records.insert(s, r);
+            }
+        }
+        let mut out: Vec<String> = held.into_iter().map(|(s, _)| s).collect();
+        out.sort();
+        Ok(obj([("settled", Json::Arr(out.into_iter().map(Json::Str).collect()))]))
+    }
+
+    /// SETTLED (SPEC §5.7, an operator call): `{settled, checkpointed}`, our settled and
+    /// checkpointed records as `[sigil, gen, tid]`, sorted.
+    pub fn settled_records(&self) -> Json {
+        let st = self.state.lock().expect("state lock");
+        let mut keys: Vec<&String> = st.records.iter().filter(|(_, r)| r.settled != 0).map(|(s, _)| s).collect();
+        keys.sort();
+        let (mut settled, mut checkpointed) = (Vec::new(), Vec::new());
+        for s in keys {
+            let r = &st.records[s];
+            let e = Json::Arr(vec![Json::str(s), Json::Int(r.gen), r.tid.clone().into()]);
+            if r.settled == SETTLED {
+                settled.push(e);
+            } else {
+                checkpointed.push(e);
+            }
+        }
+        obj([("settled", Json::Arr(settled)), ("checkpointed", Json::Arr(checkpointed))])
+    }
+
     /// STATUS (SPEC §5.3): `{gen, tid, votes}`.
     pub fn status(&self, sigil: &Json) -> Outcome {
         if matches!(sigil, Json::Arr(_) | Json::Obj(_)) {
             return (Err(Error::BadRequest("unhashable sigil".into())), 0);
         }
         let st = self.state.lock().expect("state lock");
+        // A witness that has not joined (awaiting ADOPT) answers nothing (witness.py status).
+        if st.member.is_none() {
+            return (Err(Error::Rejected("witness not active".into())), 0);
+        }
         let out = match sigil.as_str().and_then(|s| st.records.get(s)) {
             None => obj([("gen", Json::Int(0)), ("tid", Json::Null), ("votes", Json::Arr(vec![]))]),
             Some(r) => obj([("gen", Json::Int(r.gen)), ("tid", r.tid.clone().into()), ("votes", Json::Arr(r.votes.clone()))]),
@@ -667,16 +802,34 @@ impl Witness {
 
     // ------------------------------------------------------------------ rotation (§5.4)
 
+    /// [`Witness::freeze_with`] for a charter without a checkpoint.
+    pub fn freeze(&self, next_charter: &Json) -> Outcome {
+        self.freeze_with(next_charter, None)
+    }
+
+    /// [`Witness::adopt_with`] for a charter without a checkpoint.
+    pub fn adopt(&self, cid: &Json, version: &Json, snapshots: &[Json]) -> Outcome {
+        self.adopt_with(cid, version, snapshots, None)
+    }
+
+    /// [`Witness::adopt_once_with`] for a charter without a checkpoint.
+    pub fn adopt_once(&self, cid: &Json, version: &Json, snapshots: &[Json]) -> Outcome {
+        self.adopt_once_with(cid, version, snapshots, None)
+    }
+
     /// FREEZE: stop voting forever and hand over evidence for `next_charter`, the body of the
     /// next charter version. Returns `{sig, snapshot}`: our signature on it and our evidence
     /// `{sigil: log ‖ [{kind: "vote", vote} for every vote we cast on sigil]}`. We freeze for
     /// exactly one successor: the same one is signed again, any other is refused.
-    pub fn freeze(&self, next_charter: &Json) -> Outcome {
-        let r = self.freeze_inner(next_charter);
+    /// With a checkpoint in `next_charter`, `checkpoint` is its set: we freeze only if every
+    /// entry matches a record we hold settled and every record we hold checkpointed is in it
+    /// (SPEC §5.7), and the snapshot omits those sigils.
+    pub fn freeze_with(&self, next_charter: &Json, checkpoint: Option<&Json>) -> Outcome {
+        let r = self.freeze_inner(next_charter, checkpoint);
         (r, self.store.last_submitted())
     }
 
-    fn freeze_inner(&self, next_charter: &Json) -> Result<Json, Error> {
+    fn freeze_inner(&self, next_charter: &Json, checkpoint: Option<&Json>) -> Result<Json, Error> {
         let mut st = self.state.lock().expect("state lock");
         let Some((cid, version)) = st.member.clone() else { return rejected("witness not active") };
         let Some(prev) = next_charter.as_obj().and_then(|m| m.get("prev")) else {
@@ -698,6 +851,17 @@ impl Witness {
         if !well_formed {
             return rejected("not a valid next version of our charter");
         }
+        let ck = checkpoint_for(next_charter.get("checkpoint"), checkpoint)?;
+        for (s, (g, t)) in &ck {
+            match st.records.get(s) {
+                Some(r) if r.settled != 0 && r.gen == *g && r.tid.as_deref() == Some(t.as_str()) => {}
+                _ => return rejected("checkpoint names a binding this witness does not hold settled"),
+            }
+        }
+        if st.records.iter().any(|(s, r)| r.settled == CHECKPOINTED && !ck.contains_key(s)) {
+            // The extension rule: a checkpointed record has no log to hand over.
+            return rejected("checkpoint drops a sigil of our own checkpoint");
+        }
         // Signing two successors lets a quorum of honest witnesses certify two conflicting
         // version v+1 charters (a fork).
         let h = charter_hash(next_charter);
@@ -711,13 +875,25 @@ impl Witness {
         }
         // Our signed votes travel with the evidence, so that a re-used key never votes another
         // transition at a (sigil, generation) where it already voted.
+        // A re-used key keeps its own vote for a checkpointed binding (STATUS still shows it).
+        let reused = next_charter.get("witnesses").and_then(Json::as_arr).is_some_and(|ws| ws.iter().any(|w| w.as_str() == Some(self.pk.as_str())));
         let snapshot = Json::Obj(
             st.records
                 .iter()
-                .map(|(s, r)| {
-                    let mut log = r.log.clone();
-                    log.extend(r.votes.iter().map(|v| obj([("kind", "vote".into()), ("vote", v.clone())])));
-                    (s.clone(), Json::Arr(log))
+                .filter_map(|(s, r)| {
+                    if !ck.contains_key(s) {
+                        let mut log = r.log.clone();
+                        log.extend(r.votes.iter().map(|v| obj([("kind", "vote".into()), ("vote", v.clone())])));
+                        return Some((s.clone(), Json::Arr(log)));
+                    }
+                    let want = r.tid.clone().map(|t| (r.gen, t));
+                    let mine: Vec<Json> = r
+                        .votes
+                        .iter()
+                        .filter(|v| reused && vote_key(v) == want)
+                        .map(|v| obj([("kind", "vote".into()), ("vote", v.clone())]))
+                        .collect();
+                    (!mine.is_empty()).then(|| (s.clone(), Json::Arr(mine)))
                 })
                 .collect(),
         );
@@ -731,16 +907,18 @@ impl Witness {
     /// owner authorisation and a release a valid death proof, so a lying predecessor can omit
     /// evidence (covered by the union) but never invent it. Malformed parts (a snapshot that is
     /// not an object, a log that is not a list, an entry that is not an object) are skipped.
-    pub fn adopt(&self, cid: &Json, version: &Json, snapshots: &[Json]) -> Outcome {
+    /// With a checkpoint in the new charter, `checkpoint` must be its set (SPEC §5.7): each entry
+    /// becomes a checkpointed record, with no log, whatever the snapshots say about it.
+    pub fn adopt_with(&self, cid: &Json, version: &Json, snapshots: &[Json], checkpoint: Option<&Json>) -> Outcome {
         let mut st = self.state.lock().expect("state lock");
-        let r = self.adopt_locked(&mut st, cid, version, snapshots);
+        let r = self.adopt_locked(&mut st, cid, version, snapshots, checkpoint);
         drop(st);
         (r, self.store.last_submitted())
     }
 
     /// `/v0/adopt`: ADOPT once, on a witness that has not joined any charter version. A retry
     /// for the version already adopted answers the same; anything else is refused.
-    pub fn adopt_once(&self, cid: &Json, version: &Json, snapshots: &[Json]) -> Outcome {
+    pub fn adopt_once_with(&self, cid: &Json, version: &Json, snapshots: &[Json], checkpoint: Option<&Json>) -> Outcome {
         let mut st = self.state.lock().expect("state lock");
         let r = match &st.member {
             Some((c, v)) => {
@@ -750,20 +928,28 @@ impl Witness {
                     rejected("already a member of a charter version: ADOPT runs once, on a fresh witness")
                 }
             }
-            None => self.adopt_locked(&mut st, cid, version, snapshots),
+            None => self.adopt_locked(&mut st, cid, version, snapshots, checkpoint),
         };
         drop(st);
         (r, self.store.last_submitted())
     }
 
-    fn adopt_locked(&self, st: &mut State, cid: &Json, version: &Json, snapshots: &[Json]) -> Result<Json, Error> {
+    fn adopt_locked(
+        &self,
+        st: &mut State,
+        cid: &Json,
+        version: &Json,
+        snapshots: &[Json],
+        checkpoint: Option<&Json>,
+    ) -> Result<Json, Error> {
         let registry = self.registry();
         let not_member = || Error::BadRequest("not a member of this charter".into());
         let (Some(cid), Some(version)) = (cid.as_str(), version.as_int()) else { return Err(not_member()) };
-        match registry.charter(cid, version) {
-            Some(c) if c.is_member(&self.pk) => {}
+        let charter: &Charter = match registry.charter(cid, version) {
+            Some(c) if c.is_member(&self.pk) => c,
             _ => return Err(not_member()),
-        }
+        };
+        let ck = checkpoint_for(charter.body.get("checkpoint"), checkpoint)?;
         let batch = self.batch_verify;
         // Per sigil, the entries kept and the encodings seen. The evidence is a set: honest
         // predecessors hand over the same entries, and without dropping repeats each rotation
@@ -782,86 +968,60 @@ impl Witness {
                 }
             }
         }
-        let mut records: Vec<(String, Record)> = Vec::with_capacity(evidence.items.len());
+        let mut records: Vec<(String, Record)> = Vec::with_capacity(evidence.items.len() + ck.len());
+        let mut ck_sorted: Vec<(&String, &(i128, String))> = ck.iter().collect();
+        ck_sorted.sort();
+        for (sigil, (g, t)) in ck_sorted {
+            // Our own vote for exactly this binding, if our key cast one (a re-used key).
+            let want = Some((*g, t.clone()));
+            let mut mine: Option<Json> = st.records.get(sigil).and_then(|p| p.votes.iter().find(|v| vote_key(v) == want).cloned());
+            if mine.is_none() {
+                if let Some(i) = evidence.keys.get(sigil) {
+                    mine = evidence.items[*i].1 .0.iter().find_map(|e| {
+                        let v = e.get("vote").filter(|_| e.get("kind").and_then(Json::as_str) == Some("vote"))?;
+                        let is = |k: &str, w: &str| v.get(k).and_then(Json::as_str) == Some(w);
+                        (is("witness", &self.pk) && is("sigil", sigil) && is("constellation", cid) && vote_key(v) == want && verify_vote(v))
+                            .then(|| v.clone())
+                    });
+                }
+            }
+            let rec = Record {
+                gen: *g,
+                tid: Some(t.clone()),
+                vote: mine.clone(),
+                votes: mine.into_iter().collect(),
+                settled: CHECKPOINTED,
+                ..Default::default()
+            };
+            records.push((sigil.clone(), rec));
+        }
         for (sigil, (log, _)) in evidence.items {
-            let sigil_j = Json::str(&sigil);
-            let mut binds: OrderedMap<(i128, String), Json> = OrderedMap::new(); // (gen, tid) -> header
-            let mut dead: HashSet<String> = HashSet::new(); // tids proven unsealable
-            let mut sealed: HashSet<(i128, String)> = HashSet::new(); // verified seals in the evidence
+            if ck.contains_key(&sigil) {
+                continue;
+            }
+            let ev = classify_evidence(&sigil, log, cid, &registry, batch, Some(&self.pk), &HashSet::new());
+            let prior = st.records.get(&sigil);
             let mut own: OrderedMap<(i128, String), Json> = OrderedMap::new(); // votes our key cast
-            if let Some(prior) = st.records.get(&sigil) {
+            if let Some(prior) = prior {
                 for v in &prior.votes {
                     if let Some(k) = vote_key(v) {
                         own.insert(k, v.clone());
                     }
                 }
             }
-            // Which entries the new record keeps: verified binds, and verified releases and seals
-            // of transactions bound in this evidence (witness.py adopt).
-            let mut keep = vec![false; log.len()];
-            let mut releases: Vec<(usize, String)> = Vec::new();
-            let mut seals: Vec<(usize, (i128, String))> = Vec::new();
-            for (i, e) in log.iter().enumerate() {
-                match e.get("kind").and_then(Json::as_str) {
-                    Some("vote") => {
-                        let Some(v) = e.get("vote") else { continue };
-                        let is = |k: &str, want: &str| v.get(k).and_then(Json::as_str) == Some(want);
-                        if is("witness", &self.pk) && is("sigil", &sigil) && is("constellation", cid) && verify_vote(v) {
-                            if let Some(k) = vote_key(v) {
-                                own.insert(k, v.clone());
-                            }
-                        }
-                    }
-                    Some("bind") => {
-                        let auth = e.get("auth").cloned().unwrap_or(Json::Obj(Default::default()));
-                        // A non-object unlock (`Err`) is never bound by an honest witness.
-                        if let Ok(Some(b)) = authorises(&sigil_j, &auth, None, batch) {
-                            binds.insert(b, auth.get("header").cloned().unwrap_or(Json::Null));
-                            keep[i] = true;
-                        }
-                    }
-                    Some("seal") => {
-                        let Some(sl) = e.get("seal") else { continue };
-                        if sl.get("sigil").and_then(Json::as_str) == Some(sigil.as_str())
-                            && sl.get("constellation").and_then(Json::as_str) == Some(cid)
-                            && verify_seal(sl, &registry, &HashSet::new(), batch)
-                        {
-                            if let (Some(g), Some(t)) = (sl.get("gen").and_then(Json::as_int), sl.get("tid").and_then(Json::as_str)) {
-                                sealed.insert((g, t.to_string()));
-                                seals.push((i, (g, t.to_string())));
-                            }
-                        }
-                    }
-                    Some("release") => {
-                        let null = Json::Null;
-                        let h = e.get("header").unwrap_or(&null);
-                        let Some(t) = e.get("tid").and_then(Json::as_str) else { continue };
-                        if transition_id(h) == t && proves_dead(h, t, e.get("proof").unwrap_or(&null), &registry, batch) {
-                            dead.insert(t.to_string());
-                            releases.push((i, t.to_string()));
-                        }
-                    }
-                    _ => {}
+            for v in &ev.votes {
+                if let Some(k) = vote_key(v) {
+                    own.insert(k, v.clone());
                 }
             }
+            if ev.log.is_empty() && own.items.is_empty() && prior.is_none() {
+                continue; // nothing verifiable bears on this sigil: no record (no padding carried)
+            }
+            let Evidence { binds, dead, sealed, log, .. } = ev;
             let floor = binds.items.iter().map(|((g, t), _)| if dead.contains(t) { g + 1 } else { *g }).fold(0, i128::max);
             // A death proof is a timeless fact about a transition, so it retires that binding
             // wherever it was reported.
             let alive: Vec<&((i128, String), Json)> = binds.items.iter().filter(|((_, t), _)| !dead.contains(t)).collect();
-            // Releases and seals only ever bear on bound transactions, and an honest witness logs
-            // one only for a transaction it bound: those of unbound transactions are junk.
-            let bound: HashSet<&String> = binds.items.iter().map(|((_, t), _)| t).collect();
-            for (i, t) in &releases {
-                if bound.contains(t) {
-                    keep[*i] = true;
-                }
-            }
-            for (i, b) in &seals {
-                if binds.items.iter().any(|(k, _)| k == b) {
-                    keep[*i] = true;
-                }
-            }
-            let log: Vec<Json> = log.into_iter().zip(keep).filter_map(|(e, k)| k.then_some(e)).collect();
             let mut rec = Record { gen: floor, log, votes: own.items.iter().map(|(_, v)| v.clone()).collect(), ..Default::default() };
             // Two tids bound at one generation mean the owner equivocated there, and the log
             // cannot show which one (if either) a quorum sealed. So a lone live binding is
@@ -899,9 +1059,16 @@ impl Witness {
             records.push((sigil, rec));
         }
         // Membership and inherited records land in one atomic batch: a crash must never leave
-        // us active but missing a binding.
-        let mut batch_entries: Vec<Entry> = Vec::with_capacity(records.len() + 1);
+        // us active but missing a binding. Our version's charter chain lands with it: a restart
+        // from an older registry file must still know the version we are a member of.
+        let mut batch_entries: Vec<Entry> = Vec::with_capacity(records.len() + 2);
+        if self.keep.contains(cid) {
+            batch_entries.push(charter_entry(&registry, cid));
+        }
         batch_entries.push(("member".into(), String::new(), Json::Arr(vec![Json::str(cid), Json::Int(version)])));
+        if !ck.is_empty() {
+            batch_entries.push(format_entry());
+        }
         batch_entries.extend(records.iter().map(|(s, r)| ("record".to_string(), s.clone(), r.to_json())));
         self.store.submit(batch_entries);
         st.member = Some((cid.to_string(), version));
@@ -922,10 +1089,16 @@ impl Witness {
         let base = self.registry();
         let mut reg = CowRegistry::new(&base);
         let out = g.merge(&mut reg, msg, self.batch_verify).map_err(Error::BadRequest);
+        let mut seq = 0;
         if let Some(changed) = reg.into_changed() {
+            // A restart must not forget a version learned here (durable before the answer).
+            let entries = charter_entries(&base, &changed, &self.keep);
+            if !entries.is_empty() {
+                seq = self.store.submit(entries);
+            }
             *self.registry.write().expect("registry lock") = Arc::new(changed);
         }
-        (out, 0)
+        (out, seq)
     }
 
     /// `/v0/proofs`: `{proofs, forks}`.
@@ -946,6 +1119,7 @@ impl Witness {
             ("version", version),
             ("frozen", Json::Bool(st.frozen)),
             ("stamps", self.stamps.as_ref().map(StampKey::public_json).unwrap_or(Json::Null)),
+            ("features", Json::Arr(vec![Json::str("checkpoint")])),
         ])
     }
 
@@ -999,7 +1173,184 @@ fn release_entry(gen: i128, tid: &str, header: Json, proof: &Json) -> Json {
     ])
 }
 
+/// What a handover log of one sigil proves (SPEC §5.4), as ADOPT and STANDBY read it
+/// (`witness.py` `Evidence`).
+pub(crate) struct Evidence {
+    /// `(gen, tid) -> header` of the verified bind entries, in log order.
+    binds: OrderedMap<(i128, String), Json>,
+    /// Tids whose death proof verified.
+    dead: HashSet<String>,
+    /// `(gen, tid)` with a verified seal.
+    sealed: HashSet<(i128, String)>,
+    /// Verified votes of this constellation on the sigil, in log order.
+    votes: Vec<Json>,
+    /// Verified evidence bearing on a binding, in log order.
+    log: Vec<Json>,
+    /// `log` plus the verified vote entries, in log order.
+    pub(crate) kept: Vec<Json>,
+}
+
+/// `classify_evidence`: verify each entry of a (deduplicated) handover log of `sigil` for
+/// constellation `cid`. Bind entries count if their authorisation passes §5.1 step 3 with no
+/// clock, releases if their death proof verifies against their header, seals if the seal
+/// verifies for this sigil and constellation, votes if valid votes of this constellation on this
+/// sigil. Releases and seals are kept only for a transaction bound in this evidence (an honest
+/// witness logs one only for a transaction it bound); everything else is junk.
+/// With `voter`, only that key's votes are checked and kept (ADOPT needs only its own).
+/// Without `voter` (STANDBY), `kept` also holds, for a kept binding with no verified release, up
+/// to `MAX_UNVERIFIED_RELEASES` releases whose death proof passes every charter-free check but
+/// names a charter version this member does not know ([`unverifiable_death`]), within
+/// `MAX_PROOF_BYTES`; and a vote only if its sigil has a kept binding or
+/// its signer is in `members` (the version handed over: a re-used key's own votes travel).
+pub(crate) fn classify_evidence(
+    sigil: &str,
+    log: Vec<Json>,
+    cid: &str,
+    registry: &Registry,
+    batch: bool,
+    voter: Option<&str>,
+    members: &HashSet<String>,
+) -> Evidence {
+    let sigil_j = Json::str(sigil);
+    let mut binds: OrderedMap<(i128, String), Json> = OrderedMap::new();
+    let mut dead: HashSet<String> = HashSet::new();
+    let mut sealed: HashSet<(i128, String)> = HashSet::new();
+    let mut votes = Vec::new();
+    let mut keep = vec![false; log.len()];
+    let mut is_vote = vec![false; log.len()];
+    let mut releases: Vec<(usize, String)> = Vec::new();
+    let mut unknown: Vec<(usize, String)> = Vec::new();
+    let mut seals: Vec<(usize, (i128, String))> = Vec::new();
+    for (i, e) in log.iter().enumerate() {
+        match e.get("kind").and_then(Json::as_str) {
+            Some("vote") => {
+                let Some(v) = e.get("vote") else { continue };
+                let is = |k: &str, want: &str| v.get(k).and_then(Json::as_str) == Some(want);
+                // A vote counts only if signed by a member of the version it names (or, for
+                // ADOPT, by our own key): anyone can mint keys and sign votes with them.
+                let signer_ok = match voter {
+                    Some(pk) => is("witness", pk),
+                    None => match (v.get("version").and_then(Json::as_int), v.get("witness").and_then(Json::as_str)) {
+                        (Some(ver), Some(w)) => registry.charter(cid, ver).is_some_and(|c| c.is_member(w)),
+                        _ => false,
+                    },
+                };
+                if signer_ok && is("sigil", sigil) && is("constellation", cid) && vote_key(v).is_some() && verify_vote(v) {
+                    votes.push(v.clone());
+                    is_vote[i] = true;
+                }
+            }
+            Some("bind") => {
+                let auth = e.get("auth").cloned().unwrap_or(Json::Obj(Default::default()));
+                // A non-object unlock (`Err`) is never bound by an honest witness.
+                if let Ok(Some(b)) = authorises(&sigil_j, &auth, None, batch) {
+                    binds.insert(b, auth.get("header").cloned().unwrap_or(Json::Null));
+                    keep[i] = true;
+                }
+            }
+            Some("seal") => {
+                let Some(sl) = e.get("seal") else { continue };
+                if sl.get("sigil").and_then(Json::as_str) == Some(sigil)
+                    && sl.get("constellation").and_then(Json::as_str) == Some(cid)
+                    && verify_seal(sl, registry, &HashSet::new(), batch)
+                {
+                    if let (Some(g), Some(t)) = (sl.get("gen").and_then(Json::as_int), sl.get("tid").and_then(Json::as_str)) {
+                        sealed.insert((g, t.to_string()));
+                        seals.push((i, (g, t.to_string())));
+                    }
+                }
+            }
+            Some("release") => {
+                let null = Json::Null;
+                let h = e.get("header").unwrap_or(&null);
+                let Some(t) = e.get("tid").and_then(Json::as_str) else { continue };
+                let proof = e.get("proof").unwrap_or(&null);
+                if transition_id(h) == t && proves_dead(h, t, proof, registry, batch) {
+                    dead.insert(t.to_string());
+                    releases.push((i, t.to_string()));
+                } else if voter.is_none()
+                    && transition_id(h) == t
+                    && unverifiable_death(h, t, proof, registry)
+                    && proof.canonical().len() <= MAX_PROOF_BYTES
+                {
+                    unknown.push((i, t.to_string()));
+                }
+            }
+            _ => {}
+        }
+    }
+    let bound: HashSet<&String> = binds.items.iter().map(|((_, t), _)| t).collect();
+    for (i, t) in &releases {
+        if bound.contains(t) {
+            keep[*i] = true;
+        }
+    }
+    for (i, b) in &seals {
+        if binds.keys.contains_key(b) {
+            keep[*i] = true;
+        }
+    }
+    let mut extra = vec![false; log.len()];
+    let mut count: HashMap<&String, usize> = HashMap::new();
+    for (i, t) in &unknown {
+        let n = count.entry(t).or_insert(0);
+        if bound.contains(t) && !dead.contains(t) && *n < MAX_UNVERIFIED_RELEASES {
+            *n += 1;
+            extra[*i] = true;
+        }
+    }
+    let bound_sigil = !binds.items.is_empty();
+    let mut out_log = Vec::new();
+    let mut kept = Vec::new();
+    for (i, e) in log.into_iter().enumerate() {
+        if keep[i] {
+            out_log.push(e.clone());
+            kept.push(e);
+        } else if is_vote[i] {
+            let signer = e.get("vote").and_then(|v| v.get("witness")).and_then(Json::as_str).unwrap_or("");
+            if voter.is_some() || bound_sigil || members.contains(signer) {
+                kept.push(e);
+            }
+        } else if extra[i] {
+            kept.push(e);
+        }
+    }
+    Evidence { binds, dead, sealed, votes, log: out_log, kept }
+}
+
 /// `(v["gen"], v["tid"])` of one of our votes.
 fn vote_key(v: &Json) -> Option<(i128, String)> {
     Some((v.get("gen")?.as_int()?, v.get("tid")?.as_str()?.to_string()))
+}
+
+/// The checkpoint set `entries` of a charter whose body's `checkpoint` is `body_ck`, as
+/// `{sigil: (gen, tid)}` (`Witness._checkpoint_for`). A body without one has the empty set.
+pub(crate) fn checkpoint_for(body_ck: Option<&Json>, entries: Option<&Json>) -> Result<HashMap<String, (i128, String)>, Error> {
+    let entries = entries.filter(|e| !e.is_null());
+    let Some(ck) = body_ck else {
+        return match entries {
+            None => Ok(HashMap::new()),
+            Some(Json::Arr(a)) if a.is_empty() => Ok(HashMap::new()),
+            Some(_) => rejected("this charter carries no checkpoint"),
+        };
+    };
+    match entries {
+        Some(e) if valid_checkpoint_set(e) && ck.as_str() == Some(checkpoint_hash(e).as_str()) => Ok(e
+            .as_arr()
+            .expect("checked")
+            .iter()
+            .map(|x| {
+                let a = x.as_arr().expect("checked");
+                (a[0].as_str().expect("checked").to_string(), (a[1].as_int().expect("checked"), a[2].as_str().expect("checked").to_string()))
+            })
+            .collect()),
+        _ => rejected("checkpoint set does not match the charter"),
+    }
+}
+
+/// Written with every settled or checkpointed record (`Witness._format_entry`): a binary from
+/// before compaction refuses the unknown entry kind instead of opening a store whose
+/// checkpointed records have no log to hand over.
+fn format_entry() -> Entry {
+    ("format".into(), String::new(), Json::Int(2))
 }

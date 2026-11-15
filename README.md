@@ -73,7 +73,8 @@ $S --wallet bob   address > bob-addr.json         # bob gives this to alice
 $S --wallet alice pay bob-addr.json <id> 300 --out payment.json
 $S --wallet bob   receive payment.json [--deep]   # verifies, then takes custody
 $S --wallet bob   balance; $S --wallet bob assets; $S --wallet bob export-dossier
-$S --wallet bob   trust <other-cid>               # accept parcels homed there too
+$S --wallet bob   trust <other-cid>               # accept parcels homed there too (by default a wallet
+                                                   # trusts only its home and the directory's constellations)
 $S --wallet alice buy-stamps <cid> 10             # for homes whose witnesses require stamps
 ```
 
@@ -105,6 +106,6 @@ Payments are handed from holder to holder as files; no server stores them. Recei
 ## Status
 
 This is a **research prototype**: a complete reference implementation of the v0 draft, with an in-process network simulation.
-A witness daemon listening on a non-loopback address limits each client to 20 requests per second (bursts of 100; `--rate-limit 0` disables it) and bounds what one request can make it store ([WIRE.md "Admission control"](docs/WIRE.md#admission-control), [AI_THREAT_MODEL §2.6](docs/AI_THREAT_MODEL.md#26-resource-exhaustion-t5)). It hasn't been audited. Its JSON-over-HTTP transport is suitable for local testing, but no public, independently operated testnet has been run yet. The whitepaper's [limits and open problems](docs/WHITEPAPER.md#10-limits-and-open-problems) section lists what is still unsolved: dossier growth (recursive proofs), shared-state applications, the limits of constellation succession, and verification of the code itself (the protocol's safety theorem is machine-checked for unbounded sizes, also under rotation and succession: [VERIFICATION.md](docs/VERIFICATION.md)).
+A witness daemon listening on a non-loopback address limits each client to 20 requests per second (bursts of 100; `--rate-limit 0` disables it) and bounds what one request can make it store ([WIRE.md "Admission control"](docs/WIRE.md#admission-control), [AI_THREAT_MODEL §2.6](docs/AI_THREAT_MODEL.md#26-resource-exhaustion-t5)). It hasn't been audited. Its JSON-over-HTTP transport is suitable for local testing, but no public, independently operated testnet has been run yet. The whitepaper's [limits and open problems](docs/WHITEPAPER.md#10-limits-and-open-problems) section lists what is still unsolved: dossier growth for payees that hold none of a coin's history (recursive proofs; payers already leave out what the payee holds, and witness records shrink to bare checkpoint entries at each rotation: [COMPACTION.md](docs/COMPACTION.md)), shared-state applications, the limits of constellation succession, and verification of the code itself (the protocol's safety theorem is machine-checked for unbounded sizes, also under rotation and succession: [VERIFICATION.md](docs/VERIFICATION.md)).
 
 MIT licensed.

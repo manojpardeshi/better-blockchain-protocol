@@ -197,6 +197,61 @@ pub fn acked_by(acks: Option<&Json>, committee: &[String], cid: &str, version: i
 
 /// `proves_dead`: does `proof` show that transition `tid` (with `header`) can never be sealed?
 /// The evidence must come from the target sigil's home (SPEC §3.9).
+/// `unverifiable_death`: does `proof` pass every check of [`proves_dead`] that needs no charter,
+/// while the charter version its evidence names is one `registry` does not know (no chain for the
+/// home, or not that version yet)? It cannot be verified here, but may be by someone who knows it.
+pub fn unverifiable_death(header: &Json, tid: &str, proof: &Json, registry: &Registry) -> bool {
+    unverifiable_inner(header, tid, proof, registry).unwrap_or(false)
+}
+
+fn unverifiable_inner(header: &Json, tid: &str, proof: &Json, registry: &Registry) -> Option<bool> {
+    let target = proof.get("sigil")?.as_str()?;
+    let gen = proof.get("gen")?.as_int()?;
+    let wanted = Json::Arr(vec![Json::str(target), Json::Int(gen)]);
+    let p = proof.get("parcel")?;
+    let home = p.get("home")?;
+    if !header.get("inputs")?.as_arr()?.iter().any(|x| *x == wanted)
+        || sigil_of(home, p.get("lock")?, p.get("salt")?) != target
+    {
+        return Some(false);
+    }
+    let home = home.as_str()?;
+    let str_is = |v: &Json, k: &str, want: &str| v.get(k).and_then(Json::as_str) == Some(want);
+    let other_tid = |v: &Json| v.get("tid").and_then(Json::as_str).is_some_and(|t| t != tid);
+    let version = match proof.get("kind")?.as_str()? {
+        "seal" => {
+            let seal = proof.get("seal")?;
+            let votes = votes_of_seal(seal)?;
+            if !(str_is(seal, "sigil", target)
+                && seal.get("gen")?.as_int()? == gen
+                && other_tid(seal)
+                && str_is(seal, "constellation", home)
+                && !votes.is_empty())
+            {
+                return Some(false);
+            }
+            seal.get("version")?.as_int()?
+        }
+        "votes" => {
+            let votes = proof.get("votes")?.as_arr()?;
+            let version = votes.first()?.get("version")?.as_int()?;
+            for v in votes {
+                if !(str_is(v, "sigil", target)
+                    && v.get("gen")?.as_int()? == gen
+                    && other_tid(v)
+                    && str_is(v, "constellation", home)
+                    && v.get("version")?.as_int()? == version)
+                {
+                    return Some(false);
+                }
+            }
+            version
+        }
+        _ => return Some(false),
+    };
+    Some(registry.charter(home, version).is_none())
+}
+
 pub fn proves_dead(header: &Json, tid: &str, proof: &Json, registry: &Registry, batch: bool) -> bool {
     proves_dead_inner(header, tid, proof, registry, batch).unwrap_or(false)
 }
@@ -243,4 +298,44 @@ fn proves_dead_inner(header: &Json, tid: &str, proof: &Json, registry: &Registry
         }
         _ => Some(false),
     }
+}
+
+/// One input of a settlement certificate: `(sigil, gen, home, seal)`.
+pub type SettledInput = (String, i128, String, Json);
+
+/// `parse_settlement`: the shape of a settlement certificate (SPEC §3.12), without its
+/// signatures. `(tid, inputs)` in header order, or `None` if malformed: inputs and header
+/// disagree, a parcel does not hash to its sigil, or a seal names another sigil, generation,
+/// transition or home.
+pub fn parse_settlement(cert: &Json) -> Option<(String, Vec<SettledInput>)> {
+    let header = cert.get("header")?;
+    let ins = cert.get("inputs")?.as_arr()?;
+    let hin = header.get("inputs")?.as_arr()?;
+    if ins.is_empty() || ins.len() != hin.len() {
+        return None;
+    }
+    let tid = crate::model::transition_id(header);
+    let mut out = Vec::with_capacity(ins.len());
+    let mut seen: HashSet<&str> = HashSet::new();
+    for (pair, e) in hin.iter().zip(ins) {
+        let [s, g] = <&[Json; 2]>::try_from(pair.as_arr()?.as_slice()).ok()?;
+        let (s, g) = (s.as_str()?, g.as_int()?);
+        let p = e.get("parcel")?;
+        let seal = e.get("seal")?;
+        if seen.contains(s) || g < 0 || p.as_obj().is_none() || seal.as_obj().is_none() {
+            return None;
+        }
+        let home = p.get("home")?;
+        if sigil_of(home, p.get("lock")?, p.get("salt")?) != s {
+            return None;
+        }
+        let home = home.as_str()?;
+        let str_is = |k: &str, want: &str| seal.get(k).and_then(Json::as_str) == Some(want);
+        if !(str_is("sigil", s) && seal.get("gen")?.as_int()? == g && str_is("tid", &tid) && str_is("constellation", home)) {
+            return None;
+        }
+        seen.insert(s);
+        out.push((s.to_string(), g, home.to_string(), seal.clone()));
+    }
+    Some((tid, out))
 }

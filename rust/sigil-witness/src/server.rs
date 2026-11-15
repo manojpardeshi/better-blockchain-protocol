@@ -4,6 +4,7 @@
 //! |--------|-----------------|---------------------|------------------------|
 //! | GET    | `/v0/info`      | —                   | `{pk, constellation, version, frozen, stamps: {n, e} \| null}` |
 //! | GET    | `/v0/charters`  | —                   | `{cid: [charter, …]}`  |
+//! | GET    | `/v0/charters/<cid>` | —              | `[charter, …]`, `[]` if unknown |
 //! | POST   | `/v0/spend`     | `{request}`         | vote                   |
 //! | POST   | `/v0/release`   | `{sigil, proof}`    | new generation         |
 //! | POST   | `/v0/status`    | `{sigil}`           | `{gen, tid, votes}`    |
@@ -60,9 +61,9 @@ use crate::witness::{Error, Outcome, Witness};
 pub const MAX_BODY: usize = 1 << 20;
 /// ADOPT carries every predecessor's evidence.
 pub const MAX_ADMIN_BODY: usize = 256 << 20;
-pub const ADMIN_METHODS: [&str; 2] = ["freeze", "adopt"];
+pub const ADMIN_METHODS: [&str; 3] = ["freeze", "adopt", "settled"];
 /// A standby member's operator calls (SPEC §5.5).
-pub const STANDBY_ADMIN_METHODS: [&str; 3] = ["standby", "succeed", "probe"];
+pub const STANDBY_ADMIN_METHODS: [&str; 4] = ["standby", "succeed", "probe", "settled"];
 
 pub fn reply(code: StatusCode, v: &Json) -> Response {
     (code, [(header::CONTENT_TYPE, "application/json")], v.canonical()).into_response()
@@ -115,6 +116,7 @@ pub fn router_with_limits(w: Arc<Witness>, admin_token: Option<String>, limiter:
     let r = Router::new()
         .route("/v0/info", get(info))
         .route("/v0/charters", get(charters))
+        .route("/v0/charters/:cid", get(charter_chain))
         .route("/v0/proofs", get(proofs))
         .route("/v0/:method", post(call).fallback(|| async { error(StatusCode::NOT_FOUND, "bad_request", "unknown path", None) }))
         .fallback(|| async { error(StatusCode::NOT_FOUND, "bad_request", "unknown path", None) })
@@ -154,6 +156,12 @@ async fn info(State(app): State<App>) -> Response {
 
 async fn charters(State(app): State<App>) -> Response {
     reply(StatusCode::OK, &obj([("ok", app.w.registry().to_json())]))
+}
+
+/// One constellation's chain (`[]` if unknown): what a client needs, however many other
+/// chains gossip has handed this witness.
+async fn charter_chain(State(app): State<App>, Path(cid): Path<String>) -> Response {
+    reply(StatusCode::OK, &obj([("ok", Json::Arr(app.w.registry().raw_chain(&cid).to_vec()))]))
 }
 
 async fn proofs(State(app): State<App>) -> Response {
@@ -238,13 +246,22 @@ async fn call(State(app): State<App>, Path(method): Path<String>, headers: Heade
             (Err(r), _) | (_, Err(r)) => Err(r),
         },
         "status" => field(&body, "sigil").map(|s| w.status(s)),
+        "settle" => match field(&body, "settlement") {
+            Ok(c) => {
+                let c = c.clone();
+                // A certificate carries a seal per input.
+                blocking(move || w.settle(&c)).await
+            }
+            Err(r) => Err(r),
+        },
+        "settled" => Ok((Ok(w.settled_records()), 0)),
         "heartbeat" => field(&body, "challenge").map(|c| w.heartbeat(c)),
         "sell_stamp" => field(&body, "blinded").map(|b| w.sell_stamp(b)),
         "gossip" => blocking(move || w.gossip(&body)).await,
         "freeze" => match field(&body, "charter") {
             Ok(c) => {
-                let c = c.clone();
-                blocking(move || w.freeze(&c)).await
+                let (c, ck) = (c.clone(), body.get("checkpoint").cloned());
+                blocking(move || w.freeze_with(&c, ck.as_ref())).await
             }
             Err(r) => Err(r),
         },
@@ -259,7 +276,7 @@ async fn call(State(app): State<App>, Path(method): Path<String>, headers: Heade
                         let null = Json::Null;
                         let (c, v) = (body.get("constellation").unwrap_or(&null), body.get("version").unwrap_or(&null));
                         let snaps = body.get("snapshots").and_then(Json::as_arr).map(Vec::as_slice).unwrap_or(&[]);
-                        w.adopt_once(c, v, snaps)
+                        w.adopt_once_with(c, v, snaps, body.get("checkpoint"))
                     })
                     .await
                 }
@@ -293,6 +310,7 @@ pub fn standby_router(s: Arc<Standby>, admin_token: Option<String>, limiter: Opt
     let r = Router::new()
         .route("/v0/info", get(sb_info))
         .route("/v0/charters", get(sb_charters))
+        .route("/v0/charters/:cid", get(sb_charter_chain))
         .route("/v0/proofs", get(sb_proofs))
         .route("/v0/:method", post(sb_call).fallback(|| async { error(StatusCode::NOT_FOUND, "bad_request", "unknown path", None) }))
         .fallback(|| async { error(StatusCode::NOT_FOUND, "bad_request", "unknown path", None) })
@@ -306,6 +324,10 @@ async fn sb_info(State(app): State<StandbyApp>) -> Response {
 
 async fn sb_charters(State(app): State<StandbyApp>) -> Response {
     reply(StatusCode::OK, &obj([("ok", app.s.registry().to_json())]))
+}
+
+async fn sb_charter_chain(State(app): State<StandbyApp>, Path(cid): Path<String>) -> Response {
+    reply(StatusCode::OK, &obj([("ok", Json::Arr(app.s.registry().raw_chain(&cid).to_vec()))]))
 }
 
 async fn sb_proofs(State(app): State<StandbyApp>) -> Response {
@@ -336,6 +358,7 @@ async fn sb_call(State(app): State<StandbyApp>, Path(method): Path<String>, head
         },
         "gossip" => blocking(move || s.gossip(&body)).await,
         "status" => field(&body, "sigil").map(|x| s.status(x)),
+        "settled" => Ok((Ok(s.settled_records()), 0)),
         "standby" => {
             let checked = field(&body, "constellation")
                 .and_then(|_| field(&body, "version"))
@@ -347,7 +370,7 @@ async fn sb_call(State(app): State<StandbyApp>, Path(method): Path<String>, head
                         let null = Json::Null;
                         let (c, v) = (body.get("constellation").unwrap_or(&null), body.get("version").unwrap_or(&null));
                         let snaps = body.get("snapshots").and_then(Json::as_arr).map(Vec::as_slice).unwrap_or(&[]);
-                        s.enter(c, v, snaps)
+                        s.enter(c, v, snaps, body.get("checkpoint"))
                     })
                     .await
                 }
@@ -356,8 +379,8 @@ async fn sb_call(State(app): State<StandbyApp>, Path(method): Path<String>, head
         }
         "succeed" => match field(&body, "charter") {
             Ok(c) => {
-                let (c, sigs) = (c.clone(), body.get("sigs").cloned());
-                blocking(move || s.succeed(&c, sigs.as_ref())).await
+                let (c, sigs, ck) = (c.clone(), body.get("sigs").cloned(), body.get("checkpoint").cloned());
+                blocking(move || s.succeed(&c, sigs.as_ref(), ck.as_ref())).await
             }
             Err(r) => Err(r),
         },

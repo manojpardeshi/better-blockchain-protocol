@@ -276,10 +276,13 @@ def gossip_round(network, store: GossipStore) -> dict:
     """
     from .server import Unreachable  # avoid an import cycle (server imports gossip)
 
+    # The constellations the network is configured with: a peer whose every chain is more
+    # than one reply can carry is asked for these one by one.
+    wanted = [] if isinstance(network, list) else list(getattr(network, "urls", {}))
     views = []
     for peer in _peers(network):
         try:
-            theirs = peer.pull()
+            theirs = peer.pull(wanted) if wanted else peer.pull()
         except Rejected:  # includes Unreachable
             continue
         if isinstance(theirs, dict):

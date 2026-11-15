@@ -91,6 +91,8 @@ def proc_stats(pid: int) -> dict | None:
         fds = len(os.listdir(f"/proc/{pid}/fd"))
     except (FileNotFoundError, ProcessLookupError, PermissionError):
         return None
+    if "VmRSS" not in status:  # a zombie: it exited (e.g. stopped by a rotation) and is not reaped yet
+        return None
     return {"rss": int(status["VmRSS"].split()[0]) * 1024, "threads": int(status["Threads"]), "fds": fds}
 
 
@@ -118,10 +120,37 @@ def http(url: str, path: str, body=None, *, raw: bytes | None = None, method: st
             code, text, hdrs = r.status, r.read(), {k.lower(): v for k, v in r.headers.items()}
     except urllib.error.HTTPError as e:
         code, text, hdrs = e.code, e.read(), {k.lower(): v for k, v in e.headers.items()}
+    except urllib.error.URLError as e:
+        if not isinstance(e.reason, (BrokenPipeError, ConnectionResetError)) or data is None:
+            raise
+        # A server may answer an oversized body and close before we finish sending it:
+        # send what it takes, then read the reply it already wrote.
+        code, text, hdrs = _send_then_read(url + path, method, data, headers or {}, timeout)
     try:
         return code, json.loads(text), hdrs
     except ValueError:
         return code, None, hdrs
+
+
+def _send_then_read(url: str, method: str, data: bytes, headers: dict, timeout: float):
+    import socket
+    from http.client import HTTPResponse
+    from urllib.parse import urlsplit
+    u = urlsplit(url)
+    sock = socket.create_connection((u.hostname, u.port), timeout=timeout)
+    try:
+        head = [f"{method} {u.path or '/'} HTTP/1.1", f"Host: {u.netloc}", "Connection: close",
+                f"Content-Length: {len(data)}", "Content-Type: application/json"]
+        head += [f"{k}: {v}" for k, v in headers.items() if k.lower() not in ("content-type", "host")]
+        try:
+            sock.sendall(("\r\n".join(head) + "\r\n\r\n").encode() + data)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        resp = HTTPResponse(sock)
+        resp.begin()
+        return resp.status, resp.read(), {k.lower(): v for k, v in resp.getheaders()}
+    finally:
+        sock.close()
 
 
 def wait_http(url: str, timeout: float = 30, proc: subprocess.Popen | None = None, log: str | None = None) -> None:

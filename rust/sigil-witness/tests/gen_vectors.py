@@ -20,7 +20,7 @@ import sys
 from dataclasses import asdict
 
 from sigil import locks, model
-from sigil.charter import (MAX_CHARTER_BYTES, Registry, charter_body, charter_hash, constellation_id, sign_charter,
+from sigil.charter import (MAX_CHARTER_BYTES, Registry, charter_body, charter_hash, checkpoint_hash, constellation_id, sign_charter,
                            successor_clause)
 from sigil.gossip import GossipStore
 from sigil.crypto import KeyPair, verify
@@ -1211,6 +1211,188 @@ def succession_script():
     return sc.done(registries={"v0": {X: chain0}, "v1": {X: chain1}}, cid=X)
 
 
+def compaction_script():
+    """Settlement and checkpoints (SPEC §5.7) on witnesses and a standby member.
+
+    X v0 = x0..x3 (no committee). Replayed by the Rust test: x0 (SETTLE and its refusals,
+    settled records refusing votes and releases, SETTLED, FREEZE with a checkpoint and its
+    refusals), a0 (a member of v1: ADOPT with the checkpoint set, refusing wrong sets) and,
+    for the standby side, k0 (a member of Y v1's committee: STANDBY with the checkpoint, the
+    extension rule at SUCCEED, a dead-man successor carrying exactly the checkpoint).
+    """
+    old = [kp(1400 + i) for i in range(4)]
+    body0 = charter_body("cmp", 0, [k.pk for k in old], None)
+    X = constellation_id(body0)
+    chain0 = [{"body": body0, "sigs": {}}]
+    reg0 = Registry()
+    reg0.add_chain(X, chain0)
+    clock = [1700000000]
+    sc = Script(clock)
+    o = [Witness(k, reg0, lambda: clock[0]) for k in old]
+    for w in o:
+        w.join(X, 0)
+    sc.add("x0", o[0], 1400, "v0")
+    owner = kp(1450)
+    exp = clock[0] + 10 ** 6
+    t = [clock[0] + 100]
+
+    def mk(salt, home=X):
+        p = {"home": home, "lock": locks.sig(owner.pk), "salt": salt}
+        return p, model.sigil_of(p)
+
+    def hdr(inputs, tag):
+        return {"inputs": [list(i) for i in inputs], "body": tag * 32}
+
+    def req(h, sigil, p):
+        u = locks.empty_unlock(exp)
+        u["sigs"][owner.pk] = locks.sign_unlock(owner, sigil, model.transition_id(h), exp)
+        return {"sigil": sigil, "header": h, "home": p["home"], "lock": p["lock"], "salt": p["salt"], "unlock": u}
+
+    def tgt(p):
+        return {"home": p["home"], "lock": p["lock"], "salt": p["salt"]}
+
+    def cert(h, parts):
+        return {"header": h, "inputs": [{"parcel": tgt(p), "seal": s} for p, s in parts]}
+
+    def spend(i, h, sigil, p):
+        t[0] += 1
+        if i == 0:
+            return sc.run("x0", "spend", t[0], req(h, sigil, p)).get("ok")
+        clock[0] = t[0]
+        return o[i].spend(req(h, sigil, p))
+
+    def call(i, op, *args):
+        t[0] += 1
+        if i == 0:
+            return sc.run("x0", op, t[0], *args)
+        clock[0] = t[0]
+        return getattr(o[i], op)(*args)
+
+    pA, sA = mk("a1")
+    pB, sB = mk("b1")
+    pX, xB = mk("b2")
+    pY, sY = mk("y1")
+    pL, sL = mk("l1")
+    TA = hdr([(sA, 0)], "a1")
+    TB, TyB = hdr([(sB, 0), (xB, 0)], "b1"), hdr([(xB, 0)], "b2")
+    TY = hdr([(sY, 0)], "y1")
+    TL = hdr([(sL, 0)], "l1")
+    seal_A = model.seal_from_votes([spend(i, TA, sA, pA) for i in range(4)])
+    seal_yB = model.seal_from_votes([spend(i, TyB, xB, pX) for i in range(4)])
+    seal_bB = model.seal_from_votes([spend(i, TB, sB, pB) for i in range(1, 4)])   # x0 never votes TB
+    seal_Y = model.seal_from_votes([spend(i, TY, sY, pY) for i in range(1, 4)])    # x0 never saw TY
+    for i in range(4):
+        spend(i, TL, sL, pL)                                    # L: bound, never settled
+    tidA = model.transition_id(TA)
+    good = cert(TA, [(pA, seal_A)])
+    for c in ("junk", {"header": TA}, cert(TA, []), cert(TB, [(pB, seal_bB)]),     # malformed, partial
+              cert(TB, [(pB, seal_bB), (pX, seal_yB)]),                                # x's seal is for TyB
+              cert(TB, [(pX, seal_bB), (pB, seal_yB)]),                                # parcels swapped
+              cert(TA, [(pA, dict(seal_A, votes=seal_A["votes"][:2]))]),               # below quorum
+              cert(TA, [(pA, dict(seal_A, gen=True))]),                                # a bool generation
+              cert(hdr([(sA, 0), (sA, 0)], "aa"), [(pA, seal_A), (pA, seal_A)])):      # duplicate sigil
+        call(0, "settle", c)
+    Z = constellation_id(charter_body("other", 0, [kp(1499).pk], None))
+    pZ, sZ = mk("z1", Z)
+    TZ = hdr([(sZ, 0)], "z1")
+    call(0, "settle", cert(TZ, [(pZ, dict(seal_A, sigil=sZ, constellation=Z, tid=model.transition_id(TZ)))]))  # nothing lives here
+    for i in range(4):
+        call(i, "settle", good)
+    call(0, "settle", good)                                     # again: nothing changes
+    for i in range(4):
+        call(i, "settle", cert(TY, [(pY, seal_Y)]))            # x0 settles a binding it never saw
+    sc.run("x0", "record", t[0], sA)
+    sc.run("x0", "record", t[0], sY)
+    sc.run("x0", "spend", t[0] + 1, req(TA, sA, pA))           # the vote it holds
+    sc.run("x0", "spend", t[0] + 2, req(hdr([(sA, 0)], "a2"), sA, pA))   # conflict
+    sc.run("x0", "spend", t[0] + 3, req(hdr([(sA, 1)], "a3"), sA, pA))   # conflict (another tid)
+    sc.run("x0", "spend", t[0] + 4, req(TY, sY, pY))           # consumed: no new vote even for TY
+    sc.run("x0", "release", t[0] + 5, sA, {"kind": "seal", "sigil": sA, "gen": 0, "parcel": tgt(pA), "seal": seal_A})
+    sc.run("x0", "settled_records", t[0] + 6)
+    t[0] += 10
+
+    ck = [[sA, 0, tidA]]                                        # x0 never saw TY: sY is not settled there
+    other = [[sY, 0, model.transition_id(TY)]]
+    keys1 = [kp(1410), kp(1411)]
+    nxt = charter_body("cmp", 1, [k.pk for k in keys1], charter_hash(body0), None, checkpoint_hash(ck))
+    plain = charter_body("cmp", 1, [k.pk for k in keys1], charter_hash(body0))
+    live = sorted(ck + [[sL, 0, model.transition_id(TL)]])
+    bad_live = charter_body("cmp", 1, [k.pk for k in keys1], charter_hash(body0), None, checkpoint_hash(live))
+    sc.run("x0", "freeze", t[0], nxt)                          # no set given
+    sc.run("x0", "freeze", t[0], nxt, other)                   # a set that does not match the hash
+    sc.run("x0", "freeze", t[0], nxt, sorted(live, reverse=True))   # unsorted
+    sc.run("x0", "freeze", t[0], plain, ck)                    # a set for a charter without one
+    sc.run("x0", "freeze", t[0], bad_live, live)               # a live (unsettled) sigil
+    sc.run("x0", "freeze", t[0], dict(nxt, checkpoint="AB" * 32), ck)   # not a lowercase hash
+    snap0 = sc.run("x0", "freeze", t[0] + 1, nxt, ck)["ok"]["snapshot"]
+    sc.run("x0", "freeze", t[0] + 2, nxt, ck)                  # the same successor again
+    sigs, snaps = {old[0].pk: sign_charter(old[0], nxt)}, [snap0]
+    for w in o[1:3]:
+        sig, snap = w.freeze(nxt, ck)
+        sigs[w.pk] = sig
+        snaps.append(snap)
+    reg1 = Registry()
+    reg1.add_chain(X, chain0 + [{"body": nxt, "sigs": sigs}])
+    # A lying predecessor: evidence for a checkpointed sigil at a later generation.
+    lie = {sA: [{"kind": "bind", "gen": 1, "auth": {k: v for k, v in req(hdr([(sA, 1)], "a3"), sA, pA).items() if k != "sigil"}}]}
+    sc.add("a0", Witness(keys1[0], reg1, lambda: clock[0]), 1410, "v1", adopt=True)
+    for bad in (None, [], other, [[sA, 0, "11" * 32]]):
+        sc.run("a0", "adopt", t[0] + 3, X, 1, snaps, bad)
+    sc.run("a0", "adopt", t[0] + 4, X, 1, snaps + [lie], ck)
+    for s in (sA, sY, sL, sB, xB):
+        sc.run("a0", "record", t[0] + 5, s)
+    sc.run("a0", "spend", t[0] + 6, req(hdr([(sA, 1)], "a3"), sA, pA))   # the owner's re-spend: refused
+    sc.run("a0", "spend", t[0] + 7, req(TL, sL, pL))           # inherited binding: votes
+    seal_L = model.seal_from_votes([o[i].status(sL)["votes"][0] for i in range(1, 4)])
+    sc.run("a0", "settle", t[0] + 7, cert(TL, [(pL, seal_L)]))   # a v0 seal: not X's current version
+    sc.run("a0", "settle", t[0] + 7, cert(hdr([(sA, 0)], "a2"), [(pA, seal_A)]))  # never rebinds (a checkpointed sigil)
+    sc.run("a0", "status", t[0] + 8, sA)
+    sc.run("a0", "settled_records", t[0] + 9)
+    # The extension rule at the next FREEZE.
+    nxt2 = charter_body("cmp", 2, [kp(1420).pk], charter_hash(nxt))
+    sc.run("a0", "freeze", t[0] + 10, nxt2)                    # drops the checkpoint
+    nxt2b = charter_body("cmp", 2, [kp(1420).pk], charter_hash(nxt), None, checkpoint_hash(other))
+    sc.run("a0", "freeze", t[0] + 11, nxt2b, other)            # drops sA
+    nxt2c = charter_body("cmp", 2, [kp(1420).pk], charter_hash(nxt), None, checkpoint_hash(ck))
+    sc.run("a0", "freeze", t[0] + 12, nxt2c, ck)               # carried over: fine
+
+    # The standby side: Y v1 carries a checkpoint and a committee.
+    D = 100
+    yw0, yk0 = [kp(1430 + i) for i in range(4)], [kp(1440 + i) for i in range(4)]
+    yw1, yk1 = [kp(1460 + i) for i in range(4)], [kp(1470 + i) for i in range(4)]
+    yb0 = charter_body("cmpy", 0, [k.pk for k in yw0], None, successor_clause([k.pk for k in yk0], D))
+    Y = constellation_id(yb0)
+    yck = sorted([["aa" * 32, 0, "bb" * 32], ["cc" * 32, 3, "dd" * 32]])
+    yb1 = charter_body("cmpy", 1, [k.pk for k in yw1], charter_hash(yb0), successor_clause([k.pk for k in yk1], D),
+                       checkpoint_hash(yck))
+    ychain = [{"body": yb0, "sigs": {}}, {"body": yb1, "sigs": {k.pk: sign_charter(k, yb1) for k in yk0}}]
+    regy = Registry()
+    regy.add_chain(Y, ychain)
+    clock[0] = t[0] + 20
+    m = sc.add_standby("k0", Standby(yk1[0], regy, lambda: clock[0]), 1470, "y1", wait=True)
+    sc.run("k0", "enter", clock[0], Y, 1, [])                  # no checkpoint set: refused
+    sc.run("k0", "enter", clock[0], Y, 1, [], yck[:1])         # a wrong set: refused
+    sc.run("k0", "enter", clock[0], Y, 1, [{"ee" * 32: [{"kind": "junk"}], yck[0][0]: [{"kind": "junk"}]}], yck)
+    sc.run("k0", "settled_records", clock[0])
+    more = sorted(yck + [["ee" * 32, 0, "ff" * 32]])
+    y2a = charter_body("cmpy", 2, [kp(1480).pk], charter_hash(yb1))
+    y2b = charter_body("cmpy", 2, [kp(1480).pk], charter_hash(yb1), None, checkpoint_hash(yck[1:]))
+    y2c = charter_body("cmpy", 2, [kp(1480).pk], charter_hash(yb1), None, checkpoint_hash(more))
+    y2d = charter_body("cmpy", 2, [kp(1480).pk], charter_hash(yb1), None, checkpoint_hash(yck))
+    t2 = clock[0] + D + 1                                      # the dead-man period passed, no heartbeats
+    sc.run("k0", "dead", t2)
+    sc.run("k0", "succeed", t2, y2a, {})                       # drops the checkpoint
+    sc.run("k0", "succeed", t2, y2b, {}, yck[1:])              # drops an entry
+    sc.run("k0", "succeed", t2, y2c, {}, more)                 # dead man: more than the checkpoint
+    coop = {k.pk: sign_charter(k, y2c) for k in yw1[:3]}
+    sc.run("k0", "succeed", t2, y2c, coop, yck)                # set does not match the hash
+    sc.run("k0", "succeed", t2, y2d, {}, yck)                  # dead man, exactly the checkpoint
+    sc.run("k0", "succeed", t2 + 1, y2d, {}, yck)              # the same successor again
+    sc.run("k0", "succeed", t2 + 2, y2c, coop, more)           # fenced for y2d already
+    del m
+    return sc.done(registries={"v0": {X: chain0}, "v1": {X: reg1.chain(X)}, "y1": {X: chain0, Y: ychain}}, cid=X)
+
+
 def ratelimit_cases():
     """``sigil.ratelimit``: token-bucket verdicts for a fixed clock script, client keys, loopback."""
     from sigil import ratelimit as RL
@@ -1246,6 +1428,7 @@ def main():
     vectors["limits"] = limits_script()
     vectors["ratelimit"] = ratelimit_cases()
     vectors["succession"] = succession_script()
+    vectors["compaction"] = compaction_script()
     json.dump(vectors, sys.stdout, sort_keys=True, indent=None, separators=(",", ":"))
     sys.stdout.write("\n")
 

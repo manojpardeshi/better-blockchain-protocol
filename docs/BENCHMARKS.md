@@ -212,6 +212,43 @@ remaining serial work is cloning the record under the lock, plus allocator and l
 * Porting the verifier to Rust would cut the constant by roughly 3–4×, going by the seal
   numbers above. It would not change the slope.
 
+### State growth under load: settlement, checkpoints and delta dossiers (soak, 600 s)
+
+`SIGIL_SOAK_SECONDS=600 SIGIL_REQUIRE_RUST=1 python -m unittest tests.integration.test_soak`
+(seed 1; `vega` rotates every 60 s, `heir` is taken over at 300 s; SPEC §5.7, §6.1,
+docs/COMPACTION.md). *Before* is the first 600 s of the 1,800 s run on the previous code
+(same seed and configuration).
+
+| | before | after |
+|---|---:|---:|
+| rotation time, v1 … v9 | 0.85, 1.21, 1.40, 1.22, 2.29, 2.00, 1.69, 2.51, 2.47 s (rising) | 3.29¹, 0.57, 0.56, 0.48, 0.69, 0.63, 0.50, 0.70, 0.67 s (flat) |
+| handover at v9 (all snapshots + checkpoint set) | not recorded; ≈ 4 × 1.2–3 KB per consumed sigil² | **99.8 KB** (708 sigils checkpointed, ≈ 140 B each) |
+| new members' stores after rotation v9 | 24.7 MB (2 Rust + 2 Python) | 3.8 MB (redb's minimum file size dominates) |
+| new members' stores, 4 Python members (v8) | 11.7 MB | 1.3 MB |
+| long-lived Rust witness: store / RSS per sealed input | 10.5 KB / 18.3 KB | 5.5 KB / 10.0 KB³ |
+| long-lived Python witness: store / RSS per sealed input | 4.2 KB / 5.9 KB | 4.7 KB / 6.1 KB⁴ |
+| Rust restart: RSS after reload / before | 1.89× | 1.66× |
+| dossier bytes per hop: mean / median / p95 | 1.35 MB / 1.15 MB / 3.26 MB | **193 KB / 10 KB / 110 KB** (a full dossier in the same run: 3.5 MB / 3.3 MB / 8.4 MB) |
+| transitions per hop: mean | 407 | 47 (full: 868) |
+| hop to a fresh holder: mean | 1.42 MB | 3.50 MB (no history to leave out) |
+| payment latency, p50 (pay / cross) | 48 / 57 ms | 32 / 37 ms (seal 15 → 20 ms, the SETTLE round included) |
+
+¹ The first rotation of the run also starts the new processes on a cold page cache.
+² Each freezing member hands over a bind entry (0.7–2.6 KB, the header is repeated in every
+input's entry) and a vote entry (0.5 KB) per consumed sigil; the 45-minute run reached 70 MB.
+³ Mostly the Rust JSON objects becoming sorted vectors instead of B-trees (a B-tree node costs
+about 600 bytes however few members it holds). Long-lived witnesses never rotate, so they keep
+full records; rotating to the same keys would compact them.
+⁴ Settled records keep their log until a checkpoint covers them; `settled` adds a few bytes.
+
+* The soak's throughput is about half the earlier run's (2,607 operations in 600 s instead of
+  5,356) because it now also builds the *full* dossier of every hop, to report what the delta
+  saved; that is measurement, outside the timed operations, whose latencies went down.
+* Delta dossiers cut a hop to the history the payee does not hold; a fresh holder still gets the
+  coin's whole history (docs/COMPACTION.md §5).
+* Every completed transition costs one SETTLE per witness of each input's home, in which the
+  witness checks *q* signatures per input.
+
 ## Caveats
 
 * **One machine, localhost.**

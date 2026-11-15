@@ -49,7 +49,38 @@ def valid_successor(succ) -> bool:
         return False
 
 
-def charter_body(name: str, version: int, witnesses: list, prev: str | None, successor: dict | None = None) -> dict:
+def valid_checkpoint_set(entries) -> bool:
+    """A checkpoint set (SPEC §3.7, §5.7): a list of ``[sigil, gen, tid]`` (strings and a
+    non-negative integer; booleans are not integers), sorted by sigil, sigils distinct."""
+    if not isinstance(entries, list):
+        return False
+    prev = None
+    for e in entries:
+        if not (isinstance(e, list) and len(e) == 3 and isinstance(e[0], str) and isinstance(e[2], str)
+                and isinstance(e[1], int) and not isinstance(e[1], bool) and e[1] >= 0):
+            return False
+        if prev is not None and not prev < e[0]:
+            return False
+        prev = e[0]
+    return True
+
+
+def checkpoint_hash(entries: list) -> str:
+    """``H("checkpoint", S)``: what a charter body's ``checkpoint`` commits to."""
+    return digest("checkpoint", entries)
+
+
+def checkpoint_entries(records: dict) -> list:
+    """A checkpoint set from ``{sigil: (gen, tid)}``, in canonical (sorted) order."""
+    return [[s, g, t] for s, (g, t) in sorted(records.items())]
+
+
+def _is_hash(x) -> bool:
+    return isinstance(x, str) and len(x) == 64 and all(c in "0123456789abcdef" for c in x)
+
+
+def charter_body(name: str, version: int, witnesses: list, prev: str | None, successor: dict | None = None,
+                 checkpoint: str | None = None) -> dict:
     if len(set(witnesses)) != len(witnesses) or not witnesses:
         raise ValueError("witness list must be non-empty and unique")
     if len(witnesses) > MAX_WITNESSES:
@@ -59,6 +90,10 @@ def charter_body(name: str, version: int, witnesses: list, prev: str | None, suc
         if not valid_successor(successor):
             raise ValueError("malformed successor clause")
         body["successor"] = {"committee": list(successor["committee"]), "dead_man": successor["dead_man"]}
+    if checkpoint is not None:
+        if not _is_hash(checkpoint):
+            raise ValueError("a checkpoint is a 64-character lowercase hex hash")
+        body["checkpoint"] = checkpoint
     return body
 
 
@@ -124,6 +159,8 @@ def verify_chain(cid: str, chain: list) -> bool:
         if len(ws) > MAX_WITNESSES or len(canonical(c)) > MAX_CHARTER_BYTES:
             return False
         if "successor" in c["body"] and not valid_successor(c["body"]["successor"]):
+            return False
+        if "checkpoint" in c["body"] and not _is_hash(c["body"]["checkpoint"]):
             return False
     for prev, cur in zip(chain, chain[1:]):
         pb, cb = prev["body"], cur["body"]

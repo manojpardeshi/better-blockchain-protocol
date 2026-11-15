@@ -17,7 +17,6 @@
 //! the parser refuses it, so the witness rejects the request: being stricter than the reference
 //! can only make it abstain, never vote where the reference would not.
 
-use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
 /// Deepest nesting the parser accepts (Python's limit is the interpreter recursion limit).
@@ -31,10 +30,119 @@ pub enum Json {
     Float(f64),
     Str(String),
     Arr(Vec<Json>),
-    Obj(BTreeMap<String, Json>),
+    Obj(Map),
 }
 
-pub type Map = BTreeMap<String, Json>;
+
+/// A JSON object: its members sorted by key (code point order), keys unique.
+///
+/// A sorted vector instead of a `BTreeMap`: every vote, lock and header a witness keeps is a
+/// small object, and a B-tree node costs about 600 bytes however few members it holds, which
+/// made a Rust record about three times the size of the reference's (docs/COMPACTION.md §1).
+/// Lookups are binary searches; objects are built in one go (`collect`, the parser), and the
+/// rare `insert` into a large object costs a shift.
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct Map(Vec<(String, Json)>);
+
+impl Map {
+    pub fn new() -> Map {
+        Map(Vec::new())
+    }
+
+    fn find(&self, k: &str) -> Result<usize, usize> {
+        self.0.binary_search_by(|(x, _)| x.as_str().cmp(k))
+    }
+
+    pub fn get(&self, k: &str) -> Option<&Json> {
+        self.find(k).ok().map(|i| &self.0[i].1)
+    }
+
+    pub fn get_mut(&mut self, k: &str) -> Option<&mut Json> {
+        self.find(k).ok().map(move |i| &mut self.0[i].1)
+    }
+
+    pub fn contains_key(&self, k: &str) -> bool {
+        self.find(k).is_ok()
+    }
+
+    /// Insert or replace (the previous value is returned, as `BTreeMap::insert` does).
+    pub fn insert(&mut self, k: String, v: Json) -> Option<Json> {
+        match self.find(&k) {
+            Ok(i) => Some(std::mem::replace(&mut self.0[i].1, v)),
+            Err(i) => {
+                self.0.insert(i, (k, v));
+                None
+            }
+        }
+    }
+
+    pub fn remove(&mut self, k: &str) -> Option<Json> {
+        self.find(k).ok().map(|i| self.0.remove(i).1)
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn iter(&self) -> impl DoubleEndedIterator<Item = (&String, &Json)> + ExactSizeIterator + Clone {
+        self.0.iter().map(|(k, v)| (k, v))
+    }
+
+    pub fn keys(&self) -> impl DoubleEndedIterator<Item = &String> + ExactSizeIterator + Clone {
+        self.0.iter().map(|(k, _)| k)
+    }
+
+    pub fn values(&self) -> impl DoubleEndedIterator<Item = &Json> + ExactSizeIterator + Clone {
+        self.0.iter().map(|(_, v)| v)
+    }
+}
+
+impl FromIterator<(String, Json)> for Map {
+    /// Sorted by key; of duplicate keys the last one wins (as `BTreeMap` and Python's `dict`).
+    fn from_iter<I: IntoIterator<Item = (String, Json)>>(it: I) -> Map {
+        let mut v: Vec<(String, Json)> = it.into_iter().collect();
+        v.sort_by(|a, b| a.0.cmp(&b.0)); // stable: duplicates keep their order
+        let mut out: Vec<(String, Json)> = Vec::with_capacity(v.len());
+        for (k, x) in v {
+            match out.last_mut() {
+                Some(last) if last.0 == k => last.1 = x,
+                _ => out.push((k, x)),
+            }
+        }
+        out.shrink_to_fit();
+        Map(out)
+    }
+}
+
+impl std::ops::Index<&str> for Map {
+    type Output = Json;
+    fn index(&self, k: &str) -> &Json {
+        self.get(k).expect("no such key")
+    }
+}
+
+impl<'a> IntoIterator for &'a Map {
+    type Item = (&'a String, &'a Json);
+    type IntoIter = std::iter::Map<std::slice::Iter<'a, (String, Json)>, fn(&'a (String, Json)) -> (&'a String, &'a Json)>;
+    fn into_iter(self) -> Self::IntoIter {
+        fn pair(e: &(String, Json)) -> (&String, &Json) {
+            (&e.0, &e.1)
+        }
+        self.0.iter().map(pair as fn(&'a (String, Json)) -> (&'a String, &'a Json))
+    }
+}
+
+impl IntoIterator for Map {
+    type Item = (String, Json);
+    type IntoIter = std::vec::IntoIter<(String, Json)>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.into_iter()
+    }
+}
 
 impl Json {
     pub fn str(s: impl Into<String>) -> Json {
@@ -384,11 +492,11 @@ impl<'a> Parser<'a> {
             }
             Some(b'{') => {
                 self.i += 1;
-                let mut out = Map::new();
+                let mut out: Vec<(String, Json)> = Vec::new();
                 self.ws();
                 if self.peek() == Some(b'}') {
                     self.i += 1;
-                    return Ok(Json::Obj(out));
+                    return Ok(Json::Obj(Map::new()));
                 }
                 loop {
                     self.ws();
@@ -403,13 +511,13 @@ impl<'a> Parser<'a> {
                     self.i += 1;
                     self.ws();
                     let v = self.value(depth + 1)?;
-                    out.insert(k, v); // last duplicate wins, as in Python
+                    out.push((k, v)); // the last duplicate wins (Map::from_iter), as in Python
                     self.ws();
                     match self.peek() {
                         Some(b',') => self.i += 1,
                         Some(b'}') => {
                             self.i += 1;
-                            return Ok(Json::Obj(out));
+                            return Ok(Json::Obj(out.into_iter().collect()));
                         }
                         _ => return Err(self.err("expected ',' or '}'")),
                     }

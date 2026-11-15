@@ -123,6 +123,16 @@ class RotationTests(IntegrationCase):
         self.assertTrue(all(RemoteStandby(u).info()["fenced"] for u in committee))
         self.assertEqual({RemoteStandby(u).version for u in c.urls(nk)}, {1})
 
+        # The registry file still holds version 0 only. Killed and restarted now, the new members
+        # and standby members still know version 1: each kept the chain it learned (by gossip,
+        # ADOPT or STANDBY) in its store. Before, a new member refused to vote ("own charter
+        # version unknown") until someone gossiped the chain to it again.
+        for i in new + nk:
+            c.restart(i)
+        for u in c.urls(new) + c.urls(nk):
+            self.assertEqual(len(RemoteStandby(u).charters()[S]), 2, u)
+        self.assertEqual({RemoteStandby(u).version for u in c.urls(nk)}, {1})
+
         # The in-flight payment completes under version 1 (re-authorising the same tid), with
         # acks from the new committee; history sealed by v0 is deep-confirmed against v1.
         again = alice.authorise(header, body)
