@@ -2,7 +2,7 @@
 //! members of its version for heartbeats (SPEC §5.5). One request per connection, `http://` only,
 //! no new dependencies. Nothing it reads is trusted: callers verify what comes back.
 
-use std::io::{ErrorKind, Read, Write};
+use std::io::{self, ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::time::{Duration, Instant};
 
@@ -26,6 +26,16 @@ fn left(url: &str, deadline: Instant, timeout: Duration) -> Result<Duration, Str
 // DNS may return an unreachable address first. Reserve a share of the connect
 // budget for every remaining address while respecting the exchange deadline.
 fn connect_any(url: &str, addrs: impl IntoIterator<Item = SocketAddr>, deadline: Instant, timeout: Duration) -> Result<TcpStream, String> {
+    connect_any_with(url, addrs, deadline, timeout, TcpStream::connect_timeout)
+}
+
+fn connect_any_with(
+    url: &str,
+    addrs: impl IntoIterator<Item = SocketAddr>,
+    deadline: Instant,
+    timeout: Duration,
+    mut connect: impl FnMut(&SocketAddr, Duration) -> io::Result<TcpStream>,
+) -> Result<TcpStream, String> {
     let addrs: Vec<_> = addrs.into_iter().collect();
     if addrs.is_empty() {
         return Err(format!("{url}: no address"));
@@ -36,7 +46,7 @@ fn connect_any(url: &str, addrs: impl IntoIterator<Item = SocketAddr>, deadline:
         if slice.is_zero() {
             return Err(format!("{url}: connection timed out"));
         }
-        match TcpStream::connect_timeout(addr, slice) {
+        match connect(addr, slice) {
             Ok(stream) => return Ok(stream),
             Err(error) => last_error = error.to_string(),
         }
@@ -120,6 +130,38 @@ mod tests {
         let unreachable: SocketAddr = "127.0.0.1:0".parse().unwrap();
         let stream = connect_any("test", [unreachable, reachable], Instant::now() + Duration::from_secs(4), Duration::from_secs(1)).unwrap();
         assert_eq!(stream.peer_addr().unwrap(), reachable);
+    }
+
+    /// A timed-out first address (as with a blackholed DNS result) still leaves
+    /// a connect budget for the next address. Simulating the OS timeout keeps
+    /// the test independent of network routes and elapsed wall-clock time.
+    #[test]
+    fn tries_next_address_after_connect_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let reachable = listener.local_addr().unwrap();
+        let blackholed: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let mut attempts = Vec::new();
+        let stream = connect_any_with(
+            "test",
+            [blackholed, reachable],
+            Instant::now() + Duration::from_secs(4),
+            Duration::from_secs(1),
+            |addr, slice| {
+                attempts.push((*addr, slice));
+                if *addr == blackholed {
+                    Err(io::Error::new(ErrorKind::TimedOut, "simulated blackhole"))
+                } else {
+                    TcpStream::connect_timeout(addr, slice)
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(stream.peer_addr().unwrap(), reachable);
+        assert_eq!(attempts.len(), 2);
+        assert_eq!(attempts[0].0, blackholed);
+        assert!(attempts[0].1 <= Duration::from_millis(500), "first attempt used too much connect budget");
+        assert_eq!(attempts[1].0, reachable);
+        assert!(attempts[1].1 > Duration::ZERO);
     }
 
     /// A member that trickles its reply one byte at a time, each just inside the socket
