@@ -68,6 +68,9 @@ class WitnessStore:
         state = {"pk": None, "member": None, "frozen": False, "records": {}, "stamps": set(), "charters": {}}
         for kind, key, value in self.db.execute("SELECT kind, key, value FROM log ORDER BY seq"):
             v = json.loads(value)
+            if kind == "format" and not (isinstance(v, int) and not isinstance(v, bool) and v <= 2):
+                # 2 may hold settled or checkpointed records (SPEC §5.7); a later format is refused.
+                raise ValueError(f"store format {v!r} is newer than this version reads")
             if kind == "charter":
                 state["charters"][key] = v
             elif kind == "record":
