@@ -688,8 +688,7 @@ class RemoteNetwork:
                 olds.append(RemoteWitness(url, self.timeout, admin_token=token(url)))
             except Rejected:
                 continue
-        ck = plan_checkpoint(cur, settled_answers([w for w in olds if w.pk in cur["witnesses"]]), compact,
-                             quorum(len(cur["witnesses"])))
+        ck = plan_checkpoint(cur, settled_answers([w for w in olds if w.pk in cur["witnesses"]]), compact)
         ck = _gate_checkpoint(ck, cur, new + standbys)
         nxt = charter_body(cur["name"], cur["version"] + 1, [w.pk for w in new], charter_hash(cur), succ,
                            checkpoint_hash(ck) if ck else None)

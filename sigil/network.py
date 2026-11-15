@@ -16,17 +16,19 @@ from .succession import Standby
 from .witness import Rejected, Witness
 
 
-def plan_checkpoint(cur: dict, answers: list, compact: bool = True, need: int | None = None) -> list:
+def plan_checkpoint(cur: dict, answers: list, compact: bool = True) -> list:
     """The checkpoint set to offer for the version after ``cur`` (SPEC §5.7).
 
     ``answers`` are members' SETTLED answers. The current version's own set (checked
     against ``cur``'s hash) is always kept: members refuse a charter that drops one
-    of its sigils. With ``compact`` it is extended by the entries held settled by every
-    member of the ``need`` answering members (default: all of them) whose settled sets
-    have the most in common, so a member answering with little (a Byzantine one) does not
-    block compaction: members lacking an entry refuse to freeze, and a quorum of the others
-    still can. Settled records only accumulate, so the chosen members accept. A malformed
-    answer counts as holding nothing settled (it costs compaction only).
+    of its sigils. With ``compact`` it is extended by the entries ALL answering members
+    hold settled: settled records only accumulate, so every one of them accepts, and the
+    rotation needs only as many as it did without a checkpoint. (Taking the entries a
+    mere quorum holds would make honest members outside that quorum refuse to freeze, so
+    the rotation would depend on every member of the quorum, possibly a faulty one, and an
+    honest member that missed a vote can never settle that sigil.) The price: one member
+    answering with little, a Byzantine one included, limits compaction, never rotation. A
+    malformed answer counts as holding nothing settled.
     """
     prev: list = []
     ck = cur.get("checkpoint")
@@ -49,14 +51,7 @@ def plan_checkpoint(cur: dict, answers: list, compact: bool = True, need: int | 
         except (KeyError, TypeError, IndexError):
             got = set()
         sets.append(got)
-    need = len(sets) if need is None else min(max(need, 1), len(sets))
-    # Greedy: start from the largest set, add the set that keeps the most in common.
-    sets.sort(key=len, reverse=True)
-    common, rest = set(sets[0]), sets[1:]
-    for _ in range(need - 1):
-        best = max(rest, key=lambda x: len(common & x))
-        rest.remove(best)
-        common &= best
+    common = set.intersection(*sets)
     merged = {e[0]: tuple(e) for e in prev}
     for e in sorted(common or ()):
         merged.setdefault(e[0], e)
@@ -169,7 +164,7 @@ class Network:
         chain = self.registry.chain(cid)
         cur = chain[-1]["body"]
         ckeys, succ = self._committee_keys(successor)
-        ck = plan_checkpoint(cur, settled_answers(self.witnesses(cid)), compact, quorum(len(cur["witnesses"])))
+        ck = plan_checkpoint(cur, settled_answers(self.witnesses(cid)), compact)
         nxt = charter_body(cur["name"], cur["version"] + 1, [k.pk for k in new_keys], charter_hash(cur), succ,
                            checkpoint_hash(ck) if ck else None)
         sigs, snapshots = {}, []

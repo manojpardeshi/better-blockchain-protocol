@@ -374,12 +374,34 @@ class CheckpointTests(Base):
         with self.assertRaises(RuntimeError):
             plan_checkpoint(cur, [a, b])
         self.assertEqual(checkpoint_entries({"b": (0, "t"), "a": (1, "u")}), [["a", 1, "u"], ["b", 0, "t"]])
-        # One member answering with nothing (a Byzantine one) does not block compaction:
-        # the entries a quorum (3 of 4) holds in common are offered.
+        # A member answering with nothing (a Byzantine one, or an honest one that missed
+        # the votes) limits compaction to nothing; it never blocks the rotation.
         e = [["a", 0, "t1"], ["b", 0, "t2"]]
         honest = {"settled": e, "checkpointed": []}
-        self.assertEqual(plan_checkpoint({"name": "c"}, [honest, honest, {"settled": [], "checkpointed": []}, honest],
-                                         need=3), e)
+        self.assertEqual(plan_checkpoint({"name": "c"}, [honest, honest, {"settled": [], "checkpointed": []}, honest]), [])
+
+    def test_a_member_that_missed_the_vote_and_a_refusing_freezer_do_not_stop_a_rotation(self):
+        """Re-review PoC3: s is sealed and settled by w0..w2; w3 missed the vote, so it can
+        never settle s. w0 answers SETTLED and then refuses to FREEZE. With a checkpoint chosen
+        from a quorum (w0..w2), w3 refused too and the rotation failed with w1, w2 frozen for
+        that charter forever. Every answering member must hold every entry."""
+        ws = self.net.witnesses(self.X)
+        ps, s = self.parcel("s")
+        Ta = self.hdr([(s, 0)], "a")
+        seal = self.seal(Ta, s, ps, ws[:3])
+        for w in ws[:3]:
+            w.settle(self.cert(Ta, [(ps, seal)]))
+        with self.assertRaises(Rejected):
+            ws[3].settle(self.cert(Ta, [(ps, seal)]))
+
+        def refuse(*_a, **_k):
+            raise Rejected("refusing to freeze")
+        ws[0].freeze = refuse
+        v = self.net.rotate(self.X, [KeyPair.generate() for _ in range(4)])
+        self.assertEqual(v, 1)
+        self.assertNotIn("checkpoint", self.net.registry.latest(self.X))
+        for w in self.net.witnesses(self.X):
+            self.assertEqual(w.status(s)["tid"], model.transition_id(Ta))
 
     def test_drivers_gate_checkpoints_on_the_feature(self):
         """Review finding 4: an older daemon accepts a charter with a checkpoint but ignores the
