@@ -24,10 +24,10 @@ Do not publish those containers on an open network.
    Publish `https://` URLs for Python wallets and `RemoteNetwork` in the
    client directory only after testing them from another host. Do not send an
    admin bearer token across plain HTTP.
-   Restrict access to `/v0/freeze`, `/v0/adopt`, `/v0/standby`,
-   `/v0/succeed` and `/v0/probe` at the network boundary as well as with
-   each daemon's own `--admin-token FILE`. These calls can freeze or fence
-   a member and are exempt from its request rate limit.
+   Restrict access to `/v0/freeze`, `/v0/adopt`, `/v0/settled`,
+   `/v0/standby`, `/v0/succeed` and `/v0/probe` at the network boundary as
+   well as with each daemon's own `--admin-token FILE`. These operator calls
+   are exempt from its request rate limit; some can freeze or fence a member.
 3. **Isolate state.** Put each private key, admin token and durable store in
    storage readable only by its operator process. Keep the store on persistent
    storage; a vote is written before it is returned. Protect the registry and
@@ -79,7 +79,7 @@ python -m sigil.witnessd run --key /private/w1.json \
 ```
 
 The token file must contain a nonempty secret. The daemon checks it for
-rotation calls; it does not provision the file or protect the network. If
+operator calls; it does not provision the file or protect the network. If
 rotation will not be exercised, omitting `--admin-token` disables those calls.
 Serve the local daemon through the separately configured protected transport.
 Create a directory mapping `<cid>` to each operator's reachable `https://`
