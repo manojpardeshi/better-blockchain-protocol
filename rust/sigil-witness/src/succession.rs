@@ -545,7 +545,7 @@ impl Standby {
             return rejected("charter does not extend the version we stand by for");
         }
         let nxt = checkpoint_for(next.get("checkpoint"), checkpoint)?;
-        let mine = checkpoint_for(cur.body.get("checkpoint"), Some(&st.checkpoint)).unwrap_or_default();
+        let mine = checkpoint_for(cur.body.get("checkpoint"), Some(&st.checkpoint))?;
         if mine.iter().any(|(s, e)| nxt.get(s) != Some(e)) {
             // The extension rule (SPEC §5.7): a sigil of our checkpoint has no log here.
             return rejected("checkpoint drops a sigil of our version's checkpoint");
