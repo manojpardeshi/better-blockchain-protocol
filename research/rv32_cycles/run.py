@@ -22,15 +22,12 @@ import json
 import os
 import re
 import subprocess
-import sys
 
-from research._compat import ensure_wallet_signs_expiry
 from research.pcd import STEP_ID, IdealBackend, prove_history, step, witness_for
 from sigil import Network, Wallet
 from sigil.swap import atomic_swap
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-ensure_wallet_signs_expiry()
 
 
 def witness_json(dossier, tid, registry, proofs) -> tuple[dict, str]:
@@ -99,14 +96,19 @@ def main(argv=None):
         r = subprocess.run([emu, elf, path], capture_output=True, text=True)
         out = r.stdout
         m = re.search(r"STATEMENT ([0-9a-f]{64})", out)
+        if r.returncode != 0:
+            raise RuntimeError(f"guest failed for {sc['name']} (exit {r.returncode}): {r.stderr or out}")
+        if m is None or m.group(1) != sc["expected"]:
+            raise RuntimeError(
+                f"guest digest mismatch for {sc['name']}: "
+                f"expected {sc['expected']}, got {m.group(1) if m else 'no STATEMENT'}; "
+                f"stdout: {out}; stderr: {r.stderr}"
+            )
         prof = dict((k, int(v)) for k, v in re.findall(r"(\w+)=(\d+)", out.split("PROFILE", 1)[-1]))
         total = int(re.search(r"RETIRED (\d+)", out).group(1))
-        ok = bool(m) and m.group(1) == sc["expected"]
         rows.append({"name": sc["name"], "inputs": sc["inputs"], "n": sc["n"], "votes": sc["votes"],
                      "witness_bytes": os.path.getsize(path), "instructions": total,
-                     "digest_matches_python": ok, **prof})
-        if not ok:
-            print(f"MISMATCH {sc['name']}: {out} {r.stderr}", file=sys.stderr)
+                     "digest_matches_python": True, **prof})
     cols = ["name", "inputs", "votes", "witness_bytes", "instructions", "parse", "encode", "blake2b",
             "ed25519", "logic", "hashes", "signatures", "digest_matches_python"]
     print("| " + " | ".join(cols) + " |\n|" + "---|" * len(cols))
