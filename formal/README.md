@@ -1,13 +1,20 @@
 # Formal model of the Sigil witness protocol
 
-`Sigil.tla` is a TLA+ specification of the witness protocol (docs/SPEC.md §3.9, §5.1, §5.2) over one or more constellations, including attacker-run ones. TLC machine-checks the §8 safety theorem against it, exhaustively, on small instances.
+`Sigil.tla` is a TLA+ specification of the witness protocol (docs/SPEC.md §3.9, §5.1, §5.2) over one or more constellations, including attacker-run ones. TLC exhaustively checks bounded instances of its §8 safety invariant. `SigilProofs.tla` supplies the separate unbounded TLAPS proof of the safety theorem and its lemmas. The runner also checks models of rotation, succession, checkpoint compaction, expiry, deep confirmation and the wallet.
 
 ```
-formal/check.sh              # all configs: 5 safety checks + 2 mutation tests, about 5 min on 4 cores
-formal/check.sh MC.cfg       # one config
+formal/check.sh                         # base TLAPS proof and all default TLC configs
+formal/check.sh MC.cfg                  # one TLC config; no TLAPS proof
+SIGIL_SKIP_TLAPS=1 formal/check.sh      # default TLC configs without the proof
+SIGIL_ROT_PROOF=1 formal/check.sh       # base + rotation proofs, rotation TLC instances
+SIGIL_SUCC_PROOF=1 formal/check.sh      # base + succession proofs, succession TLC instances
 ```
 
-`check.sh` downloads `tla2tools.jar` v1.7.4 (an immutable release) into `~/.cache/sigil-tla/` (override with `TLA_CACHE`) and checks its SHA-256. It needs Java 11 or later and curl, and it uses the system CA bundle (TLS is always verified). The jar is never committed. CI runs the same script (job `formal` in `.github/workflows/test.yml`). Configs named `MC_multi*.cfg` are run against `MC_multi.tla`, the others against `MC.tla`.
+Run these commands from the repository root. `check.sh` downloads `tla2tools.jar` v1.7.4 and, when needed, the pinned `tlapm` 1.6.0-pre build into `~/.cache/sigil-tla/` (override with `TLA_CACHE`). Both downloads are checked against SHA-256 hashes; neither is committed. It needs Java 11 or later and curl, and it verifies TLS using the system CA bundle. The proof runner supports Linux x86_64; on other platforms the default command reports that it skipped TLAPS, so a successful TLC run there does not establish that the proof was checked. Some TLC configs use the TLAPS standard library and may still download the `tlapm` archive when the proof is skipped. CI runs the default command in the `formal` job and the two opt-in proof modes in separate jobs in `.github/workflows/test.yml`.
+
+The runner selects each TLC module by config prefix: `MC_multi*` uses `MC_multi.tla`, `MC_proofs*` uses `MC_proofs.tla`, `MC_rot*` uses the rotation modules, `MC_ckpt*` uses `MC_ckpt.tla`, `MC_succ*` uses the succession modules, `MC_expiry*` uses `SigilExpiry.tla`, `MC_deep*` uses `SigilDeep.tla`, and `MC_wallet*` uses `MC_wallet.tla`; unmatched configs use `MC.tla`. See `module_for` in `check.sh` for the precise mapping, including witness and three-version variants. Configs named `*mutant*` or `*witness*` must find an expected counterexample; the other configs must pass.
+
+The next two sections describe the original `Sigil.tla` model specifically. The other models and proofs cover additional rules and assumptions.
 
 ## What is modelled
 
@@ -44,14 +51,16 @@ With `ByzEager = TRUE`, every vote a Byzantine witness could sign (rogue members
 
 * **Cryptography:** hashes, Ed25519 and tids are replaced by identifiers, and signatures by "only `w` can create `w`'s vote". The binding of a sigil id to its home (`sigil = H(home, lock, salt)`) is the constant map `Home`.
 * **Locks, unlocks, stamps and time:** §5.1 steps 1 and 3. The owner is adversarial and signs everything, so for safety these checks only remove behaviours.
-* **Rotation:** FREEZE/ADOPT (§5.4), multiple charter versions and the contested state are not modelled. Each constellation has a single charter version.
+* **Rotation:** `Sigil.tla` does not model FREEZE/ADOPT (§5.4), multiple charter versions or the contested state; each constellation has a single charter version in this model. Separate rotation and succession proofs and TLC instances cover these rules (see below).
 * **Holder validation (§6):** conservation, the outputs and the body are not modelled. *Complete* is defined directly on home seals, as in §8.
 * **Network:** messages are delivered atomically, as an honest witness's action. Loss, delay and reordering are covered because any action may fire at any time or never.
 * **Bounded generations:** headers use `0..MaxGen`. A release at `MaxGen` moves to `MaxGen+1`, where nothing can bind any more.
 
-## Instances and results
+## Historical `Sigil.tla` instances and results
 
-Single constellation: N = 4 (3 honest + 1 Byzantine), q = 3, so f = 1. Multi-constellation (`MC_multi.tla`): C = {h1, h2, h3, z1} (q = 3, f = 1), D = {h4} (q = 1, f = 0), and a rogue R = {r1}, all Byzantine, which can produce an R seal for any `(s, g, t)`. TLC v1.8.0 on 4 cores, Java 21, `-workers auto`:
+These measurements cover the original seven TLC configs only. They were recorded with TLC v1.8.0 on 4 cores, Java 21 and `-workers auto`; the current runner pins TLC v1.7.4 and runs many more default configs plus the base TLAPS proof. Treat the state counts and times below as historical, not expected output or duration for a current `formal/check.sh` run.
+
+Single constellation: N = 4 (3 honest + 1 Byzantine), q = 3, so f = 1. Multi-constellation (`MC_multi.tla`): C = {h1, h2, h3, z1} (q = 3, f = 1), D = {h4} (q = 1, f = 0), and a rogue R = {r1}, all Byzantine, which can produce an R seal for any `(s, g, t)`.
 
 | Config | Instance | Result | Distinct states | Generated | Depth | Time |
 |---|---|---|---|---|---|---|
@@ -63,7 +72,7 @@ Single constellation: N = 4 (3 honest + 1 Byzantine), q = 3, so f = 1. Multi-con
 | `MC_multi_all.cfg` | constellations C, D, R; s1 homed at C, s2 at D, 3 transitions, **every** header assignment (3375 maps), gens 0..2, eager Byzantine votes, symmetry on C's honest witnesses and tids | **all invariants hold** | 60,240 | 363,168 | 17 | ~20 s |
 | `MC_multi_mutant.cfg` | `MC_multi.cfg` with `AnyConstellationProof = TRUE` | **Safety violated** (expected) | ~8–9k when found | ~0.12M | 8–9 | ~4 s |
 
-Times are from one `check.sh` run (5 min 11 s wall clock) on a loaded 4-core container. On the same machine the pre-constellation model needed ~130 s for `MC_all`, so the generalisation costs about 30% per state; state counts of the single-constellation configs are unchanged. A 3-sigil version of `MC_all` (gens 0..1, 26³ header maps) did not finish within 10 minutes, so it is not included. `MC_multi.cfg` has fewer states than `MC.cfg` because sigil c is served by a single witness. As a sanity check, temporary probe invariants confirmed that under the fixed rule the cross-constellation paths are live: h4 releases c at D using C's seal on `(b,0)` as death proof for t3, and t4 (a at C, c at D) can become complete.
+The historical seven-config run took 5 min 11 s wall clock on a loaded 4-core container. On the same machine the pre-constellation model needed ~130 s for `MC_all`, so the generalisation cost about 30% per state in that experiment; state counts of the single-constellation configs were unchanged. A 3-sigil version of `MC_all` (gens 0..1, 26³ header maps) did not finish within 10 minutes, so it is not included. `MC_multi.cfg` has fewer states than `MC.cfg` because sigil c is served by a single witness. As a sanity check, temporary probe invariants confirmed that under the fixed rule the cross-constellation paths are live: h4 releases c at D using C's seal on `(b,0)` as death proof for t3, and t4 (a at C, c at D) can become complete.
 
 ### Mutation counterexample (`MC_mutant.cfg`)
 
@@ -95,7 +104,10 @@ With the fixed rule (`AnyConstellationProof = FALSE`), the proof in step 4 must 
 * `MC.tla`: single-constellation instance definitions (fixed headers, all headers, symmetry sets).
 * `MC_multi.tla`: multi-constellation instances (constellations C, D and the rogue R, homes).
 * `MC.cfg`, `MC_all.cfg`, `MC_lazy.cfg`, `MC_mutant.cfg`, `MC_multi.cfg`, `MC_multi_all.cfg`, `MC_multi_mutant.cfg`: TLC configurations.
-* `check.sh`: downloads TLC, runs the configs, and checks that the mutants fail and the others pass.
+* `SigilProofs.tla`, `MC_proofs.tla`, `MC_proofs_witness*.cfg`: unbounded base safety proof and bounded non-vacuity checks.
+* `SigilRotProofs.tla`, `SigilSuccProofs.tla`, `MC_rot*.tla`, `MC_rot*.cfg`, `MC_succ*.tla`, `MC_succ*.cfg`: rotation and succession proofs and bounded checks.
+* `MC_ckpt.tla`, `MC_ckpt*.cfg`, `SigilExpiry.tla`, `MC_expiry*.cfg`, `SigilDeep.tla`, `MC_deep*.cfg`: checkpoint compaction, expiry and deep-confirmation checks.
+* `check.sh`: runs the selected proofs and TLC configs, checks expected counterexamples, and fails when an expectation is unmet.
 * `SigilWallet.tla`, `MC_wallet.tla`, `MC_wallet*.cfg`: the honest wallet's state machine (authorise, failed seal, finalise, unpledge, abort, crash/restart) composed with the witness protocol of its home, a Byzantine witness and a swap counter-party. `MC_wallet`, `MC_wallet_live` (liveness) and `MC_wallet_code` must hold; the `*_mutant` configs reproduce the wallet bugs of docs/VERIFICATION.md §4b and three pure mutations; the `*_witness` configs are non-vacuity checks. `MC_wallet_big.cfg` is an opt-in larger instance (`SIGIL_TLC_EXTRA=MC_wallet_big.cfg`, about 5 min). Liveness counterexamples are accepted as expected violations by `check.sh`.
 
 ## Rotation proof
