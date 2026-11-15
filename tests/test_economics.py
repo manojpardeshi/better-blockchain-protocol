@@ -18,6 +18,7 @@ class EconomicsWorksheetTests(unittest.TestCase):
             member("a", "10"), member("b", "20"),
             member("c", "30"), member("d", "40")]})
         self.assertEqual((result["f"], result["q"], result["minimum_quorum_intersection"]), (1, 3, 2))
+        self.assertIn("one charter membership/version", result["intersection_scope"])
         self.assertEqual(result["least_assumed_collectible_bonds"], ["a", "b"])
         self.assertEqual(result["collateral_minus_exposure"], "1")
         self.assertEqual(result["stamp_rows"][0]["estimated_cost_per_redeemed_stamp"], "0.6")

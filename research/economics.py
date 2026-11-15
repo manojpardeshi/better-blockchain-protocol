@@ -3,6 +3,7 @@
 
 Usage: python3 research/economics.py scenario.json
 All monetary inputs must use the same unit. See docs/ECONOMICS.md.
+The quorum-intersection calculation applies only within one charter membership/version.
 """
 
 import argparse
@@ -64,6 +65,7 @@ def evaluate(scenario):
                      "sale_is_open": not paid})
 
     return {
+        "intersection_scope": "two conflicting quorum seals under one charter membership/version",
         "n": n, "f": f, "q": q, "minimum_quorum_intersection": intersection,
         "least_assumed_collectible_bonds": [name for _, name in bonds[:intersection]],
         "assumed_collectible_collateral_floor": str(collateral_floor),

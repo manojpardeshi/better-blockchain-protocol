@@ -12,16 +12,18 @@ and the evidence behind each input with the decision.
 
 ## What the worksheet calculates
 
-For *n* charter members, the protocol uses *f* = floor((*n* − 1)/3) and
-*q* = *n* − *f*. Two conflicting quorum seals for the same sigil and generation
-share at least `2q − n` signing witnesses. The worksheet sorts the assumed
+For *n* members of **one charter version**, the protocol uses
+*f* = floor((*n* − 1)/3) and *q* = *n* − *f*. Two conflicting quorum seals for
+the same sigil and generation **under that same membership** share at least
+`2q − n` signing witnesses. The worksheet sorts the assumed
 collectible bond amounts and adds the cheapest `2q − n`. This is a **conditional
 lower bound** on collateral associated with such a pair of seals. It compares
 that number with a supplied `max_concurrent_loss`, the total value that could be
 lost across all simultaneous exposures before a response, in one monetary unit.
 An individual payment limit is insufficient if many payments can be attacked at
 once. A positive difference is only a screen; it is not proof of deterrence or
-recovery.
+recovery. Conflicting seals involving different charter memberships or versions,
+including retired-key attacks, are outside this calculation.
 
 For each witness, the worksheet adds the estimated variable cost of one stamp
 sale, one redeemed SPEND, and an allocation of fixed cost per redeemed stamp.
@@ -43,7 +45,8 @@ Rate limits and network controls remain necessary.
 
 ## Scenario file
 
-All amounts must use the **same unit and valuation date**. `assumed_collectible_bond`
+List the witnesses of one charter version only. All amounts must use the
+**same unit and valuation date**. `assumed_collectible_bond`
 is an intentionally conservative amount: use zero when a bond is absent, expired,
 homed in a compromised constellation, unavailable to the intended claimant, or
 otherwise not demonstrably collectible. Do not enter a bond's face amount merely
