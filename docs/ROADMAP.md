@@ -47,5 +47,6 @@ Status legend: ⬜ not started · 🟨 in progress · ✅ done
 ## Phase 5: Public testnet and audit (#12)
 | | Item |
 |---|---|
+| 🟨 | [Operator testnet runbook](OPERATOR_TESTNET.md): document isolation, transport, state recovery and fault drills; independently operated deployment and validation remain open |
 | ⬜ | Three or more independent constellations run by outside operators |
 | ⬜ | Cryptography and protocol audit, then a v1 spec freeze |
