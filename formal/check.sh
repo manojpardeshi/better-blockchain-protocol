@@ -219,7 +219,8 @@ for cfg in "${CONFIGS[@]}"; do
     log="$WORK/$name.log"
     start=$(date +%s)
     set +e
-    (cd "$HERE" && java -XX:+UseParallelGC "${libarg[@]}" -cp "$JAR" tlc2.TLC \
+    # Bash 3.2 with nounset treats an empty array as unbound.
+    (cd "$HERE" && java -XX:+UseParallelGC "${libarg[@]+"${libarg[@]}"}" -cp "$JAR" tlc2.TLC \
         -workers auto -cleanup \
         -metadir "$WORK/$name.states" -config "$cfgpath" "$module") >"$log" 2>&1
     rc=$?
