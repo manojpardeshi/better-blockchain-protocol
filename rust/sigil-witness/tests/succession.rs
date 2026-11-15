@@ -322,6 +322,12 @@ async fn standby_over_http() {
     assert_eq!((c, r.get("ok").and_then(|o| o.get("answered"))), (200, Some(&Json::Int(0))), "an unreachable member does not count");
     let (c, _) = http(addr, "POST", "/v0/probe", Some("Bearer t"), r#"{"urls":"x"}"#).await;
     assert_eq!(c, 400);
+    for url in ["https://127.0.0.1:9", "http://127.0.0.1", "http://127.0.0.1:9/v0"] {
+        let body = format!(r#"{{"urls":["{url}"]}}"#);
+        let (c, r) = http(addr, "POST", "/v0/probe", Some("Bearer t"), &body).await;
+        assert_eq!((c, r.get("error").and_then(Json::as_str)), (400, Some("bad_request")), "{url}");
+        assert!(r.get("message").and_then(Json::as_str).unwrap().contains(url));
+    }
     let (c, _) = http(addr, "POST", "/v0/standby", Some("Bearer t"), &format!(r#"{{"constellation":"{}","version":0,"snapshots":{{}}}}"#, w.cid)).await;
     assert_eq!(c, 400, "snapshots must be a list");
     let (c, r) = http(addr, "POST", "/v0/standby", Some("Bearer t"), &format!(r#"{{"constellation":"{}","version":0,"snapshots":[]}}"#, w.cid)).await;

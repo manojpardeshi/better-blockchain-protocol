@@ -1059,14 +1059,11 @@ class RemoteNetwork:
                              list(new_urls), list(committee_urls or []), ck)
 
     def probe(self, cid: str, admin_token) -> int:
-        """Have every reachable standby member of ``cid`` challenge its members now."""
+        """Have each standby challenge members; return a count only if all answered."""
         token = admin_token.get if isinstance(admin_token, dict) else (lambda _url: admin_token)
         n = 0
         for url in self.committees.get(cid, []):
-            try:
-                n += RemoteStandby(url, self.timeout, admin_token=token(url)).probe(self.urls.get(cid, []))
-            except Rejected:
-                continue
+            n += RemoteStandby(url, self.timeout, admin_token=token(url)).probe(self.urls.get(cid, []))
         return n
 
     def _current(self, cid: str) -> tuple[list, dict]:
