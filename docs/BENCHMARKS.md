@@ -44,6 +44,17 @@ python3 bench/run_all.py            # ~15 min; --quick for a smoke run; writes b
 python3 bench/interop.py            # wire-compatibility check (not a benchmark)
 ```
 
+The full runner requires Linux with readable `/proc/cpuinfo`, `taskset`, both release
+executables (`sigil-witness` and `sigil-bench`), and CPUs 0–3 in the process's allowed
+affinity set. Containers and shared hosts often expose a different CPU set; the runner
+now stops before measuring in that case, since its fixed witness and load-generator
+pinning would not reproduce these numbers. It also rejects missing build artifacts and
+invalid `--reps` values before measuring. Use `--out PATH` to keep a new run separate
+from the checked-in results. The runner checks that it can create a temporary file
+in the output directory before measuring, though later filesystem failures remain
+possible. A measurement or serialization failure leaves any existing output file
+intact; the runner replaces it only after every measurement succeeds.
+
 Individual pieces:
 
 ```sh

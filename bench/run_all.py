@@ -15,6 +15,7 @@ import os
 import platform
 import shutil
 import signal
+import stat
 import statistics
 import subprocess
 import sys
@@ -26,6 +27,75 @@ from common import RUST_BIN, ROOT, Cluster  # noqa: E402
 
 BENCH_BIN = os.path.join(os.path.dirname(RUST_BIN), "sigil-bench")
 PY = [sys.executable, os.path.join(ROOT, "bench", "bench_python.py")]
+REQUIRED_CPUS = {0, 1, 2, 3}
+
+
+def preflight(reps: int, output: str) -> None:
+    """Reject hosts that cannot reproduce the fixed CPU placement in this suite."""
+    if reps < 1:
+        raise ValueError("--reps must be at least 1")
+    if sys.platform != "linux":
+        raise RuntimeError("bench/run_all.py requires Linux (/proc/cpuinfo and taskset CPU affinity)")
+    try:
+        with open("/proc/cpuinfo", encoding="utf-8") as f:
+            if not any(line.startswith("model name") for line in f):
+                raise RuntimeError("/proc/cpuinfo has no CPU model name")
+    except OSError as e:
+        raise RuntimeError(f"cannot read /proc/cpuinfo: {e}") from e
+    taskset = shutil.which("taskset")
+    if taskset is None:
+        raise RuntimeError("taskset is required for fixed CPU pinning")
+    try:
+        available = os.sched_getaffinity(0)
+    except (AttributeError, OSError) as e:
+        raise RuntimeError(f"cannot inspect CPU affinity: {e}") from e
+    if not REQUIRED_CPUS <= available:
+        raise RuntimeError(f"CPUs 0-3 must be available to this process; allowed CPUs: {sorted(available)}")
+    for name, path in (("Rust witness", RUST_BIN), ("Rust benchmark", BENCH_BIN)):
+        if not os.path.isfile(path) or not os.access(path, os.X_OK):
+            raise RuntimeError(f"{name} executable missing: {path}; build with cargo build --release --manifest-path rust/Cargo.toml")
+    for pin in ("0", "1-3"):
+        try:
+            probe = subprocess.run([taskset, "-c", pin, sys.executable, "-c", "pass"],
+                                   capture_output=True, text=True)
+        except OSError as e:
+            raise RuntimeError(f"cannot run taskset: {e}") from e
+        if probe.returncode:
+            raise RuntimeError(f"taskset cannot pin to CPUs {pin}: {probe.stderr.strip()}")
+    parent = os.path.dirname(os.path.abspath(output))
+    if not os.path.isdir(parent):
+        raise RuntimeError(f"output directory does not exist: {parent}")
+    if os.path.isdir(output):
+        raise RuntimeError(f"output path is a directory: {output}")
+    try:
+        fd, probe_path = tempfile.mkstemp(prefix=".sigil-preflight-", dir=parent)
+    except OSError as e:
+        raise RuntimeError(f"cannot create a temporary file in output directory {parent}: {e}") from e
+    try:
+        os.close(fd)
+    finally:
+        os.unlink(probe_path)
+
+
+def write_results(output: str, results: dict) -> None:
+    """Replace the old result only after the complete JSON is on disk."""
+    parent = os.path.dirname(os.path.abspath(output))
+    fd, temp_path = tempfile.mkstemp(prefix=".sigil-results-", suffix=".json", dir=parent)
+    try:
+        if os.path.exists(output):
+            os.fchmod(fd, stat.S_IMODE(os.stat(output).st_mode))
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            fd = -1
+            json.dump(results, f, indent=1, sort_keys=True)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temp_path, output)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        if os.path.exists(temp_path):
+            os.unlink(temp_path)
 
 
 def sh(cmd, **kw) -> dict:
@@ -81,6 +151,10 @@ def main():
     ap.add_argument("--out", default=os.path.join(ROOT, "bench", "results.json"))
     a = ap.parse_args()
     reps = 1 if a.quick else a.reps
+    try:
+        preflight(a.reps, a.out)
+    except (RuntimeError, ValueError) as e:
+        ap.error(str(e))
     q = (lambda full, quick: quick if a.quick else full)
     res = {"machine": machine(), "fsync": [rust("fsync", "--iters", "500")]}
 
@@ -132,8 +206,7 @@ def main():
     res["dossier"] = python("dossier", "--lengths", q("1,10,100,1000", "1,10,100"))
     res["fsync"].append(rust("fsync", "--iters", "500"))
 
-    with open(a.out, "w") as f:
-        json.dump(res, f, indent=1, sort_keys=True)
+    write_results(a.out, res)
     print(json.dumps({"inproc": {k: round(v["median"]) for k, v in res["inproc"].items()},
                       "http": {k: round(v["median"]) for k, v in res["http"].items()},
                       "latency_p50_ms": {k: round(v["median"], 2) for k, v in res["latency"].items()}}, indent=1))
