@@ -25,7 +25,7 @@ below generation 16, and at most ``MAX_MIRROR_TIDS`` transitions per sigil and
 generation; a release entry needs a death proof of at most 128 KiB for a binding
 the member holds. Each refusal only withholds an ack (no ack, no vote), which
 costs liveness and never safety. The handover of STANDBY, like ADOPT, keeps every
-entry it is given, each distinct one once.
+verifiable entry it is given, each distinct one once, and drops the rest.
 """
 
 import json
@@ -37,8 +37,9 @@ from .crypto import KeyPair
 from .encoding import canonical
 from .model import ack_payload, transition_id
 from .proofs import proves_dead, verify_heartbeat
-from .store import WitnessStore
-from .witness import MAX_AUTH_BYTES, MAX_GEN, MAX_PROOF_BYTES, Rejected, _encoding, _too_big, authorises
+from .store import WitnessStore, charter_entries, restore_charters
+from .witness import (MAX_AUTH_BYTES, MAX_GEN, MAX_PROOF_BYTES, Rejected, _encoding, _too_big, authorises,
+                      classify_evidence)
 
 # Distinct transitions a member mirrors per (sigil, generation). An honest owner binds
 # one transition per generation, and re-pledges another only after the first expired
@@ -53,17 +54,20 @@ class StandbyStore(WitnessStore):
     Kinds: ``pk``; ``standby`` (``{constellation, version, since}``); ``fenced``
     (``{constellation, version, charter}``: the successor it signed); ``mirror``
     (key ``"<version>|<sigil>"``, value the mirror log of that sigil); ``checkpoint``
-    (key ``"<version>"``, value that version's checkpoint set, SPEC §5.7).
+    (key ``"<version>"``, value that version's checkpoint set, SPEC §5.7); ``charter``
+    (as ``WitnessStore``: a charter chain learned by gossip or STANDBY).
     """
 
     def load(self) -> dict:
-        state = {"pk": None, "standby": None, "fenced": None, "mirror": {}, "checkpoint": {}}
+        state = {"pk": None, "standby": None, "fenced": None, "mirror": {}, "checkpoint": {}, "charters": {}}
         for kind, key, value in self.db.execute("SELECT kind, key, value FROM log ORDER BY seq"):
             v = json.loads(value)
             if kind == "mirror":
                 state["mirror"][key] = v
             elif kind == "checkpoint":
                 state["checkpoint"][key] = v
+            elif kind == "charter":
+                state["charters"][key] = v
             elif kind in ("pk", "standby", "fenced"):
                 state[kind] = v
         return state
@@ -126,6 +130,8 @@ class Standby:
         self.heard: dict[str, int] = {}        # member pk -> when it last answered our challenge
         self.since: int | None = None          # start of our observation window
         self.checkpoint: list = []             # our version's checkpoint set (SPEC §5.7)
+        self._charters_saved: dict[str, int] = {}  # cid -> chain length the store holds
+        self._charters_keep = set(registry.ids())  # constellations the registry file names
         self.store = store
         if store is not None:
             self._restore()
@@ -138,6 +144,8 @@ class Standby:
             self.store.append([("pk", "", self.pk)])
         elif state["pk"] != self.pk:
             raise ValueError("store belongs to a different key")
+        # Charter chains learned before the restart: the registry file may predate them.
+        self._charters_saved = restore_charters(self.registry, state.get("charters", {}))
         sb = state["standby"]
         if sb is None:
             return
@@ -155,6 +163,16 @@ class Standby:
     def _persist(self, *entries) -> None:
         if self.store is not None:
             self.store.append(list(entries))
+
+    def remember_charters(self) -> None:
+        """Persist every charter chain our registry learned that the store does not hold yet
+        (as ``Witness.remember_charters``)."""
+        if self.store is not None:
+            saved = dict(self._charters_saved)
+            entries = charter_entries(self.registry, saved, self._charters_keep)
+            if entries:
+                self._persist(*entries)
+            self._charters_saved = saved
 
     def _set_mirrored(self, binds: set) -> None:
         self.mirrored, self._tids, self._by_sigil = set(), {}, {}
@@ -207,13 +225,25 @@ class Standby:
                 return  # a retried STANDBY
             if self.cid != cid or not _is_int(version) or version <= self.version:
                 raise Rejected("already standing by for another version")
-        # Like ADOPT, the handover keeps every entry it is given whatever its size:
-        # dropping evidence could lose a sealed binding.
-        mirror = _members_snapshot_union(snapshots)
+        # Like ADOPT, the handover keeps every verifiable entry whatever its size (dropping
+        # evidence could lose a sealed binding), and nothing else: junk a Byzantine
+        # predecessor added would otherwise be handed on to every later committee.
+        mirror = {}
+        members = set(self.registry.charter(cid, version)["witnesses"])
+        for sigil, log in _members_snapshot_union(snapshots).items():
+            kept = classify_evidence(sigil, log, cid, self.registry, members=members).kept
+            if kept:
+                mirror[sigil] = kept
         since = int(self.clock())
-        self._persist(("standby", "", {"constellation": cid, "version": version, "since": since}),
+        saved = dict(self._charters_saved)
+        charters = []
+        if self.store is not None and cid in self._charters_keep:
+            charters = [("charter", cid, self.registry.chain(cid))]  # always our own chain
+            saved[cid] = len(charters[0][2])
+        self._persist(*charters, ("standby", "", {"constellation": cid, "version": version, "since": since}),
                       *([("checkpoint", str(version), ck)] if ck else []),
                       *(("mirror", f"{version}|{s}", log) for s, log in mirror.items()))
+        self._charters_saved = saved
         self.cid, self.version, self.since, self.checkpoint = cid, version, since, ck
         self.mirror, self.fenced_for, self.heard = mirror, None, {}
         self._set_mirrored(_bindings(mirror))
@@ -283,8 +313,11 @@ class Standby:
         if not ok:
             raise Rejected("invalid release evidence")
         log = self.mirror.get(sigil, [])
-        if any(e.get("kind") == "release" and e.get("tid") == t for e in log):
+        held = [e for e in log if e.get("kind") == "release" and e.get("tid") == t]
+        if any(proves_dead(e["header"], t, e["proof"], self.registry) for e in held):
             return False
+        # Releases kept from a handover that we could not verify give way to one that verifies.
+        log = [e for e in log if not (e.get("kind") == "release" and e.get("tid") == t)]
         log = log + [{"kind": "release", "gen": entry["gen"], "tid": t, "header": h, "proof": proof}]
         self._persist(("mirror", f"{self.version}|{sigil}", log))
         self.mirror[sigil] = log

@@ -2,7 +2,18 @@
 
 Transport for the witness protocol of [SPEC.md](SPEC.md) §5. v0 uses JSON over HTTP/1.1 because it is easy to inspect and has no dependencies. A binary encoding over HTTP/2 or QUIC is planned for the Rust witness (Phase 2), carrying the same messages.
 
-Nothing a witness sends is trusted. Clients verify votes, seals, charters and proofs exactly as they do in-process.
+Nothing a witness sends is trusted. Clients verify votes, seals, charters and proofs exactly as they do in-process. Before that, the reference client (`RemoteWitness`, `RemoteStandby`) treats each of the following as no answer (`Unreachable`):
+
+* a reply larger than its cap: 256 KiB for an ordinary call (a STATUS holds at most one vote per generation), 16 MiB for a charter chain or a gossip pull, and 256 MiB for the operator calls, whose snapshots hold every binding a member has;
+* an exchange (connect, request, status line, headers and body) not finished within 4 socket timeouts, or 60 for the operator calls. A watchdog shuts the socket down at the deadline, so a trickled status line or header, or endless `100 Continue` lines, cannot hold a client;
+* a redirect, which is never followed;
+* a body that is not JSON or not `{"ok": …}`. Memory is bounded by the caps alone: no reply is refused for its content's density, since snapshots, mirror logs, proofs and charters carry what clients sent. Parsed JSON can take about twenty times its size, so at most about 5 MiB for an ordinary reply;
+* an `ok` result not of the shape the table below gives for that call, for example a vote with a missing or non-integer `gen`, an INFO whose stamp key is not hex, or a FREEZE snapshot that is not an object of lists;
+* a malformed error reply, such as a `conflict` whose `vote` is neither a vote nor null. Any error reply to a GET also counts as no answer.
+
+STATUS votes that are not vote objects are dropped, beyond the first 256 too, and a gossip pull keeps only well-shaped collections. So one Byzantine witness within *f* looks, at worst, like one that is down. A standby member asks every member for a heartbeat at once, so a member that stalls its reply never delays hearing the others. The Rust standby member's probe reads at most 64 KiB, within the same 4-timeout deadline.
+
+A wallet trusts by default only its home and the constellations its directory names (`RemoteNetwork.configured()`), and a client learns only the chain of a constellation it asks about (`GET /v0/charters/<cid>`). It never trusts a chain merely because a witness served it: gossip admits any valid genesis chain from anyone, so an outsider could otherwise plant a constellation whose every key it holds.
 
 ## Calls
 
@@ -10,9 +21,10 @@ Nothing a witness sends is trusted. Clients verify votes, seals, charters and pr
 |---|---|---|---|
 | GET | `/v0/info` | — | `{pk, constellation, version, frozen, stamps: {n, e} \| null, features}`; `features` lists protocol features the daemon understands (`"checkpoint"`, SPEC §5.7); a daemon from before compaction has no such key |
 | GET | `/v0/charters` | — | `{cid: [charter, …]}`: every charter chain the witness knows |
+| GET | `/v0/charters/<cid>` | — | `[charter, …]`: the chain of constellation `cid`, `[]` if unknown. Clients ask for the chains they are configured with this way, since gossip admits any valid genesis chain, so `/v0/charters` can grow past what a client reads |
 | POST | `/v0/spend` | `{request}` (SPEC §5.1; `request.mirror` carries the mirror acks a version with a successor committee needs, §5.5) | vote |
 | POST | `/v0/release` | `{sigil, proof}` (SPEC §5.2) | new generation (int) |
-| POST | `/v0/status` | `{sigil}` (SPEC §5.3) | `{gen, tid, votes}` |
+| POST | `/v0/status` | `{sigil}` (SPEC §5.3) | `{gen, tid, votes}`; `rejected` ("witness not active") from a witness that has not joined a charter version (awaiting ADOPT), whose "unbound" would otherwise read as a member's answer |
 | POST | `/v0/sell_stamp` | `{blinded: hex}` | blind signature (hex) |
 | POST | `/v0/heartbeat` | `{challenge}`: a string of 1 to 128 characters (SPEC §5.5) | `{constellation, version, witness, challenge, sig}`; only an active, unfrozen witness answers |
 | POST | `/v0/settle` | `{settlement}`: a settlement certificate `{header, inputs: [{parcel: {home, lock, salt}, seal}]}` (SPEC §3.12, §5.7), at most 512 KiB encoded, every seal from its home's current version | `{settled: [sigil, …]}`: the inputs living here that the witness held bound to exactly the certificate's binding, now settled (rate limited like every public call) |
@@ -31,16 +43,18 @@ Every reply is one JSON object:
 
 Big integers (RSA stamp values) are lowercase hex strings. Request bodies are capped at 1 MiB (the admin calls: 256 MiB, read only after the token is checked). Within that, a SPEND's authorisation `{home, lock, salt, unlock, header}` is at most 32 KiB encoded, a sigil is newly bound only below generation 16, and a RELEASE's death proof is at most 128 KiB (SPEC §5.1, §5.2): anything larger is `rejected` and changes nothing, so no request can make a witness store more than about its own size. A witness handles its calls one at a time and persists state before it answers (SPEC §5). An unlock carries at most 64 equivocation proofs (SPEC §3.5), so one lock evaluation verifies at most 64 of them, far fewer than the ~1,400 a 1 MiB body could hold.
 
+**Portable JSON.** Both daemons refuse (`bad_request`) a request body that is not *portable*: every integer in [−2¹²⁷, 2¹²⁷), no `NaN`/`Infinity` and no float out of range, no string or key holding a lone UTF-16 surrogate, and no value nested more than 256 levels under the body (the admin calls: 272). The Rust parser cannot represent anything else, so the reference refuses it too: a witness of either kind never binds, releases or stores what one of the other kind could not read back from a handover. A FREEZE or SUCCEED snapshot from a Byzantine predecessor may still hold such values; the reference client (`RemoteWitness.freeze`, `RemoteStandby.succeed`) drops every entry that would not be portable inside an `/v0/adopt` or `/v0/standby` body (`portable_snapshot`) before relaying it. Such an entry can never verify, and relaying it would make every adopter refuse the whole handover.
+
 ## Rotation
 
 FREEZE is irreversible, so `/v0/freeze` and `/v0/adopt` are operator calls. They need `Authorization: Bearer <token>`, where the witness reads the token from `--admin-token FILE`. A witness started without one refuses them (`rejected`), and so does a request with a wrong token.
 
 * `freeze` answers the witness's signature on the charter body and its evidence `{sigil: log ‖ [{kind: "vote", vote}, …]}`. The witness freezes for exactly one successor: asked again for the same body it answers the same, and for any other it answers `rejected`. A frozen witness never votes or releases again, also after a restart.
-* `adopt` runs once, on a witness that has joined no charter version. A retry for the version it adopted answers the same; anything else is `rejected`. The witness must already know the charter `version` (send it by `/v0/gossip` first), and must be a member, else `bad_request`. Malformed parts of a snapshot are skipped, like any other unverifiable evidence.
+* `adopt` runs once, on a witness that has joined no charter version. A retry for the version it adopted answers the same; anything else is `rejected`. The witness must already know the charter `version` (send it by `/v0/gossip` first), and must be a member, else `bad_request`. Malformed parts of a snapshot are skipped, like any other unverifiable evidence, and a sigil left with no verifiable entry gets no record.
 * **Checkpoints** (SPEC §5.7). A charter body may carry `checkpoint`: `H("checkpoint", S)` of a checkpoint set `S` (a list of `[sigil, gen, tid]`, sorted by sigil, distinct sigils). `freeze` then needs `S` in the request and answers `rejected` unless every entry matches a record the witness holds settled and every record it holds checkpointed is in `S`; `adopt` needs `S` and answers `rejected` without the exact set. A body without `checkpoint` is hashed as before; `checkpoint` is sent only when the charter has one, so a rotation without settlements reaches older witnesses unchanged. Every member of the next version (and of its committee) must be upgraded before a rotation that carries a checkpoint: an older daemon would adopt such a charter and ignore the set (SPEC §5.7). `RemoteNetwork` checks the `features` each new member announces in `/v0/info`, but that is the daemon's own claim.
 * A fresh store joins version 0 directly. A witness for a later version is started with `--adopt` (both daemons): it votes on nothing until ADOPT. A fresh store without `--adopt` refuses to start on a constellation that has rotated.
 
-`RemoteNetwork.rotate(cid, new_urls, admin_token, compact=True)` drives a rotation like `Network.rotate`: it first asks every member for `/v0/settled` and offers the current checkpoint set plus every entry all answering members hold settled (never entries only some hold: those members would refuse to freeze) (a member that does not answer, or an older witness without the call, counts as holding nothing settled); every reachable member freezes for the next charter and signs it; signatures that do not verify are dropped with their evidence; with a quorum, the new chain is gossiped to old and new members, and every new member adopts the union of the signers' evidence. A re-used key whose old process did not sign is left waiting (`RotationIncomplete`), because it must bring its own votes. Operators then add the new chain to their registry files, since gossip state is not persisted.
+`RemoteNetwork.rotate(cid, new_urls, admin_token, compact=True)` drives a rotation like `Network.rotate`: it first asks every member for `/v0/settled` and offers the current checkpoint set plus every entry all answering members hold settled (never entries only some hold: those members would refuse to freeze) (a member that does not answer, or an older witness without the call, counts as holding nothing settled); every reachable member freezes for the next charter and signs it; signatures that do not verify are dropped with their evidence; with a quorum, the new chain is gossiped to old and new members, and every new member adopts the union of the signers' evidence. A re-used key whose old process did not sign is left waiting (`RotationIncomplete`), because it must bring its own votes. Every witness and standby member keeps the charter chains it learns (by gossip, ADOPT or STANDBY) in its store (`charter` entries) and merges them into its registry file's chains at start, so a member restarted before its registry file holds the new chain still knows its own version; operators should still add the new chain to their registry files (fresh processes, and proofs and fork evidence learned by gossip, are not persisted).
 
 ## Succession
 
@@ -49,7 +63,7 @@ A standby member of a successor committee (SPEC §5.5) is served like a witness 
 | Method | Path | Body | `ok` result |
 |---|---|---|---|
 | GET | `/v0/info` | — | `{pk, role: "standby", constellation, version, fenced, dead, frozen: false, stamps: null}` |
-| GET | `/v0/charters`, `/v0/proofs`; POST `/v0/gossip` | as for a witness | as for a witness |
+| GET | `/v0/charters`, `/v0/charters/<cid>`, `/v0/proofs`; POST `/v0/gossip` | as for a witness | as for a witness |
 | POST | `/v0/mirror` | `{request}`: a SPEND request plus the `version` it is for | mirror ack `{constellation, version, member, sigil, gen, tid, sig}` |
 | POST | `/v0/note_release` | `{sigil, entry}`: a release entry `{kind: "release", gen, tid, header, proof}` for a binding it holds | `true` if new, `false` if held already |
 | POST | `/v0/status` | `{sigil}` | `{bindings: [[gen, tid], …]}`: every binding of the sigil in its mirror log (holders ask before releasing a pledge, SPEC §4 rule 3) |
@@ -108,7 +122,7 @@ On a witness, gossip uses the witness's own charter registry, so a verified rota
 
 A wallet builds its store as `GossipStore(network.registry)`, so newly learned charters reach its `TrustPolicy`. It then calls `store.apply(wallet.policy)` to convict every proven equivocator, and from then on that witness's votes no longer count toward seals. `equivocations_in(votes)` extracts proofs from any votes the wallet sees, such as STATUS replies or death proofs.
 
-**Caps.** A message holds at most 64 charter chains, 1024 versions per chain, 64 proofs and 16 forks, within the 1 MiB body limit. A message over any cap is refused as a whole with `bad_request`. A charter names at most 128 witnesses and encodes to at most 64 KiB (SPEC §3.7); a chain holding a larger one does not verify, so it is dropped like any invalid item. A store accepts at most 10 000 new constellations, while extensions of known constellations are always accepted. A client reads at most 16 MiB from one witness per pull.
+**Caps.** A message holds at most 64 charter chains, 1024 versions per chain, 64 proofs and 16 forks, within the 1 MiB body limit. A message over any cap is refused as a whole with `bad_request`. A charter names at most 128 witnesses and encodes to at most 64 KiB (SPEC §3.7); a chain holding a larger one does not verify, so it is dropped like any invalid item. A store accepts at most 10 000 new constellations, while extensions of known constellations are always accepted. A client reads at most 16 MiB from one witness per pull. If a witness holds more chains than that, the client asks for the chains of the constellations it is configured with one by one (`GET /v0/charters/<cid>`).
 
 **Threats.**
 * *Spam.* Genesis charters need no signatures, so anyone can mint constellations. The constellation cap bounds how many, the charter caps how large each version is (before them, one message registered a 14,000-witness charter), and the rate limit how fast. Proofs against keys outside every known charter are refused, so throwaway keys cannot grow the store. Verification costs at most the signatures that fit in one 1 MiB body.

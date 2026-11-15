@@ -112,9 +112,7 @@ class SeededChaos(ChaosCase):
         strict = os.environ.get("SIGIL_CHAOS_STRICT_LIVENESS", "1") == "1"
         for seed in seeds:
             with self.subTest(seed=seed):
-                # Malformed replies from a Byzantine witness crash wallets (Findings), which
-                # leaves pledges no settle can finish; they get their own runs and test.
-                cfg = Config.random(seed, ops=ops, byz_modes="equivocate,lie,withhold")
+                cfg = Config.random(seed, ops=ops)  # Byzantine witnesses answer garbage too
                 res = ChaosRun(cfg, log=_log).run()
                 self.assertEqual(res["violations"], [], f"seed {seed}: safety violated: {res['violations']}")
                 self.assertEqual([a["key"] for a in res["anomalies"]], [], f"seed {seed}: {res['anomalies']}")

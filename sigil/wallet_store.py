@@ -143,6 +143,9 @@ def load(wallet_dir: str, network) -> Wallet:
             walk([o.get("lock") for o in tx["body"]["outputs"]])
         w.legacy_keys = set(w.keys) - used
     w.spent = set(state.get("spent", []))
+    # Wallets saved before finalise pruned pledges still list those of consumed inputs.
+    for s in w.spent:
+        w.pledged.pop(s, None)
     w.kill_switches = set(state.get("kill_switches", []))
     w.aborted = state.get("aborted", {})
     w.stamps = defaultdict(list, {pk: list(v) for pk, v in state["stamps"].items()})

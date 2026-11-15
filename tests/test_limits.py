@@ -235,8 +235,8 @@ class StorageBounds(unittest.TestCase):
         junk = {fresh["sigil"]: [{"kind": "bind", "gen": i, "auth": None} for i in range(3 * MAX_GEN)]}
         a = Witness(kp, self.net.registry, self.net.clock)
         a.adopt(self.c, 1, snaps + [junk])
-        self.assertEqual(a.records[fresh["sigil"]].log, [])  # unverifiable entries are dropped
-        self.assertEqual(a.records[fresh["sigil"]].gen, 0)
+        self.assertNotIn(fresh["sigil"], a.records)  # only junk: no record at all (nothing to carry forward)
+        self.assertEqual(a.status(fresh["sigil"])["gen"], 0)
         self.assertEqual(a.spend(fresh)["witness"], kp.pk)
 
     def test_store_keeps_one_row_per_key(self):

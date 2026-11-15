@@ -98,6 +98,42 @@ def verify_heartbeat(h: dict) -> bool:
         return False
 
 
+def unverifiable_death(header: dict, tid: str, proof, registry: Registry) -> bool:
+    """Does ``proof`` pass every check of ``proves_dead`` that needs no charter, while the charter
+    version its evidence names is one ``registry`` does not know (no chain for the home, or not
+    that version yet)? Such a proof cannot be verified here, but may be by someone who knows it."""
+    try:
+        target, gen = proof["sigil"], proof["gen"]
+        p = proof["parcel"]
+        home = p["home"]
+        if [target, gen] not in header["inputs"] or not isinstance(home, str) or sigil_of(p) != target:
+            return False
+        if proof["kind"] == "seal":
+            seal = proof["seal"]
+            votes = votes_of_seal(seal)
+            if not all(isinstance(v, dict) and set(v) == {"witness", "time", "sig"} for v in seal["votes"]):
+                return False
+            if not (seal["sigil"] == target and seal["gen"] == gen and seal["tid"] != tid
+                    and seal["constellation"] == home and votes):
+                return False
+            version = seal["version"]
+        elif proof["kind"] == "votes":
+            votes = proof["votes"]
+            if not isinstance(votes, list) or not votes or any(
+                    v["sigil"] != target or v["gen"] != gen or v["tid"] == tid or v["constellation"] != home
+                    or not isinstance(v["version"], int) or isinstance(v["version"], bool)
+                    or v["version"] != votes[0]["version"] for v in votes):
+                return False
+            version = votes[0]["version"]
+        else:
+            return False
+        if not isinstance(version, int) or isinstance(version, bool):
+            return False
+        return registry.charter(home, version) is None
+    except (KeyError, TypeError, AttributeError, RecursionError):
+        return False
+
+
 def proves_dead(header: dict, tid: str, proof: dict, registry: Registry) -> bool:
     """Does ``proof`` show that transition ``tid`` (with ``header``) can never be sealed?
 

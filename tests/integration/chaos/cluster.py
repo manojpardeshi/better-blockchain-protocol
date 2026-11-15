@@ -164,6 +164,9 @@ class ChaosCluster(Cluster):
             return [sys.executable, "-m", "sigil.witnessd", *common, *w["args"]]
         if kind.startswith("mutant:"):
             return [sys.executable, "-m", "tests.integration.chaos.mutant", kind.split(":", 1)[1], *common, *w["args"]]
+        if kind.startswith("byzk:"):   # a Byzantine standby member (byzantine_standby.py)
+            return [sys.executable, "-m", "tests.integration.chaos.byzantine_standby", *common[1:],
+                    "--modes", kind.split(":", 1)[1], "--seed", str(self.seed * 31 + i)]
         if kind.startswith("byz:"):
             return [sys.executable, "-m", "tests.integration.chaos.byzantine", *common[1:],
                     "--modes", kind.split(":", 1)[1], "--seed", str(self.seed * 31 + i),

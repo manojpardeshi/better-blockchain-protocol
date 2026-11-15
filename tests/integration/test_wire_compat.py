@@ -207,6 +207,9 @@ class WireCompatTests(unittest.TestCase):
         for t in (cls.plain, cls.stamped, cls.limited, cls.standby, cls.heirw):
             for dmn in t:
                 wait_http(dmn.url, proc=dmn.proc, log=dmn.log)
+        # The standby twins report `dead` once dead_man (1 s) has passed with no member heard;
+        # compare their info only once both are past that point, not on either side of it.
+        time.sleep(2)
         cls.owner = KeyPair.from_seed(b"\x07" * 32)
         cls.rec = Recorder()
 
@@ -250,7 +253,9 @@ class WireCompatTests(unittest.TestCase):
         tok = {"Authorization": f"Bearer {self.token}"}
         # --- GET endpoints and unknown paths
         for t, role in ((P, W), (ST, W), (SB, S)):
-            for path in ("/v0/info", "/v0/charters", "/v0/proofs"):
+            for path in ("/v0/info", "/v0/charters", "/v0/proofs", f"/v0/charters/{cid}",
+                         f"/v0/charters/{'ab' * 32}", "/v0/charters/not-a-cid", "/v0/charters/",
+                         "/v0/charters/a/b", f"/v0/charters/{cid}/", f"/v0/charters/{cid}?x=1"):
                 r.send(f"{role} GET {path}", t, role, path)
             r.send(f"{role} GET unknown", t, role, "/v0/nope")
             r.send(f"{role} GET root", t, role, "/")
@@ -429,6 +434,8 @@ class WireCompatTests(unittest.TestCase):
         r.send("adopt info", AD, W, "/v0/info")
         r.send("adopt unknown version", AD, W, "/v0/adopt", {"constellation": cid, "version": 1, "snapshots": []}, headers=tok)
         r.send("adopt spend before adopt", AD, W, "/v0/spend", {"request": good})
+        # A witness that has not joined answers no STATUS (it would read as "unbound" from a member).
+        r.send("adopt status before adopt", AD, W, "/v0/status", {"sigil": good["sigil"]}, expect=403)
         r.send("adopt learns v1", AD, W, "/v0/gossip", {"charters": {cid: chain0 + [a]}}, expect=200)
         r.send("adopt version 0", AD, W, "/v0/adopt", {"constellation": cid, "version": 0, "snapshots": []}, headers=tok)
         r.send("adopt snapshots not a list", AD, W, "/v0/adopt", {"constellation": cid, "version": 1, "snapshots": {}}, headers=tok)

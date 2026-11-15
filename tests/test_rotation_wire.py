@@ -152,7 +152,8 @@ class AdoptHardening(unittest.TestCase):
         w = Witness(new[0], net.registry, net.clock)
         w.adopt(X, 1, junk + snaps)
         self.assertEqual(w.records[s].tid, model.transition_id(h))
-        self.assertEqual(w.records["t"].tid, None)
+        # A sigil whose log holds nothing verifiable gets no record at all (no padding carried).
+        self.assertNotIn("t", w.records)
 
 
 class GossipForkCap(unittest.TestCase):

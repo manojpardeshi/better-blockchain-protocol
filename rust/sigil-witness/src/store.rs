@@ -11,7 +11,10 @@
 //! and `stamp` (key = a redeemed stamp serial). A standby member (`crate::succession`) uses the
 //! kinds of the reference's `StandbyStore`: `pk`, `standby` (`{constellation, version, since}`),
 //! `fenced` (`{constellation, version, charter}`) and `mirror` (key `"<version>|<sigil>"`, value
-//! that sigil's mirror log). Each commit uses `Durability::Immediate`, i.e. redb's
+//! that sigil's mirror log). Both also keep `charter` (key = a constellation id, value = the
+//! longest verified charter chain learned for it by gossip, ADOPT or STANDBY): a restart merges
+//! these into the registry file's chains, so a member never starts with a registry older than
+//! its own version (stores written before have none). Each commit uses `Durability::Immediate`, i.e. redb's
 //! checksummed commit followed by `fdatasync`, so a commit that returned survives a crash or
 //! power loss and a batch lands entirely or not at all.
 //!
@@ -31,6 +34,7 @@ use std::thread;
 
 use redb::{Database, Durability, ReadableTable, TableDefinition};
 
+use crate::charter::Registry;
 use crate::json::{parse_with_depth, Json, MAX_DEPTH};
 
 const STATE: TableDefinition<&str, &[u8]> = TableDefinition::new("state");
@@ -58,6 +62,43 @@ pub struct Loaded {
     pub mirror: HashMap<String, Json>,
     /// A standby member's checkpoint sets (SPEC §5.7), keyed by version.
     pub checkpoint: HashMap<String, Json>,
+    /// Charter chains learned by gossip, ADOPT or STANDBY, keyed by constellation id.
+    pub charters: HashMap<String, Json>,
+}
+
+/// Merge the charter chains a store kept into `registry` (`store.restore_charters`). Only chains
+/// of constellations the registry file already names are restored (rows an older version wrote
+/// for others are ignored, so gossip's constellation cap never becomes permanent). Each chain is
+/// verified again; one that does not verify, or forks from the registry file's, is ignored: the
+/// registry stays as the file has it, and a member that then lacks its own charter version
+/// refuses to vote (fail closed).
+pub fn restore_charters(registry: &mut Registry, charters: &HashMap<String, Json>) {
+    for (cid, chain) in charters {
+        if !registry.contains(cid) {
+            continue;
+        }
+        if let Some(chain) = chain.as_arr() {
+            let _ = registry.add_chain(cid, chain);
+        }
+    }
+}
+
+/// `charter` entries for every chain of a constellation in `keep` (those the registry file names)
+/// that is longer in `new` than in `old` (what gossip learned). A chain only gossip introduced is
+/// not persisted: wallets hand it over again with the evidence that needs it.
+pub fn charter_entries(old: &Registry, new: &Registry, keep: &HashSet<String>) -> Vec<Entry> {
+    let mut out: Vec<Entry> = new
+        .ids()
+        .filter(|cid| keep.contains(*cid) && new.raw_chain(cid).len() > old.raw_chain(cid).len())
+        .map(|cid| charter_entry(new, cid))
+        .collect();
+    out.sort_by(|a, b| a.1.cmp(&b.1));
+    out
+}
+
+/// The `charter` entry for `cid`'s chain in `registry`.
+pub fn charter_entry(registry: &Registry, cid: &str) -> Entry {
+    ("charter".into(), cid.to_string(), Json::Arr(registry.raw_chain(cid).to_vec()))
 }
 
 struct Progress {
@@ -286,9 +327,18 @@ fn load(db: &Database) -> Result<Loaded, String> {
             "checkpoint" => {
                 out.checkpoint.insert(key.to_string(), value);
             }
-            // The store format (2: may hold settled or checkpointed records); readable here.
-            "format" => {}
-            _ => return Err(format!("unknown store entry kind {kind:?}")),
+            // The store format: 2 may hold settled or checkpointed records. A later format is
+            // refused (a record this version cannot read must never be handed over as less).
+            "format" => {
+                if value.as_int().is_none_or(|f| f > 2) {
+                    return Err(format!("store format {} is newer than this version reads", value.canonical_string()));
+                }
+            }
+            "charter" => {
+                out.charters.insert(key.to_string(), value);
+            }
+            // A kind a later version wrote: skipped, so a store can roll back and forward.
+            _ => {}
         }
     }
     Ok(out)

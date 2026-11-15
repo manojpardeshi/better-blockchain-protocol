@@ -122,6 +122,8 @@ fn freeze_and_adopt_survive_restarts() {
     let n = open(&p, "n0", &reg1, &w.cid, true);
     assert_eq!((n.cid(), n.version()), (None, None));
     assert_eq!(n.spend(&ra).0, Err(Error::Rejected("witness not active".into())));
+    // Nor does it answer STATUS: its "unbound" would read as a current member's (rule 3).
+    assert_eq!(n.status(&Json::str(&sa)).0, Err(Error::Rejected("witness not active".into())));
     close(n);
     // Without --adopt a fresh store refuses to start on a rotated constellation.
     let (store, loaded) = Store::open(&dir.path("fresh.redb")).unwrap();
@@ -307,4 +309,60 @@ async fn rotation_calls_need_the_admin_token() {
     assert_eq!((m.cid(), m.version()), (Some(w.cid.clone()), Some(1)));
     let (c, p) = http(maddr, "GET", "/v0/proofs", None, "").await;
     assert_eq!((c, p.get("ok").unwrap().canonical_string()), (200, r#"{"forks":[],"proofs":[]}"#.to_string()));
+}
+
+/// Version 1 of `w`, signed by its four old members (frozen on stores under `dir`).
+fn rotate_to_v1(dir: &TempDir, w: &World, tag: &str) -> Registry {
+    let mut sigs = Vec::new();
+    for i in 0..4 {
+        let o = open(&dir.path(&format!("o{i}.redb")), &format!("{tag}o{i}"), &w.reg0, &w.cid, false);
+        let f = ok(o.freeze(&w.next), &o);
+        sigs.push((o.pk.clone(), f.get("sig").unwrap().clone()));
+        close(o);
+    }
+    registry_v1(w, sigs)
+}
+
+#[test]
+fn adopted_member_votes_after_a_restart_with_an_old_registry_file() {
+    // The store keeps the charter chain ADOPT ran under: a restart from a registry file
+    // written before the rotation still knows the member's own version.
+    let dir = TempDir::new("oldreg");
+    let w = world("lyra", &["m0", "m1", "m2", "m3"]);
+    let reg1 = rotate_to_v1(&dir, &w, "lyra");
+    let far = 1i128 << 40;
+    let (ra, _, _) = spend_request(&w.owner, &w.cid, "aa", 0, far, "a");
+    let p = dir.path("m0.redb");
+    let n = open(&p, "m0", &reg1, &w.cid, true);
+    ok(n.adopt_once(&Json::str(&w.cid), &Json::Int(1), &[]), &n);
+    close(n);
+    let n = open(&p, "m0", &w.reg0, &w.cid, false);
+    assert_eq!(n.registry().chain(&w.cid).len(), 2);
+    assert_eq!(ok(n.spend(&ra), &n).get("version"), Some(&Json::Int(1)));
+    close(n);
+}
+
+#[test]
+fn chain_learned_by_gossip_survives_a_restart() {
+    let dir = TempDir::new("gossipreg");
+    let w = world("vega", &["g0", "g1", "g2", "g3"]);
+    let reg1 = rotate_to_v1(&dir, &w, "vega");
+    let p = dir.path("x.redb");
+    let o = open(&p, "g0", &w.reg0, &w.cid, true);
+    let msg = obj([("charters", obj([(w.cid.as_str(), Json::Arr(reg1.raw_chain(&w.cid).to_vec()))]))]);
+    ok(o.gossip(&msg), &o);
+    assert_eq!(o.registry().chain(&w.cid).len(), 2);
+    close(o);
+    let o = open(&p, "g0", &w.reg0, &w.cid, true);
+    assert_eq!(o.registry().chain(&w.cid).len(), 2);
+    // A constellation the registry file does not name is learned, but not kept across a
+    // restart (gossip's constellation cap must not become permanent).
+    let other = world("deneb", &["d0"]);
+    let msg = obj([("charters", obj([(other.cid.as_str(), Json::Arr(other.reg0.raw_chain(&other.cid).to_vec()))]))]);
+    ok(o.gossip(&msg), &o);
+    assert!(o.registry().contains(&other.cid));
+    close(o);
+    let o = open(&p, "g0", &w.reg0, &w.cid, true);
+    assert!(!o.registry().contains(&other.cid));
+    close(o);
 }

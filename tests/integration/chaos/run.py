@@ -72,6 +72,8 @@ class Config:
     byz: int = 0                    # Byzantine witnesses in constellation 0
     byz_modes: str = "equivocate,lie,withhold,garbage"
     byz_other: int = 0              # Byzantine witnesses in each other constellation (<= f)
+    byz_standby: int = 0            # Byzantine standby members in constellation 0's committee
+    byz_standby_modes: str = "ackonly,lie,signany,junksnap,norelease"
     committee: bool = True          # constellation 0 has a successor committee
     dead_man: int = 4
     probe_every: float = 0.5
@@ -101,14 +103,17 @@ class Config:
         n_const = r.choice([2, 2, 3])
         sizes = [r.choice([4, 4, 5, 7]) for _ in range(n_const)]
         cfg = cls(seed=seed, sizes=sizes, kinds=r.choice(["mixed", "mixed", "mixed", "rust", "python"]),
-                  byz_modes=r.choice(["equivocate,lie,withhold", "equivocate,lie,withhold",
-                                      "equivocate,lie,withhold,garbage"]),
+                  # Every Byzantine witness may also answer garbage (still drawn, so the other
+                  # choices of a seed stay what they were when garbage was a third of the runs).
+                  byz_modes=r.choice(["equivocate,lie,withhold,garbage"] * 3),
                   committee=r.random() < 0.7, rotation=r.random() < 0.6, succession=r.random() < 0.5,
                   skew=r.choice(["none", "within", "within", "beyond_f"]),
                   byz=r.choice([0, 0, 1]), byz_other=r.choice([0, 0, 1]),
                   disk=r.random() < 0.5, delayed_expiry=r.choice([0, 1, 1, 2]),
                   workers=r.choice([1, 2, 2, 3]))
         cfg.succession = cfg.succession and cfg.committee
+        # Drawn last, so the earlier draws (and the shapes of older seeds) stay as they were.
+        cfg.byz_standby = r.choice([0, 0, 1]) if cfg.committee else 0
         for k, v in over.items():
             setattr(cfg, k, v)
         return cfg
@@ -208,6 +213,9 @@ class ChaosRun:
                 m = ("rustm:" + cfg.mutant[5:]) if cfg.mutant.startswith("rust:") else ("mutant:" + cfg.mutant)
                 kinds = [m if k in ("python", "rust") else k for k in kinds]
             committee = self._kinds(4) if (ci == 0 and cfg.committee) else None
+            if committee:
+                for j in range(cfg.byz_standby):
+                    committee[1 + j] = "byzk:" + cfg.byz_standby_modes
             cid = c.create(names[ci], kinds, committee=committee, dead_man=cfg.dead_man if committee else None)
             self.cids.append(cid)
             for i in c.indices(cid):

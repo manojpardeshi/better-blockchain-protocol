@@ -250,6 +250,11 @@ impl Registry {
         self.raw.get(cid).map(Vec::as_slice).unwrap_or(&[])
     }
 
+    /// The ids of the known constellations (in no particular order).
+    pub fn ids(&self) -> impl Iterator<Item = &str> {
+        self.raw.keys().map(String::as_str)
+    }
+
     /// How many constellations are known.
     pub fn len(&self) -> usize {
         self.raw.len()

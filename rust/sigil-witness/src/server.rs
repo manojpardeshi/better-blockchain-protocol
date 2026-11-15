@@ -4,6 +4,7 @@
 //! |--------|-----------------|---------------------|------------------------|
 //! | GET    | `/v0/info`      | —                   | `{pk, constellation, version, frozen, stamps: {n, e} \| null}` |
 //! | GET    | `/v0/charters`  | —                   | `{cid: [charter, …]}`  |
+//! | GET    | `/v0/charters/<cid>` | —              | `[charter, …]`, `[]` if unknown |
 //! | POST   | `/v0/spend`     | `{request}`         | vote                   |
 //! | POST   | `/v0/release`   | `{sigil, proof}`    | new generation         |
 //! | POST   | `/v0/status`    | `{sigil}`           | `{gen, tid, votes}`    |
@@ -115,6 +116,7 @@ pub fn router_with_limits(w: Arc<Witness>, admin_token: Option<String>, limiter:
     let r = Router::new()
         .route("/v0/info", get(info))
         .route("/v0/charters", get(charters))
+        .route("/v0/charters/:cid", get(charter_chain))
         .route("/v0/proofs", get(proofs))
         .route("/v0/:method", post(call).fallback(|| async { error(StatusCode::NOT_FOUND, "bad_request", "unknown path", None) }))
         .fallback(|| async { error(StatusCode::NOT_FOUND, "bad_request", "unknown path", None) })
@@ -154,6 +156,12 @@ async fn info(State(app): State<App>) -> Response {
 
 async fn charters(State(app): State<App>) -> Response {
     reply(StatusCode::OK, &obj([("ok", app.w.registry().to_json())]))
+}
+
+/// One constellation's chain (`[]` if unknown): what a client needs, however many other
+/// chains gossip has handed this witness.
+async fn charter_chain(State(app): State<App>, Path(cid): Path<String>) -> Response {
+    reply(StatusCode::OK, &obj([("ok", Json::Arr(app.w.registry().raw_chain(&cid).to_vec()))]))
 }
 
 async fn proofs(State(app): State<App>) -> Response {
@@ -302,6 +310,7 @@ pub fn standby_router(s: Arc<Standby>, admin_token: Option<String>, limiter: Opt
     let r = Router::new()
         .route("/v0/info", get(sb_info))
         .route("/v0/charters", get(sb_charters))
+        .route("/v0/charters/:cid", get(sb_charter_chain))
         .route("/v0/proofs", get(sb_proofs))
         .route("/v0/:method", post(sb_call).fallback(|| async { error(StatusCode::NOT_FOUND, "bad_request", "unknown path", None) }))
         .fallback(|| async { error(StatusCode::NOT_FOUND, "bad_request", "unknown path", None) })
@@ -315,6 +324,10 @@ async fn sb_info(State(app): State<StandbyApp>) -> Response {
 
 async fn sb_charters(State(app): State<StandbyApp>) -> Response {
     reply(StatusCode::OK, &obj([("ok", app.s.registry().to_json())]))
+}
+
+async fn sb_charter_chain(State(app): State<StandbyApp>, Path(cid): Path<String>) -> Response {
+    reply(StatusCode::OK, &obj([("ok", Json::Arr(app.s.registry().raw_chain(&cid).to_vec()))]))
 }
 
 async fn sb_proofs(State(app): State<StandbyApp>) -> Response {
