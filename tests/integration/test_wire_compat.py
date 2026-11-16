@@ -86,15 +86,11 @@ def normalise(x, bad_sigs: list):
 
 
 # Differences the project documents as deliberate (docs/BENCHMARKS.md "Compatibility notes":
-# "the Rust witness may refuse what the reference accepts, never the reverse"), and minor ones
-# pinned by an expectedFailure test in test_bugs_found.py. Keyed by case name; the value says
-# why. A listed case must still answer an error on the Rust side.
+# "the Rust witness may refuse what the reference accepts, never the reverse"), and minor known
+# wire differences. Keyed by case name; the value says why. A listed case must still answer an
+# error on the Rust side.
 KNOWN: dict = {
     "sell_stamp 0x prefix": "deliberate: hex in stamps must be plain [0-9a-fA-F]+ (BENCHMARKS.md)",
-    "witness GET unknown": "bug: Rust answers 405 with no JSON body (test_bugs_found.RustGetUnknownPath)",
-    "standby GET unknown": "bug: Rust answers 405 with no JSON body (test_bugs_found.RustGetUnknownPath)",
-    "witness GET a POST path": "bug: Rust answers 405 with no JSON body (test_bugs_found.RustGetUnknownPath)",
-    "standby GET a POST path": "bug: Rust answers 405 with no JSON body (test_bugs_found.RustGetUnknownPath)",
     "witness POST v1": "minor: a path outside /v0/ is 404 in Rust, 400 in Python; both bad_request",
     "standby POST v1": "minor: a path outside /v0/ is 404 in Rust, 400 in Python; both bad_request",
 }

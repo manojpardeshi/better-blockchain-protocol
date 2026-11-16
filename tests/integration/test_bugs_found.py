@@ -1,8 +1,6 @@
-"""Bugs found by the soak and compatibility suite, pinned as expected failures.
+"""Regressions found by the soak and compatibility suite.
 
-Each test asserts the correct behaviour and is marked ``unittest.expectedFailure`` until the
-product code is fixed (this suite does not change product code). The docstrings give the
-scenario, the impact and a suggested fix.
+Each test asserts the correct behaviour; its docstring describes the scenario it covers.
 """
 
 import json
@@ -91,34 +89,25 @@ class RustFreezeValidation(_FreezeValidation, unittest.TestCase):
 
 @requires_rust
 class RustGetUnknownPath(unittest.TestCase):
-    """The Rust witness answers ``GET /v0/<name>`` for any name but info/charters/proofs with
-    HTTP 405 and an empty body, not a JSON error object.
+    """Unknown GET paths, including POST-only paths, return a JSON 404 in both Rust roles.
 
-    Scenario: ``GET /v0/nope`` or ``GET /v0/status`` on ``sigil-witness run`` or
-    ``sigil-witness standby``. The router registers ``/v0/:method`` for POST only, so axum
-    answers 405 Method Not Allowed itself before the JSON ``fallback`` runs. The Python
-    daemons answer 404 ``{"error": "bad_request", "message": "unknown path", "vote": null}``
-    (and the Rust witness does so too for paths outside ``/v0/``).
-
-    Impact: low. WIRE.md says "Every reply is one JSON object"; a client that parses every
-    reply (``RemoteWitness._get``) raises a JSON decode error instead of ``Rejected``. Only
-    reachable with a wrong path, so it affects tooling and probes, not payments.
-
-    Suggested fix: in ``server.rs`` add ``.route("/v0/:method", post(call).get(unknown))``
-    (or a ``method_not_allowed_fallback``) answering 404 ``bad_request`` "unknown path",
-    for both ``router_with_limits`` and ``standby_router``.
+    The MethodRouter fallback handles GET requests to ``/v0/:method``; this guards the
+    protocol's JSON error contract for both the witness and standby routers.
     """
 
     def test_get_unknown_path_is_json(self):
-        d = make_tmpdir(self, "get405")
-        c = new_constellation(d, "g", 4)
+        d = make_tmpdir(self, "get-unknown")
+        c = new_constellation(d, "g", 4, committee=4, dead_man=1)
         os.makedirs(os.path.join(d, "logs"))
-        dmn = Daemon("rust", c["keys"][0], c["registry"], c["cid"], os.path.join(d, "w.redb"),
-                     os.path.join(d, "logs", "w.log")).start()
-        self.addCleanup(dmn.stop)
-        for path in ("/v0/nope", "/v0/status"):
-            self.assertEqual(http(dmn.url, path)[:2],
-                             (404, {"error": "bad_request", "message": "unknown path", "vote": None}), path)
+        for role in ("witness", "standby"):
+            key = c["keys"][0] if role == "witness" else c["committee"][0]
+            dmn = Daemon("rust", key, c["registry"], c["cid"], os.path.join(d, f"{role}.redb"),
+                         os.path.join(d, "logs", f"{role}.log"), role=role).start()
+            self.addCleanup(dmn.stop)
+            for path in ("/v0/nope", "/v0/status"):
+                with self.subTest(role=role, path=path):
+                    self.assertEqual(http(dmn.url, path)[:2],
+                                     (404, {"error": "bad_request", "message": "unknown path", "vote": None}))
 
 
 class LegacyWalletPreUpgradeAddress(unittest.TestCase):
