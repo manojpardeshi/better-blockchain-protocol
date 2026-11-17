@@ -1459,7 +1459,9 @@ def main(argv=None) -> int:
             with open(a.out, "w") as f:
                 json.dump({"summary": summarize(results), "runs": results}, f, indent=1, default=str)
     print(json.dumps(summarize(results), indent=1, default=str))
-    return 1 if any(r["violations"] or r["anomalies"] for r in results) else 0
+    return 1 if any(r["violations"] or r["anomalies"] or
+                    any(not x["kind"].startswith("known:") for x in r["liveness"])
+                    for r in results) else 0
 
 
 if __name__ == "__main__":
