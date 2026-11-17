@@ -664,7 +664,7 @@ class ChaosRun:
                     break
                 except RotationIncomplete as e:
                     self.faults["rotation-incomplete"] += 1
-                    v = self._finish_rotation(net, cid, e.pending)
+                    v = self._finish_rotation(net, cid, e)
                     break
                 except (RuntimeError, Rejected) as e:
                     self.log(f"rotation attempt {attempt}: {e}")
@@ -679,14 +679,16 @@ class ChaosRun:
             self.log(f"rotated {cid[:8]} to v{v} ({[self.c.witnesses[i]['kind'] for i in new_idx]})")
             return "ok"
 
-    def _finish_rotation(self, net, cid: str, pending: list) -> int:
+    def _finish_rotation(self, net, cid: str, incomplete: RotationIncomplete) -> int:
         chain = net.registry.chain(cid)
         nxt = chain[-1]["body"]
+        # A checkpointed charter rejects FREEZE and ADOPT retries without the same set.
+        pending, checkpoint = incomplete.pending, getattr(incomplete, "checkpoint", None)
         for attempt in range(20):
             snaps, still = [], []
             for url in self.directory[cid]:
                 try:
-                    sig, snap = RemoteWitness(url, 5, admin_token=TOKEN).freeze(nxt)
+                    sig, snap = RemoteWitness(url, 5, admin_token=TOKEN).freeze(nxt, checkpoint)
                 except Rejected:
                     continue
                 snaps.append(snap)
@@ -695,7 +697,7 @@ class ChaosRun:
                     RemoteWitness(url, 5).gossip({"charters": {cid: chain}})
                     w = RemoteWitness(url, 5, admin_token=TOKEN)
                     if w.cid is None:
-                        w.adopt(cid, nxt["version"], snaps)
+                        w.adopt(cid, nxt["version"], snaps, checkpoint)
                 except Rejected:
                     still.append(url)
             if not still:
@@ -741,7 +743,7 @@ class ChaosRun:
                         break
                     except RotationIncomplete as e:
                         self.faults["succession-incomplete"] += 1
-                        v = self._finish_succession(net, cid, e.pending)
+                        v = self._finish_succession(net, cid, e)
                         break
                     except (RuntimeError, Rejected) as e:
                         self.log(f"succession attempt {attempt}: {e}")
@@ -768,7 +770,7 @@ class ChaosRun:
                             v = net.rotate(cid, new_urls, TOKEN, committee_urls=new_k, dead_man=self.cfg.dead_man)
                             break
                         except RotationIncomplete as e:
-                            v = self._finish_succession(net, cid, e.pending)
+                            v = self._finish_succession(net, cid, e)
                             break
                         except (RuntimeError, Rejected) as e:
                             self.log(f"recovery rotation attempt {attempt}: {e}")
@@ -787,20 +789,21 @@ class ChaosRun:
             self.log(f"succession of {cid[:8]} to v{v}")
             return "ok"
 
-    def _finish_succession(self, net, cid: str, pending: list) -> int:
+    def _finish_succession(self, net, cid: str, incomplete: RotationIncomplete) -> int:
         chain = net.registry.chain(cid)
         nxt = chain[-1]["body"]
+        pending, checkpoint = incomplete.pending, getattr(incomplete, "checkpoint", None)
         for attempt in range(20):
             snaps, still = [], []
             for url in self.committees[cid]:
                 try:
-                    sig, snap = RemoteStandby(url, 5, admin_token=TOKEN).succeed(nxt)
+                    sig, snap = RemoteStandby(url, 5, admin_token=TOKEN).succeed(nxt, checkpoint=checkpoint)
                 except Rejected:
                     continue
                 snaps.append(snap)
             for url in self.directory[cid]:   # a cooperative completion also hands over the members' evidence
                 try:
-                    snaps.append(RemoteWitness(url, 5, admin_token=TOKEN).freeze(nxt)[1])
+                    snaps.append(RemoteWitness(url, 5, admin_token=TOKEN).freeze(nxt, checkpoint)[1])
                 except Rejected:
                     continue
             for url in pending:
@@ -810,11 +813,11 @@ class ChaosRun:
                     if info.get("role") == "standby":
                         m = RemoteStandby(url, 5, admin_token=TOKEN)
                         if m.version != nxt["version"]:
-                            m.enter(cid, nxt["version"], snaps)
+                            m.enter(cid, nxt["version"], snaps, checkpoint)
                     else:
                         w = RemoteWitness(url, 5, admin_token=TOKEN)
                         if w.cid is None:
-                            w.adopt(cid, nxt["version"], snaps)
+                            w.adopt(cid, nxt["version"], snaps, checkpoint)
                 except Rejected:
                     still.append(url)
             if not still:

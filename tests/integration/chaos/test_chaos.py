@@ -37,11 +37,12 @@ import threading
 import time
 import unittest
 from contextlib import redirect_stdout
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from sigil import model
 from sigil.charter import Registry
-from sigil.server import RemoteStandby, RemoteWitness
+from sigil.server import RemoteStandby, RemoteWitness, RotationIncomplete
 from sigil.wallet import SealFailed, request_seal
 from sigil.witness import Rejected
 
@@ -59,6 +60,99 @@ def _log(line):
 
 def kinds_of(violations) -> set:
     return {v["kind"] for v in violations}
+
+
+class HarnessCheckpointRecovery(unittest.TestCase):
+    def test_incomplete_rotation_reuses_its_checkpoint(self):
+        checkpoint = [["sigil", 0, "tid"]]
+        incomplete = RotationIncomplete(1, ["new"])
+        incomplete.checkpoint = checkpoint
+        net = SimpleNamespace(registry=SimpleNamespace(chain=lambda _cid: [{"body": {"version": 1}}]))
+        calls = []
+
+        class Member:
+            def __init__(self, url, *_args, **_kwargs):
+                self.url = url
+                self.cid = None if url == "new" else "cid"
+
+            def freeze(self, _nxt, ck=None):
+                self.assert_checkpoint(ck)
+                calls.append("freeze")
+                return "signature", {}
+
+            def gossip(self, _chains):
+                pass
+
+            def adopt(self, _cid, _version, _snapshots, ck=None):
+                self.assert_checkpoint(ck)
+                calls.append("adopt")
+
+            @staticmethod
+            def assert_checkpoint(ck):
+                if ck != checkpoint:
+                    raise Rejected("missing checkpoint")
+
+        with tempfile.TemporaryDirectory() as directory:
+            run = ChaosRun(Config(seed=12, skew="none"), workdir=directory)
+            run.directory = {"cid": ["old"]}
+            with patch("tests.integration.chaos.run.RemoteWitness", Member):
+                self.assertEqual(run._finish_rotation(net, "cid", incomplete), 1)
+        self.assertEqual(calls, ["freeze", "adopt"])
+
+    def test_incomplete_succession_reuses_its_checkpoint(self):
+        checkpoint = [["sigil", 0, "tid"]]
+        incomplete = RotationIncomplete(1, ["new", "new_k"])
+        incomplete.checkpoint = checkpoint
+        net = SimpleNamespace(registry=SimpleNamespace(chain=lambda _cid: [{"body": {"version": 1}}]))
+        calls = []
+
+        class Member:
+            def __init__(self, url, *_args, **_kwargs):
+                self.url = url
+                self.cid = None if url == "new" else "cid"
+
+            def freeze(self, _nxt, ck=None):
+                if ck != checkpoint:
+                    raise Rejected("missing checkpoint")
+                calls.append("freeze")
+                return "signature", {}
+
+            def gossip(self, _chains):
+                pass
+
+            def adopt(self, _cid, _version, _snapshots, ck=None):
+                if ck != checkpoint:
+                    raise Rejected("missing checkpoint")
+                calls.append("adopt")
+
+        class Standby:
+            def __init__(self, url, *_args, **_kwargs):
+                self.url = url
+                self.version = None
+
+            def succeed(self, _nxt, checkpoint=None):
+                if checkpoint != expected_checkpoint:
+                    raise Rejected("missing checkpoint")
+                calls.append("succeed")
+                return "signature", {}
+
+            def info(self):
+                return {"role": "standby" if self.url == "new_k" else "witness"}
+
+            def enter(self, _cid, _version, _snapshots, ck=None):
+                if ck != expected_checkpoint:
+                    raise Rejected("missing checkpoint")
+                calls.append("enter")
+
+        expected_checkpoint = checkpoint
+        with tempfile.TemporaryDirectory() as directory:
+            run = ChaosRun(Config(seed=12, skew="none"), workdir=directory)
+            run.directory = {"cid": ["old"]}
+            run.committees = {"cid": ["old_k"]}
+            with patch("tests.integration.chaos.run.RemoteWitness", Member), \
+                 patch("tests.integration.chaos.run.RemoteStandby", Standby):
+                self.assertEqual(run._finish_succession(net, "cid", incomplete), 1)
+        self.assertEqual(calls, ["succeed", "freeze", "adopt", "enter"])
 
 
 class HarnessLifecycle(unittest.TestCase):
