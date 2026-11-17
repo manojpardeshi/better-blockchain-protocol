@@ -139,9 +139,12 @@ class ChaosRun:
         self.faults = Counter()
         self.anomalies: list = []
         self.violations: list = []
+        self.uncertain: list = []
         self.liveness: list = []
         self.notes: list = []
-        self.released: list = []          # (sigil, gen, tid) pledges honest wallets released
+        # One tid may have several pledge episodes when another input keeps a
+        # pending transition alive.
+        self.released: list[invariants.ReleasedPledge] = []
         self.payee_of: dict = {}          # tid -> (payer, payee, [ref])
         self.undelivered: list = []       # (payer, payee, tid, refs)
         self.swaps: list = []             # (a, b, header, body, tid)
@@ -275,15 +278,32 @@ class ChaosRun:
                    deep_threshold=self.cfg.deep_threshold if honest else None)
         self.wallet_locks[name] = threading.Lock()
         if honest:
+            def pledged(_wallet):
+                for sigil, (gen, tid, _expires) in _wallet.pledged.items():
+                    for released in self.released:
+                        if (released.sigil, released.gen, released.tid) == (sigil, gen, tid) \
+                                and released.reauthorised_order is None:
+                            released.reauthorised_order = self.obs.mark()
+                            released.reauthorised_clock = int(_wallet.clock())
+
+            w.on_pledge = pledged
             real = w.unpledge_if_unbound
 
             def unpledge(sigil, _real=real, _w=w):
                 pledge = _w.pledged.get(sigil)
+                # A vote racing with the STATUS sweep must remain suspect if the
+                # sweep nevertheless releases the pledge.
+                began = self.obs.mark()
+                began_clock = int(_w.clock())
                 ok = _real(sigil)
+                ended = self.obs.mark()
+                ended_clock = int(_w.clock())
                 if ok and pledge is not None:
                     home = self._home_of(_w, sigil)
                     cur = _w.network.registry.latest(home) if home else None
-                    self.released.append((sigil, pledge[0], pledge[1], cur["version"] if cur else 0))
+                    self.released.append(invariants.ReleasedPledge(
+                        sigil, pledge[0], pledge[1], cur["version"] if cur else 0,
+                        began, ended, began_clock, ended_clock, _w.max_skew))
                     self.faults["pledges-released"] += 1
                     hook = getattr(_w, "_chaos_on_release", None)
                     if hook is not None:
@@ -1124,10 +1144,11 @@ class ChaosRun:
         """Coins of ``w`` whose released pledge the home's current members are bound to again
         (the succession finding, test_chaos.Findings): known, reported apart."""
         out = []
-        released = {(s, t) for s, _g, t, _v in self.released}
+        released = {(r.sigil, r.gen, r.tid) for r in self.released
+                    if r.reauthorised_order is None}
         for h in w.holdings.values():
-            for s, t in released:
-                if s != h["sigil"]:
+            for s, g, t in released:
+                if s != h["sigil"] or h["gen"] != g or (w.pledged.get(s) or ())[:2] == (g, t):
                     continue
                 for rw in w.network.all_witnesses(h["parcel"]["home"]):
                     try:
@@ -1260,7 +1281,8 @@ class ChaosRun:
                 extra_headers[tid] = tx["header"]
         self.violations += invariants.check(self.obs, registry, honest=honest, clocked=clocked,
                                             released=self.released, final_status=final,
-                                            extra_seals=extra_seals, extra_headers=extra_headers)
+                                            extra_seals=extra_seals, extra_headers=extra_headers,
+                                            uncertain=self.uncertain)
         self._check_wallets(registry)
 
     def _check_wallets(self, registry) -> None:
@@ -1328,6 +1350,7 @@ class ChaosRun:
             "votes_observed": len(self.obs.votes),
             "transitions_observed": len(self.obs.headers),
             "violations": self.violations,
+            "uncertain": self.uncertain,
             "liveness": self.liveness,
             "anomalies": self.anomalies,
             "dir": self.tmp,
@@ -1343,7 +1366,8 @@ class ChaosRun:
 
 def summarize(results: list) -> dict:
     agg = {"runs": len(results), "duration": 0.0, "ops": Counter(), "faults": Counter(), "proxy": Counter(),
-           "kills": 0, "votes_observed": 0, "violations": Counter(), "liveness": Counter(), "anomalies": Counter(),
+           "kills": 0, "votes_observed": 0, "violations": Counter(), "uncertain": Counter(),
+           "liveness": Counter(), "anomalies": Counter(),
            "seeds_with_violations": [], "seeds_with_liveness_failures": [], "seeds_with_anomalies": []}
     for r in results:
         agg["duration"] += r["duration"]
@@ -1354,6 +1378,8 @@ def summarize(results: list) -> dict:
         agg["votes_observed"] += r["votes_observed"]
         for v in r["violations"]:
             agg["violations"][v["kind"]] += 1
+        for v in r.get("uncertain", []):
+            agg["uncertain"][v["kind"]] += 1
         for v in r["liveness"]:
             agg["liveness"][v["kind"]] += 1
         for a in r["anomalies"]:
@@ -1364,7 +1390,7 @@ def summarize(results: list) -> dict:
             agg["seeds_with_liveness_failures"].append(r["seed"])
         if r["anomalies"]:
             agg["seeds_with_anomalies"].append(r["seed"])
-    for k in ("ops", "faults", "proxy", "violations", "liveness", "anomalies"):
+    for k in ("ops", "faults", "proxy", "violations", "uncertain", "liveness", "anomalies"):
         agg[k] = dict(agg[k])
     agg["duration"] = round(agg["duration"], 1)
     return agg
@@ -1417,6 +1443,7 @@ def main(argv=None) -> int:
         results.append(res)
         print(json.dumps({"seed": seed, "duration": res["duration"], "ops": sum(res["ops"].values()),
                           "kills": res["kills"], "violations": [v["kind"] for v in res["violations"]],
+                          "uncertain": [v["kind"] for v in res["uncertain"]],
                           "liveness": [v["kind"] for v in res["liveness"]],
                           "anomalies": [x["key"] for x in res["anomalies"]]}), flush=True)
         if a.out:

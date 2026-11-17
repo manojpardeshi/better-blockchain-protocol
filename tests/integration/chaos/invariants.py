@@ -15,8 +15,9 @@ can be resolved to the inputs it consumes), and which process emitted which vote
 * **S5 durability**: every vote an honest process sent is still in its STATUS at the end
   (after any number of SIGKILLs and restarts, disk-full episodes included).
 * **S6 expiry**: no honest, correctly clocked witness of the version the wallet checked (or a
-  later one) ever voted for a transition at a generation whose pledge an honest wallet had
-  released (SPEC §4 rule 3). **S6b**: no honest witness of version 0 ever created a vote, by
+  later one) voted for a transition during the interval after an honest wallet released its
+  pledge and before it authorised the same transition again (SPEC §4 rule 3). **S6b**: no
+  honest witness of version 0 ever created a vote, by
   its own clock, later than the latest ``expires`` any request for that binding carried
   (it never newly binds on an expired authorisation, SPEC §5.1 step 4).
 * **S3 conservation** and **S4 fresh verification** are wallet-level and live in run.py.
@@ -24,12 +25,28 @@ can be resolved to the inputs it consumes), and which process emitted which vote
 
 import threading
 from collections import defaultdict
+from dataclasses import dataclass
 
 from sigil.charter import quorum
 from sigil.model import VOTE_FIELDS, transition_id
 from sigil.proofs import verify_seal, verify_vote
 
 VOTE_KEYS = frozenset(VOTE_FIELDS) | {"sig"}
+
+
+@dataclass
+class ReleasedPledge:
+    sigil: str
+    gen: int
+    tid: str
+    version: int
+    sweep_started_order: int
+    released_order: int
+    sweep_started_clock: int
+    released_clock: int
+    max_skew: int
+    reauthorised_order: int | None = None
+    reauthorised_clock: int | None = None
 
 
 def _vote_key(v: dict) -> tuple:
@@ -40,6 +57,8 @@ class Observer:
     def __init__(self):
         self.lock = threading.Lock()
         self.votes: dict[tuple, dict] = {}          # vote key -> vote (verified)
+        self.vote_seen: dict[tuple, int] = {}        # first observation in the event order
+        self.order = 0
         self.headers: dict[str, dict] = {}          # tid -> header (from SPEND / MIRROR requests)
         self.expires: dict[tuple, int] = {}         # (sigil, tid) -> latest unlock.expires requested
         self.emitted: dict[str, set] = defaultdict(set)   # proxy name -> vote keys it relayed from its process
@@ -80,10 +99,19 @@ class Observer:
         except (TypeError, KeyError, ValueError):
             return False
         with self.lock:
-            self.votes.setdefault(k, {f: v[f] for f in VOTE_KEYS})
+            if k not in self.votes:
+                self.order += 1
+                self.vote_seen[k] = self.order
+                self.votes[k] = {f: v[f] for f in VOTE_KEYS}
             if source is not None and self.pk_of.get(source) == v["witness"]:
                 self.emitted[source].add(k)
         return True
+
+    def mark(self) -> int:
+        """Order a wallet event against votes observed by the fault proxies."""
+        with self.lock:
+            self.order += 1
+            return self.order
 
     def add_header(self, header) -> None:
         try:
@@ -142,13 +170,16 @@ class Observer:
 
 
 def check(obs: Observer, registry, *, honest: set, clocked: set, released: list, final_status: dict,
-          extra_seals=(), extra_headers=None) -> list:
+          extra_seals=(), extra_headers=None, uncertain: list | None = None) -> list:
     """Every safety violation found, as ``{"kind", ...}`` dicts.
 
     ``honest``: witness keys that run honest code; ``clocked``: those whose clock stayed
     within the configured skew bound (S6 applies to them only); ``released``: pledges
-    ``(sigil, gen, tid, version)`` honest wallets released, with the home's version then; ``final_status``: ``{proxy name:
-    {sigil: status}}`` read from every honest process at the end.
+    ``ReleasedPledge`` events from honest wallets, with the home's version then.
+    Event orders are marked under the Observer lock; a later authorisation of
+    the *same* tid ends the unpledged interval. ``uncertain`` receives matches
+    whose signing order cannot be proved within the clock-skew margin.
+    ``final_status``: ``{proxy name: {sigil: status}}`` read at the end.
     """
     violations = []
     headers = dict(obs.headers)
@@ -175,6 +206,7 @@ def check(obs: Observer, registry, *, honest: set, clocked: set, released: list,
     # S2: an honest key never signs two tids for one (constellation, sigil, gen)
     with obs.lock:
         votes = list(obs.votes.values())
+        vote_seen = dict(obs.vote_seen)
     by: dict[tuple, set] = defaultdict(set)
     for v in votes:
         if v["witness"] in honest:
@@ -200,19 +232,50 @@ def check(obs: Observer, registry, *, honest: set, clocked: set, released: list,
             if k not in held:
                 violations.append({"kind": "S5-vote-forgotten", "process": source, "vote": list(k)})
 
-    # S6: nothing voted (honest, well-clocked) for a released pledge, in the version the
-    # wallet checked or a later one. (A straggler of an older version, one that missed the
-    # FREEZE, may still vote: at most f honest stragglers, so never a seal, SPEC §8.)
-    rel = {}
-    for s, g, t, version in released:
-        rel[(s, g, t)] = min(version, rel.get((s, g, t), version))
+    # A pending multi-input transition may later re-authorise the same tid. Use
+    # signed time and the clock-skew bound to prove a vote belongs to the gap.
+    # Observation order alone is insufficient: a proxy can deliver a signed
+    # pre-release vote only after the wallet releases. Conversely, a vote known
+    # before the STATUS sweep means release violated rule 3's no-binding test.
+    # Older-version stragglers are excluded (SPEC §8).
+    rel = defaultdict(list)
+    for r in released:
+        rel[(r.sigil, r.gen, r.tid)].append(r)
     for v in votes:
         k = (v["sigil"], v["gen"], v["tid"])
-        if (v["witness"] in honest and v["witness"] in clocked and k in rel
-                and isinstance(v["version"], int) and v["version"] >= rel[k]):
-            violations.append({"kind": "S6-vote-after-pledge-release", "witness": v["witness"],
-                               "sigil": v["sigil"], "gen": v["gen"], "tid": v["tid"], "time": v["time"],
-                               "version": v["version"]})
+        if v["witness"] not in honest or v["witness"] not in clocked:
+            continue
+        seen = vote_seen.get(_vote_key(v), float("inf"))
+        for r in rel[k]:
+            if not isinstance(v["version"], int) or v["version"] < r.version:
+                continue
+            detail = {"witness": v["witness"], "sigil": v["sigil"], "gen": v["gen"],
+                      "tid": v["tid"], "time": v["time"], "version": v["version"]}
+            if seen <= r.sweep_started_order and v["version"] == r.version:
+                # This same-version vote was already visible before the wallet
+                # began its all-member STATUS sweep, which must refuse release.
+                violations.append({"kind": "S6-release-despite-prior-vote", **detail})
+                break
+            if seen <= r.sweep_started_order or (isinstance(v["time"], int) and
+                                                  v["time"] < r.sweep_started_clock - r.max_skew - 1):
+                if uncertain is not None:
+                    uncertain.append({"kind": "S6-prior-vote-observed-outside-sweep", **detail,
+                                      "released_clock": r.released_clock})
+                continue
+            if (r.reauthorised_clock is not None and isinstance(v["time"], int) and
+                    v["time"] > r.reauthorised_clock + r.max_skew + 1):
+                # Definitely signed after the owner renewed this same tid.
+                continue
+            if (isinstance(v["time"], int) and
+                    v["time"] > r.released_clock + r.max_skew + 1 and
+                    (r.reauthorised_clock is None or
+                     v["time"] < r.reauthorised_clock - r.max_skew - 1)):
+                violations.append({"kind": "S6-vote-after-pledge-release", **detail})
+                break
+            if uncertain is not None:
+                uncertain.append({"kind": "S6-vote-order-uncertain", **detail,
+                                  "released_clock": r.released_clock,
+                                  "reauthorised_clock": r.reauthorised_clock})
     # S6b: no honest founding member (version 0: it never inherits a binding by ADOPT) votes,
     # by its own clock, after the latest expiry any request for that binding carried, so it
     # never newly bound on an expired authorisation (SPEC §5.1 step 4). One second of slack:
