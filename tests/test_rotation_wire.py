@@ -76,10 +76,11 @@ class RotationOverHttp(unittest.TestCase):
         seal = model.seal_from_votes([w.spend(req) for w in self.old])
         cert = {"header": header, "inputs": [{"parcel": {"home": self.X, "lock": parcel["lock"],
                                                  "salt": parcel["salt"]}, "seal": seal}]}
-        for w in self.old:
+        for w in self.old[:3]:
             w.settle(cert)
         checkpoint = [[sigil, 0, tid]]
         self.assertEqual(self.old[0].settled_records()["settled"], checkpoint)
+        self.assertEqual(self.old[3].settled_records()["settled"], [])
 
         new_keys = [KeyPair.generate() for _ in range(4)]
         old_urls = [f"old-{i}" for i in range(4)]
@@ -104,9 +105,7 @@ class RotationOverHttp(unittest.TestCase):
                 return self.w.cid
 
             def settled_records(self):
-                # The first SETTLED round misses the available record, as it
-                # can when that reply is delayed or one member answers empty.
-                return self.w.settled_records() if phase[0] else {"settled": [], "checkpointed": []}
+                return self.w.settled_records()
 
             def freeze(self, body, checkpoint=None):
                 i = old_urls.index(self.url)
@@ -138,6 +137,9 @@ class RotationOverHttp(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "not enough live witnesses"):
                 operator.rotate(cid, new_urls, TOKEN)
             self.assertEqual(sum(w.frozen for w in self.old), 3)
+            # The still-active fourth member settles between attempts, so the
+            # next SETTLED intersection would propose a new checkpoint.
+            self.old[3].settle(cert)
             phase[0] = 1
             self.assertEqual(operator.rotate(cid, new_urls, TOKEN), 1)
         self.assertEqual(len({w.frozen_for for w in self.old}), 1)
