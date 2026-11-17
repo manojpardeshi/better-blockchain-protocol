@@ -890,6 +890,10 @@ class RemoteNetwork:
         self.committees: dict[str, list] = {cid: list(urls) for cid, urls in (committees or {}).items()}
         self._clients: dict[str, RemoteWitness] = {}
         self._standbys: dict[str, RemoteStandby] = {}
+        # FREEZE is irreversible. Keep the proposed successor stable when an
+        # operator retries after fewer than a quorum answered; SETTLED replies
+        # can change between attempts and otherwise change its checkpoint.
+        self._rotation_plans: dict[tuple, tuple[list, dict]] = {}
         self.down: set[str] = set()
         for cid in self.urls:
             self.refresh_charters(cid)
@@ -972,7 +976,9 @@ class RemoteNetwork:
         verify is dropped together with its evidence. Raises ``RuntimeError`` if
         fewer than a quorum signed (the members that did sign stay frozen, as
         with ``Network.rotate``), and ``RotationIncomplete`` if the new version
-        is in force but some new member or standby member has not adopted.
+        is in force but some new member or standby member has not adopted. A
+        retry on this operator for the same parent charter, successor keys,
+        committee and options reuses its original checkpoint and charter body.
         """
         token = admin_token.get if isinstance(admin_token, dict) else (lambda _url: admin_token)
         chain, cur = self._current(cid)
@@ -984,10 +990,21 @@ class RemoteNetwork:
                 olds.append(RemoteWitness(url, self.timeout, admin_token=token(url)))
             except Rejected:
                 continue
-        ck = plan_checkpoint(cur, settled_answers([w for w in olds if w.pk in cur["witnesses"]]), compact)
-        ck = _gate_checkpoint(ck, cur, new + standbys)
-        nxt = charter_body(cur["name"], cur["version"] + 1, [w.pk for w in new], charter_hash(cur), succ,
-                           checkpoint_hash(ck) if ck else None)
+        plan_key = (cid, charter_hash(cur), tuple(w.pk for w in new), tuple(m.pk for m in standbys),
+                    dead_man, compact)
+        plans = getattr(self, "_rotation_plans", None)
+        if plans is None:
+            plans = self._rotation_plans = {}
+        if plan_key in plans:
+            ck, nxt = plans[plan_key]
+            if ck and any("checkpoint" not in getattr(m, "features", []) for m in new + standbys):
+                raise RuntimeError("a new member or standby member no longer supports the planned checkpoint")
+        else:
+            ck = plan_checkpoint(cur, settled_answers([w for w in olds if w.pk in cur["witnesses"]]), compact)
+            ck = _gate_checkpoint(ck, cur, new + standbys)
+            nxt = charter_body(cur["name"], cur["version"] + 1, [w.pk for w in new], charter_hash(cur), succ,
+                               checkpoint_hash(ck) if ck else None)
+            plans[plan_key] = (ck, nxt)
         sigs, snapshots = {}, []
         for w in olds:
             try:
@@ -1006,8 +1023,11 @@ class RemoteNetwork:
             if len(csigs) < quorum(len(cur["successor"]["committee"])):
                 raise RuntimeError("not enough live standby members to sign the rotation")
             sigs.update(csigs)
-        return self._install(cid, chain, cur, nxt, sigs, snapshots, new, frozen, standbys,
-                             list(new_urls), list(committee_urls or []), ck)
+        try:
+            return self._install(cid, chain, cur, nxt, sigs, snapshots, new, frozen, standbys,
+                                 list(new_urls), list(committee_urls or []), ck)
+        finally:
+            plans.pop(plan_key, None)
 
     def succeed(self, cid: str, new_urls: list, admin_token, *, committee_urls: list | None = None,
                 dead_man: int | None = None) -> int:

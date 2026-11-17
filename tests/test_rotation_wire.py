@@ -5,6 +5,7 @@ reference's own server.
 """
 
 import unittest
+from unittest.mock import patch
 
 from sigil import Network, Wallet, locks, model
 from sigil.charter import Registry, charter_body, charter_hash
@@ -55,6 +56,96 @@ class RotationOverHttp(unittest.TestCase):
         carol = Wallet("carol", RemoteNetwork({self.X: urls}), self.X, deep_threshold=1)
         alice.pay(carol, usd, 5)
         self.assertEqual(carol.balance(usd), 5)
+
+    def test_partial_freeze_retry_keeps_the_same_checkpoint(self):
+        """A changed SETTLED answer must not change a retry's successor body.
+
+        Three members can freeze while only two replies arrive. A later
+        compacting checkpoint would name a different charter, which those
+        three must refuse forever. The operator must retry its first plan.
+        """
+        owner = KeyPair.generate()
+        parcel = model.parcel(self.X, "x", 1, locks.sig(owner.pk), "settled")
+        sigil = model.sigil_of(parcel)
+        header = {"inputs": [[sigil, 0]], "body": "a" * 64}
+        tid = model.transition_id(header)
+        unlock = locks.empty_unlock(int(self.sim.clock()) + 1000)
+        unlock["sigs"][owner.pk] = locks.sign_unlock(owner, sigil, tid, unlock["expires"])
+        req = {"sigil": sigil, "header": header, "home": self.X, "lock": parcel["lock"],
+               "salt": parcel["salt"], "unlock": unlock}
+        seal = model.seal_from_votes([w.spend(req) for w in self.old])
+        cert = {"header": header, "inputs": [{"parcel": {"home": self.X, "lock": parcel["lock"],
+                                                 "salt": parcel["salt"]}, "seal": seal}]}
+        for w in self.old[:3]:
+            w.settle(cert)
+        checkpoint = [[sigil, 0, tid]]
+        self.assertEqual(self.old[0].settled_records()["settled"], checkpoint)
+        self.assertEqual(self.old[3].settled_records()["settled"], [])
+
+        new_keys = [KeyPair.generate() for _ in range(4)]
+        old_urls = [f"old-{i}" for i in range(4)]
+        new_urls = [f"new-{i}" for i in range(4)]
+        members = dict(zip(old_urls, self.old))
+        for url, kp in zip(new_urls, new_keys):
+            reg = Registry()
+            reg.add_chain(self.X, self.sim.registry.chain(self.X))
+            members[url] = Witness(kp, reg, self.sim.clock)
+        phase = [0]
+        cid = self.X
+
+        class Member:
+            def __init__(self, url, *_args, **_kwargs):
+                self.url = url
+                self.w = members[url]
+                self.pk = self.w.pk
+                self.features = ["checkpoint"]
+
+            @property
+            def cid(self):
+                return self.w.cid
+
+            def settled_records(self):
+                return self.w.settled_records()
+
+            def freeze(self, body, checkpoint=None):
+                i = old_urls.index(self.url)
+                if phase[0] == 0 and i == 2:
+                    # FREEZE can commit even when its reply is lost.
+                    self.w.freeze(body, checkpoint)
+                    raise Rejected("reply lost")
+                if phase[0] == 0 and i == 3:
+                    raise Rejected("temporarily unreachable")
+                return self.w.freeze(body, checkpoint)
+
+            def gossip(self, data):
+                for target, chain in data["charters"].items():
+                    self.w.registry.add_chain(target, chain)
+
+            def adopt(self, cid, version, snapshots, checkpoint=None):
+                self.w.adopt(cid, version, snapshots, checkpoint)
+
+        operator = RemoteNetwork.__new__(RemoteNetwork)
+        operator.registry = self.sim.registry
+        operator.urls = {self.X: old_urls}
+        operator.committees = {}
+        operator.timeout = 1
+        operator._clients = {}
+        operator._standbys = {}
+        operator.down = set()
+        operator.refresh_charters = lambda _cid: None
+        with patch("sigil.server.RemoteWitness", Member):
+            with self.assertRaisesRegex(RuntimeError, "not enough live witnesses"):
+                operator.rotate(cid, new_urls, TOKEN)
+            self.assertEqual(sum(w.frozen for w in self.old), 3)
+            # The still-active fourth member settles between attempts, so the
+            # next SETTLED intersection would propose a new checkpoint.
+            self.old[3].settle(cert)
+            phase[0] = 1
+            self.assertEqual(operator.rotate(cid, new_urls, TOKEN), 1)
+        self.assertEqual(len({w.frozen_for for w in self.old}), 1)
+        self.assertEqual(operator.registry.latest(cid).get("checkpoint"), None)
+        self.assertTrue(all(members[url].cid == cid for url in new_urls))
+        self.assertEqual(operator._rotation_plans, {})
 
     def test_rotation_calls_need_the_token_and_adopt_runs_once(self):
         cur = self.sim.registry.latest(self.X)
