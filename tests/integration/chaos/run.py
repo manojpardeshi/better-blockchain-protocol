@@ -785,17 +785,7 @@ class ChaosRun:
                     # this very successor cooperatively: rotate to the same members and committee.
                     self.log("succession failed with fenced standby members; completing it by rotation")
                     self.faults["failed-succession-fenced"] += 1
-                    for attempt in range(10):
-                        try:
-                            v = net.rotate(cid, new_urls, TOKEN, committee_urls=new_k, dead_man=self.cfg.dead_man)
-                            break
-                        except RotationIncomplete as e:
-                            v = self._finish_succession(net, cid, e)
-                            break
-                        except (RuntimeError, Rejected) as e:
-                            self.log(f"recovery rotation attempt {attempt}: {e}")
-                            self._restart_down(range(len(self.c.witnesses)))
-                            time.sleep(1)
+                    v = self._recover_fenced_succession(net, cid, new_urls, new_k)
                     if v is not None:
                         self.faults["failed-succession-recovered"] += 1
             if v is None:
@@ -808,6 +798,22 @@ class ChaosRun:
             self._publish(cid, new_urls, new_k)
             self.log(f"succession of {cid[:8]} to v{v}")
             return "ok"
+
+    def _recover_fenced_succession(self, net, cid: str, new_urls: list, new_k: list) -> int | None:
+        # A standalone SUCCEED can only carry the current checkpoint. A standby that
+        # signed it is fenced for that exact charter, so a cooperative recovery must
+        # not add settled entries to the checkpoint as an ordinary rotation would.
+        for attempt in range(10):
+            try:
+                return net.rotate(cid, new_urls, TOKEN, committee_urls=new_k,
+                                  dead_man=self.cfg.dead_man, compact=False)
+            except RotationIncomplete as e:
+                return self._finish_succession(net, cid, e)
+            except (RuntimeError, Rejected) as e:
+                self.log(f"recovery rotation attempt {attempt}: {e}")
+                self._restart_down(range(len(self.c.witnesses)))
+                time.sleep(1)
+        return None
 
     def _finish_succession(self, net, cid: str, incomplete: RotationIncomplete) -> int:
         chain = net.registry.chain(cid)

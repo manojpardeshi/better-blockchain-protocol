@@ -12,11 +12,13 @@ import unittest
 from unittest.mock import patch
 
 from sigil import Network, Wallet
-from sigil.charter import Registry, charter_body, charter_hash, taken_over, verify_chain
+from sigil.charter import Registry, charter_body, charter_hash, checkpoint_hash, successor_clause, taken_over, verify_chain
 from sigil.crypto import KeyPair
+from sigil.network import plan_checkpoint, settled_answers
 from sigil.server import RemoteNetwork, RemoteStandby, RemoteWitness, StandbyServer, Unreachable, WitnessServer
 from sigil.succession import Standby
 from sigil.witness import Rejected, Witness
+from tests.integration.chaos.run import ChaosRun, Config
 
 TOKEN = "t0ken"
 DEAD = 3600
@@ -127,6 +129,44 @@ class SuccessionOverHttp(unittest.TestCase):
         self.assertNotIn("successor", chain[1]["body"])
         bob.pay(alice, usd, 10)
         self.assertEqual(self.net.committee(self.X), [])
+
+    def test_fenced_succession_recovery_preserves_the_signed_charter(self):
+        """A fenced standby must see the same charter when the live home recovers it."""
+        alice, bob = Wallet("alice", self.net, self.X), Wallet("bob", self.net, self.X)
+        usd = alice.issue("USD", 100)
+        alice.pay(bob, usd, 40)
+        cur = self.sim.registry.latest(self.X)
+        olds = [RemoteWitness(u, admin_token=TOKEN) for u in self.member_urls]
+        compacted = plan_checkpoint(cur, settled_answers(olds))
+        self.assertTrue(compacted)
+        self.assertEqual(plan_checkpoint(cur, settled_answers(olds), compact=False), [])
+        self.assertEqual(plan_checkpoint(cur, settled_answers(self.sim.committees[self.X]), compact=False), [])
+
+        keys = [KeyPair.generate() for _ in range(4)]
+        new_urls = self.new_members(keys)
+        committee_keys = [KeyPair.generate() for _ in range(4)]
+        committee_urls = self.new_standbys(committee_keys)
+        nxt = charter_body(cur["name"], 1, [k.pk for k in keys], charter_hash(cur),
+                           successor_clause([k.pk for k in committee_keys], DEAD))
+        compacted_body = charter_body(cur["name"], 1, [k.pk for k in keys], charter_hash(cur),
+                                      successor_clause([k.pk for k in committee_keys], DEAD),
+                                      checkpoint_hash(compacted))
+        self.assertNotEqual(charter_hash(compacted_body), charter_hash(nxt))
+        # A dead-man attempt signed only once before the old home was found alive.
+        fenced = self.sim.committees[self.X][0]
+        fenced.dead = lambda: True
+        RemoteStandby(self.committee_urls[0], admin_token=TOKEN).succeed(nxt)
+        self.assertEqual(fenced.fenced_for, charter_hash(nxt))
+
+        run = ChaosRun.__new__(ChaosRun)
+        run.cfg = Config(seed=1, dead_man=DEAD)
+        with patch("tests.integration.chaos.run.TOKEN", TOKEN):
+            self.assertEqual(run._recover_fenced_succession(self.net, self.X, new_urls, committee_urls), 1)
+        chain = self.net.registry.chain(self.X)
+        self.assertEqual(chain[-1]["body"], nxt)
+        self.assertTrue(verify_chain(self.X, chain))
+        self.assertTrue(all(m.fenced_for == charter_hash(nxt) for m in self.sim.committees[self.X]))
+        bob.pay(alice, usd, 1)
 
 
 if __name__ == "__main__":
