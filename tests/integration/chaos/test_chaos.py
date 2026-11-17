@@ -155,6 +155,21 @@ class HarnessCheckpointRecovery(unittest.TestCase):
         self.assertEqual(calls, ["succeed", "freeze", "adopt", "enter"])
 
 
+class HarnessExitStatus(unittest.TestCase):
+    def test_long_run_fails_on_new_liveness_findings(self):
+        base = {"seed": 12, "duration": 0, "ops": {}, "faults": {}, "proxy": {},
+                "kills": 0, "votes_observed": 0, "violations": [], "uncertain": [],
+                "liveness": [], "anomalies": []}
+        for kinds, expected in [(["known:swap-unfinishable"], 0),
+                                (["known:swap-unfinishable", "pledge-unsettled"], 1)]:
+            with self.subTest(kinds=kinds):
+                result = dict(base, liveness=[{"kind": kind} for kind in kinds])
+                with patch("tests.integration.chaos.run.rust_available", return_value=True), \
+                     patch("tests.integration.chaos.run.ChaosRun") as run, redirect_stdout(io.StringIO()):
+                    run.return_value.run.return_value = result
+                    self.assertEqual(main(["--seeds", "12"]), expected)
+
+
 class HarnessLifecycle(unittest.TestCase):
     def test_new_standby_is_pending_until_its_proxy_and_process_are_ready(self):
         with tempfile.TemporaryDirectory() as directory:
