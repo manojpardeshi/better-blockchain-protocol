@@ -125,11 +125,37 @@ Record the results and the charter/daemon version used:
 - Rehearse rotation with real operators and unique tokens, including registry
   distribution after the new charter is signed. A rotation is not complete
   merely because the old members froze: new members must adopt the evidence.
+  Practice the partial-rotation recovery below.
   If using succession, test standby mirrors, probes and handover separately.
 - Confirm operator processes can be monitored for health and disk exhaustion.
   The reference daemon has no packaged metrics, alerting, service manager,
   backup procedure or TLS termination; the testnet deployment must supply
   and verify these.
+
+### Recover a partial rotation
+
+If `RemoteNetwork.rotate` reports that too few current witnesses or standby
+members signed, some old members may already be frozen, even if their FREEZE
+replies were lost. Restore their reachability on the same stores, then retry on
+the **same `RemoteNetwork`
+object**, for the same parent charter, successor keys and endpoints, committee
+keys and endpoints, `dead_man` period and `compact` setting. That object keeps
+the original successor body and checkpoint for the retry. Creating a new object
+can produce a different charter hash if `/v0/settled` answers have changed;
+members already frozen for the first hash will refuse it.
+
+If `rotate` raises `RotationIncomplete`, the signed version is already in force;
+finish its pending adoption instead of proposing another rotation. Keep the
+signed chain from the operator's registry, the handover snapshots from
+`RemoteNetwork.last_handover`, and the exception's `checkpoint`. Bring pending
+new witnesses or standby members back on their original keys and stores,
+gossip the signed chain to them, and complete `/v0/adopt` or `/v0/standby` with
+those snapshots and that same checkpoint. A re-used key whose old process did
+not sign must first provide its own evidence by FREEZE for the **same signed
+successor**; include that evidence in its handover. The
+[local chaos runner](../tests/integration/chaos/run.py) demonstrates recovery
+for pending witnesses. Distribute the new registry and directory after the
+adoption is complete.
 
 Keep this testnet at no real value while the independent operation, incident
 response, economics and external audit items in the [roadmap](ROADMAP.md#phase-5-public-testnet-and-audit-12)
