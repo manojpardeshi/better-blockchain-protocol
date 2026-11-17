@@ -111,9 +111,15 @@ class ChaosCluster(Cluster):
         return out
 
     def add_standbys(self, *a, **kw):
-        out = super().add_standbys(*a, **kw)
-        self._fix_ports()
-        return out
+        # The chaos thread must not select a standby before _start_new has created
+        # its proxy and started its process. Unlike add_members, the base method
+        # does not mark newly appended standbys as pending.
+        with self.lock:
+            out = super().add_standbys(*a, **kw)
+            for i in out:
+                self.witnesses[i]["pending"] = True
+            self._fix_ports()
+            return out
 
     def _new_proxy(self, name: str, i: int, seed: int) -> FaultProxy:
         while True:

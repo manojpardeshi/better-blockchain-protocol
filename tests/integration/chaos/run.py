@@ -636,8 +636,9 @@ class ChaosRun:
             self.c.start(i)
         for i in idx:
             self.c.wait_ready(i)
-        for i in idx:
-            self.c.witnesses[i]["pending"] = False
+        with self.c.lock:
+            for i in idx:
+                self.c.witnesses[i]["pending"] = False
         return [self.c.url(i) for i in idx]
 
     def op_rotate(self, r: random.Random) -> str:
@@ -881,7 +882,9 @@ class ChaosRun:
                     e[1]()
                 except Exception as ex:  # noqa: BLE001
                     self.log(f"undo failed: {ex!r}")
-            procs = [i for i in range(len(c.witnesses)) if i not in c.retired and not c.witnesses[i].get("pending")]
+            with c.lock:
+                procs = [i for i in range(len(c.witnesses))
+                         if i not in c.retired and not c.witnesses[i].get("pending")]
             if not procs:
                 continue
             roll = r.random()
@@ -990,7 +993,7 @@ class ChaosRun:
     def run(self) -> dict:
         try:
             self.setup()
-            chaos = threading.Thread(target=self.chaos_loop, daemon=True)
+            chaos = threading.Thread(target=self._run_chaos, daemon=True)
             chaos.start()
             plans = self.plan()
             ts = [threading.Thread(target=self.worker, args=(k, p), daemon=True) for k, p in enumerate(plans)]
@@ -1009,6 +1012,13 @@ class ChaosRun:
             self.stop.set()
             self.finish()
         return self.result
+
+    def _run_chaos(self) -> None:
+        try:
+            self.chaos_loop()
+        except Exception as e:  # noqa: BLE001 - a dead fault injector invalidates the run
+            self.anomaly("chaos", e)
+            self.stop.set()
 
     # ------------------------------------------------------------ heal / settle
 
@@ -1413,7 +1423,7 @@ def main(argv=None) -> int:
             with open(a.out, "w") as f:
                 json.dump({"summary": summarize(results), "runs": results}, f, indent=1, default=str)
     print(json.dumps(summarize(results), indent=1, default=str))
-    return 1 if any(r["violations"] for r in results) else 0
+    return 1 if any(r["violations"] or r["anomalies"] for r in results) else 0
 
 
 if __name__ == "__main__":

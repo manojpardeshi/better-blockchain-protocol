@@ -29,11 +29,15 @@ directories of failed runs), ``SIGIL_CHAOS_RUST_MUTANTS=1`` (build and check mut
 witnesses).
 """
 
+import io
 import os
 import random
+import tempfile
 import threading
 import time
 import unittest
+from contextlib import redirect_stdout
+from unittest.mock import patch
 
 from sigil import model
 from sigil.charter import Registry
@@ -42,7 +46,8 @@ from sigil.wallet import SealFailed, request_seal
 from sigil.witness import Rejected
 
 from . import invariants
-from .run import ChaosRun, Config, _seeds, rust_available
+from .cluster import ChaosCluster, Cluster
+from .run import ChaosRun, Config, _seeds, main, rust_available
 
 QUIET = os.environ.get("SIGIL_CHAOS_VERBOSE") != "1"
 
@@ -54,6 +59,109 @@ def _log(line):
 
 def kinds_of(violations) -> set:
     return {v["kind"] for v in violations}
+
+
+class HarnessLifecycle(unittest.TestCase):
+    def test_new_standby_is_pending_until_its_proxy_and_process_are_ready(self):
+        with tempfile.TemporaryDirectory() as directory:
+            c = ChaosCluster(directory, invariants.Observer(), 11, skew_so=None, client_timeout=1)
+            try:
+                (i,) = c.add_standbys("cid", ["python"])
+                self.assertTrue(c.witnesses[i]["pending"])
+                self.assertNotIn(i, c.proxies)
+            finally:
+                c.teardown()
+
+    def test_chaos_waits_while_new_standby_is_being_registered(self):
+        run = ChaosRun(Config(seed=11, skew="none"))
+        appended = threading.Event()
+        release = threading.Event()
+        selecting = threading.Event()
+        finished = threading.Event()
+        errors = []
+
+        class NotifyingLock:
+            def __init__(self):
+                self.lock = threading.RLock()
+
+            def __enter__(self):
+                if threading.current_thread().name == "fault-injector":
+                    selecting.set()
+                return self.lock.__enter__()
+
+            def __exit__(self, *args):
+                return self.lock.__exit__(*args)
+
+        class FixedRandom:
+            def uniform(self, *_):
+                return 0
+
+            def random(self):
+                return 0.3  # net fault path would look up the missing proxy
+
+            def choice(self, seq):
+                return seq[0]
+
+        def append_unready(cluster, cid, kinds):
+            i = len(cluster.witnesses)
+            cluster.witnesses.append(cluster._standby("standby-0", cid, "unused", kinds[0], []))
+            appended.set()
+            if not release.wait(2):
+                raise TimeoutError("standby registration did not resume")
+            return [i]
+
+        def add():
+            try:
+                run.c.add_standbys("cid", ["python"])
+            except Exception as e:  # noqa: BLE001
+                errors.append(e)
+
+        def inject():
+            try:
+                run._run_chaos()
+            finally:
+                finished.set()
+
+        run.c.lock = NotifyingLock()
+        adder = threading.Thread(target=add)
+        injector = threading.Thread(target=inject, name="fault-injector")
+        with patch.object(Cluster, "add_standbys", append_unready), \
+             patch("tests.integration.chaos.run.random.Random", return_value=FixedRandom()):
+            try:
+                adder.start()
+                self.assertTrue(appended.wait(1))
+                injector.start()
+                self.assertTrue(selecting.wait(1))
+                self.assertFalse(finished.wait(0.05), "chaos selected an uninitialized standby")
+            finally:
+                release.set()
+                adder.join(2)
+                run.stop.set()
+                injector.join(2)
+                run.finish()
+        self.assertFalse(errors)
+        self.assertFalse(run.result["anomalies"])
+
+    def test_chaos_thread_failure_is_reported_as_anomaly(self):
+        run = ChaosRun(Config(seed=11, skew="none"))
+        run.setup = lambda: None
+        run.plan = lambda: [[]]
+        run.heal = lambda: None
+        run.settle = lambda: None
+        run.check = lambda: None
+
+        def fail():
+            raise KeyError(23)
+
+        run.chaos_loop = fail
+        result = run.run()
+        self.assertEqual(len(result["anomalies"]), 1)
+        self.assertEqual(result["anomalies"][0]["ops"], ["chaos"])
+        self.assertIn("KeyError", result["anomalies"][0]["key"])
+        with patch("tests.integration.chaos.run.rust_available", return_value=True), \
+             patch("tests.integration.chaos.run.ChaosRun") as fake_run, redirect_stdout(io.StringIO()):
+            fake_run.return_value.run.return_value = result
+            self.assertEqual(main(["--seeds", "11"]), 1)
 
 
 @unittest.skipUnless(rust_available(), "Rust witness binary missing: cargo build --release --locked in rust/")
