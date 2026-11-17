@@ -24,9 +24,9 @@ class PledgeEpochChecks(unittest.TestCase):
                            released=released, final_status={}, uncertain=uncertain)
         return violations, uncertain
 
-    def add_vote(self, time=100):
+    def add_vote(self, time=100, version=1):
         with patch("tests.integration.chaos.invariants.verify_vote", return_value=True):
-            self.obs.add_vote({**self.vote, "time": time})
+            self.obs.add_vote({**self.vote, "time": time, "version": version})
 
     def release(self, order, reauthorised=None, start_clock=100, end_clock=100,
                 reauthorise_clock=None):
@@ -40,6 +40,18 @@ class PledgeEpochChecks(unittest.TestCase):
         self.assertNotIn("S6-vote-after-pledge-release", {v["kind"] for v in violations})
         self.assertIn("S6-release-despite-prior-vote", {v["kind"] for v in violations})
         self.assertEqual(uncertain, [])
+
+    def test_later_version_vote_before_sweep_proves_stale_release(self):
+        self.add_vote(version=2)
+        release = self.obs.mark()
+        violations, uncertain = self.check_s6(self.release(release, start_clock=110, end_clock=110))
+        self.assertEqual([v["kind"] for v in violations], ["S6-release-despite-prior-vote"])
+        self.assertEqual(uncertain, [])
+
+    def test_older_version_vote_before_sweep_is_excluded(self):
+        self.add_vote(version=0)
+        release = self.obs.mark()
+        self.assertEqual(self.check_s6(self.release(release, start_clock=110, end_clock=110)), ([], []))
 
     def test_vote_during_unpledged_interval_is_reported(self):
         release = self.obs.mark()

@@ -251,13 +251,14 @@ def check(obs: Observer, registry, *, honest: set, clocked: set, released: list,
                 continue
             detail = {"witness": v["witness"], "sigil": v["sigil"], "gen": v["gen"],
                       "tid": v["tid"], "time": v["time"], "version": v["version"]}
-            if seen <= r.sweep_started_order and v["version"] == r.version:
-                # This same-version vote was already visible before the wallet
-                # began its all-member STATUS sweep, which must refuse release.
+            if seen <= r.sweep_started_order:
+                # This current-or-later-version vote was already visible before
+                # the wallet began its all-member STATUS sweep. A later version
+                # also proves that the wallet checked a stale charter.
                 violations.append({"kind": "S6-release-despite-prior-vote", **detail})
                 break
-            if seen <= r.sweep_started_order or (isinstance(v["time"], int) and
-                                                  v["time"] < r.sweep_started_clock - r.max_skew - 1):
+            if (isinstance(v["time"], int) and
+                    v["time"] < r.sweep_started_clock - r.max_skew - 1):
                 if uncertain is not None:
                     uncertain.append({"kind": "S6-prior-vote-observed-outside-sweep", **detail,
                                       "released_clock": r.released_clock})
