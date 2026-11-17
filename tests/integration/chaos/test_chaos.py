@@ -402,13 +402,15 @@ class NonVacuity(ChaosCase):
 
     def test_mutant_skipping_the_expiry_check_is_caught(self):
         """Witnesses that newly bind on an expired authorisation (``mutant.py noexpiry``): the
-        held payment, delivered after the wallet released its pledge, gets votes (S6)."""
+        held payment, delivered after the wallet released its pledge, gets votes despite
+        the expired authorisation (S6b). The near-immediate vote's ordering against
+        the release is ambiguous within the permitted clock skew (S6)."""
         run = self.scenario(kinds="python", mutant="noexpiry")
         try:
             run.delayed_expiry("alice", "bob", "carol", random.Random(1))
         except (ValueError, SealFailed):
             pass  # the late binding makes the wallet refuse the second payment (or it fails)
-        self.assertIn("S6-vote-after-pledge-release", kinds_of(self.check(run)))
+        self.assertIn("S6b-bound-after-expiry", kinds_of(self.check(run)))
 
     @unittest.skipUnless(os.environ.get("SIGIL_CHAOS_RUST_MUTANTS") == "1",
                          "builds mutated Rust witnesses (minutes): set SIGIL_CHAOS_RUST_MUTANTS=1")
@@ -436,7 +438,7 @@ class NonVacuity(ChaosCase):
                 run.delayed_expiry("alice", "bob", "carol", random.Random(1))
             except (ValueError, SealFailed):
                 pass
-            self.assertIn("S6-vote-after-pledge-release", kinds_of(self.check(run)))
+            self.assertIn("S6b-bound-after-expiry", kinds_of(self.check(run)))
 
     def test_byzantine_beyond_f_is_caught(self):
         """Two Byzantine witnesses of four (f = 1) with an equivocating owner: both
@@ -449,10 +451,12 @@ class NonVacuity(ChaosCase):
         self.assertIn("S1-double-consumption", found)
         self.assertIn("S1b-two-seals-one-generation", found)
 
-    def test_clock_skew_beyond_bound_is_caught(self):
+    def test_clock_skew_beyond_bound_is_diagnostic(self):
         """Every witness of the home lags the wallet by more than ``max_skew``: the held
         payment binds after the wallet released its pledge. Within the assumption the harness
-        treats these witnesses as faulty (S6 skips them); held to S6 they are reported."""
+        treats these witnesses as faulty (S6 skips them). If held to S6, their signed
+        timestamps cannot prove the ordering because the clock assumption was broken,
+        so the harness reports the late observation separately."""
         run = self.scenario(kinds="mixed", skew="beyond_q")
         if run.skew_so is None:
             self.skipTest("no C compiler for the clock shim")
@@ -460,7 +464,8 @@ class NonVacuity(ChaosCase):
             run.delayed_expiry("alice", "bob", "carol", random.Random(1))
         except (ValueError, SealFailed):
             pass  # the late binding makes the wallet refuse the second payment (or it fails)
-        self.assertIn("S6-vote-after-pledge-release", kinds_of(self.check(run, clock_assumption=False)))
+        self.check(run, clock_assumption=False)
+        self.assertIn("S6-prior-vote-observed-outside-sweep", kinds_of(run.uncertain))
 
 
 class Findings(ChaosCase):
@@ -552,7 +557,7 @@ class Findings(ChaosCase):
         alice.release_expired_pledges()
         # Fixed: rule 3 also asks the committee, which mirrored T1, so the pledge is not
         # released; alice completes T1 instead (re-authorising the same tid, rule 1).
-        self.assertFalse(any(r[:3] == (sigil, 0, t1) for r in run.released),
+        self.assertFalse(any((r.sigil, r.gen, r.tid) == (sigil, 0, t1) for r in run.released),
                          "rule 3 released a pledge the committee holds in its mirror log")
         self.assertIn(t1, alice.dossier.transitions, "alice completed the payment she authorised")
         self.assertEqual(run.op_succession(random.Random(3)), "ok")

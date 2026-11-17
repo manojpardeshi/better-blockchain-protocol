@@ -694,7 +694,8 @@ wallets over HTTP. They are not part of the default `unittest discover`; CI's
   within *f*, interrupted rotations and successions. Safety invariants are
   checked over every vote seen (no sigil consumed twice, one sealed tid per
   `(sigil, gen)`, no honest equivocation, no vote lost by a restart, no vote
-  after a released pledge's expiry), plus wallet-level conservation. In about
+  provably signed between pledge release and renewed authorisation of the same
+  transition), plus wallet-level conservation. In about
   2.1 hours of seeded runs (1,660 SIGKILLs, 705,000 proxied requests) there
   was **no safety violation**. Mutated witnesses (Python and Rust: not
   persisting before answering, not checking expiry) and Byzantine faults
