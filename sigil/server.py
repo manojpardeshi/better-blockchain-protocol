@@ -98,6 +98,7 @@ class WitnessServer:
             rate_limit = 0 if is_loopback(host) else DEFAULT_RATE
         self.limiter = RateLimiter(rate_limit, rate_burst) if rate_limit > 0 else None
         self._lock = threading.Lock()
+        self._closing = threading.Event()
         # Gossip shares the witness's registry: a verified rotation learned
         # by gossip is immediately what the witness serves and checks against.
         self.gossip = GossipStore(witness.registry)
@@ -222,6 +223,11 @@ class WitnessServer:
     def dispatch(self, method: str, body: dict):
         w = self.witness
         with self._lock:
+            # SIGTERM may leave handlers queued on this lock. Only the call that
+            # already owns it may finish; later calls must not delay store close
+            # or reach the store after it has closed.
+            if self._closing.is_set():
+                raise Rejected("server stopping")
             if method in ADMIN_METHODS:
                 return self._admin(method, body)
             if method == "spend":
@@ -270,6 +276,7 @@ class WitnessServer:
         self.httpd.serve_forever()
 
     def stop(self) -> None:
+        self._closing.set()
         self.httpd.shutdown()
         self.httpd.server_close()
 
@@ -314,12 +321,16 @@ class StandbyServer(WitnessServer):
         counted = []
 
         def ask(url):
+            if self._closing.is_set():
+                return
             challenge = secrets.token_hex(16)
             try:
                 hb = RemoteWitness(url, 5.0).heartbeat(challenge)
             except Rejected:
                 return
             with self._lock:
+                if self._closing.is_set():
+                    return
                 counted.append(self.standby.observe(hb, challenge))
 
         threads = [threading.Thread(target=ask, args=(u,), daemon=True) for u in dict.fromkeys(urls)]
@@ -332,11 +343,15 @@ class StandbyServer(WitnessServer):
     def dispatch(self, method: str, body: dict):
         s = self.standby
         if method == "probe":
+            if self._closing.is_set():
+                raise Rejected("server stopping")
             urls = body.get("urls", self.members)
             if not isinstance(urls, list) or not all(isinstance(u, str) for u in urls):
                 raise ValueError("urls must be a list of strings")
             return {"answered": self.probe(urls)}
         with self._lock:
+            if self._closing.is_set():
+                raise Rejected("server stopping")
             if method == "mirror":
                 return s.mirror_bind(body["request"])
             if method == "note_release":
