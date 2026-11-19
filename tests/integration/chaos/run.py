@@ -150,6 +150,9 @@ class ChaosRun:
         self.swaps: list = []             # (a, b, header, body, tid)
         self.wallet_locks: dict = {}
         self.op_lock = threading.Lock()   # operator: one rotation/succession at a time
+        # A failed FREEZE cannot be rolled back: keep the exact proposal and operator
+        # client so it can be completed once the injected faults have healed.
+        self.deferred_rotations: list[tuple[str, list[str], RemoteNetwork, RotationIncomplete | None]] = []
         self.dir_lock = threading.Lock()
         self.directory: dict = {}
         self.committees: dict = {}
@@ -684,20 +687,60 @@ class ChaosRun:
                     break
                 except RotationIncomplete as e:
                     self.faults["rotation-incomplete"] += 1
-                    v = self._finish_rotation(net, cid, e)
-                    break
+                    try:
+                        v = self._finish_rotation(net, cid, e)
+                        break
+                    except (RuntimeError, Rejected) as err:
+                        self.log(f"rotation completion deferred: {err}")
+                        self.deferred_rotations.append((cid, new_urls, net, e))
+                        return "deferred"
                 except (RuntimeError, Rejected) as e:
                     self.log(f"rotation attempt {attempt}: {e}")
                     self.faults["rotation-retry"] += 1
                     self._restart_down(old_idx + new_idx)
                     time.sleep(1)
             else:
-                return "failed"
+                self.deferred_rotations.append((cid, new_urls, net, None))
+                return "deferred"
             chain = net.registry.chain(cid)
             self.c.write_chain(cid, chain)
             self._publish(cid, new_urls, [])
             self.log(f"rotated {cid[:8]} to v{v} ({[self.c.witnesses[i]['kind'] for i in new_idx]})")
             return "ok"
+
+    def _complete_deferred_rotations(self) -> None:
+        """Finish a frozen or partly installed handover after all faults are cleared.
+
+        Reuse the original ``RemoteNetwork``: it remembers the exact checkpoint and
+        successor body signed before a pre-quorum failure. An installed charter uses
+        its original ``RotationIncomplete`` checkpoint for late ADOPT calls.
+        """
+        for cid, new_urls, net, incomplete in self.deferred_rotations:
+            for attempt in range(3):
+                try:
+                    if incomplete is None:
+                        try:
+                            version = net.rotate(cid, new_urls, TOKEN)
+                        except RotationIncomplete as e:
+                            self.faults["rotation-incomplete"] += 1
+                            incomplete = e
+                            version = self._finish_rotation(net, cid, e)
+                    else:
+                        version = self._finish_rotation(net, cid, incomplete)
+                    break
+                except (RuntimeError, Rejected) as e:
+                    self.log(f"deferred rotation attempt {attempt}: {e}")
+                    self._restart_down(range(len(self.c.witnesses)))
+            else:
+                self.liveness.append({"kind": "rotation-unfinished", "constellation": cid,
+                                      "new_members": new_urls})
+                continue
+            chain = net.registry.chain(cid)
+            self.c.write_chain(cid, chain)
+            self._publish(cid, new_urls, [])
+            self.log(f"completed deferred rotation of {cid[:8]} to v{version}")
+            self.faults["rotation-recovered"] += 1
+        self.deferred_rotations.clear()
 
     def _finish_rotation(self, net, cid: str, incomplete: RotationIncomplete) -> int:
         chain = net.registry.chain(cid)
@@ -1079,6 +1122,7 @@ class ChaosRun:
         n = sum(p.deliver_held() for p in c.all_proxies())
         self.faults["held-delivered-at-heal"] += n
         self._gossip_registry()
+        self._complete_deferred_rotations()
         self.log("healed")
 
     def settle(self) -> None:
