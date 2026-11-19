@@ -1408,6 +1408,13 @@ class ChaosRun:
             "anomalies": self.anomalies,
             "dir": self.tmp,
         }
+        # The nightly artifact needs the attempted recovery sequence when a run
+        # fails. Keep it small even if a seed logs many retries or long errors.
+        if (self.violations or self.uncertain or self.anomalies or
+                any(not x["kind"].startswith("known:") for x in self.liveness)):
+            self.result["diagnostic_notes"] = [line[:300] for line in self.notes[-40:]]
+            if len(self.notes) > 40:
+                self.result["diagnostic_notes_omitted"] = len(self.notes) - 40
         try:
             self.c.teardown()
         finally:

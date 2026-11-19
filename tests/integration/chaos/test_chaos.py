@@ -30,6 +30,7 @@ witnesses).
 """
 
 import io
+import json
 import os
 import random
 import tempfile
@@ -202,6 +203,34 @@ class HarnessExitStatus(unittest.TestCase):
                      patch("tests.integration.chaos.run.ChaosRun") as run, redirect_stdout(io.StringIO()):
                     run.return_value.run.return_value = result
                     self.assertEqual(main(["--seeds", "12"]), expected)
+
+    def test_failed_run_artifact_keeps_recent_recovery_note(self):
+        for kind in (None, "known:swap-unfinishable", "rotation-unfinished"):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as directory:
+                run = ChaosRun(Config(seed=47, skew="none"), workdir=os.path.join(directory, "run"), keep=True)
+                for i in range(47):
+                    run.log(f"rotation attempt {i}: quorum unavailable " + "x" * 400)
+                if kind:
+                    run.liveness.append({"kind": kind})
+                run.finish()
+
+                out = os.path.join(directory, "chaos-stats.json")
+                with patch("tests.integration.chaos.run.rust_available", return_value=True), \
+                     patch("tests.integration.chaos.run.ChaosRun") as fake_run, redirect_stdout(io.StringIO()):
+                    fake_run.return_value.run.return_value = run.result
+                    main(["--seeds", "47", "--out", out])
+
+                with open(out) as f:
+                    artifact = json.load(f)
+                self.assertEqual(artifact["summary"]["runs"], 1)
+                saved = artifact["runs"][0]
+                if kind == "rotation-unfinished":
+                    notes = saved["diagnostic_notes"]
+                    self.assertIn("rotation attempt 46: quorum unavailable", notes[-1])
+                    self.assertLessEqual(len(json.dumps(notes)), 16000)
+                    self.assertGreater(saved["diagnostic_notes_omitted"], 0)
+                else:
+                    self.assertNotIn("diagnostic_notes", saved)
 
 
 class HarnessLifecycle(unittest.TestCase):
