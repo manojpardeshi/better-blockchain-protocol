@@ -63,6 +63,40 @@ def kinds_of(violations) -> set:
 
 
 class HarnessCheckpointRecovery(unittest.TestCase):
+    def test_deferred_rotation_remains_a_liveness_failure_if_heal_cannot_complete_it(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run = ChaosRun(Config(seed=12, skew="none"), workdir=directory)
+            def cannot_rotate(*_args):
+                raise RuntimeError("no quorum")
+
+            net = SimpleNamespace(rotate=cannot_rotate)
+            run.deferred_rotations.append(("cid", ["new"], net, None))
+            with patch.object(run, "_restart_down"):
+                run._complete_deferred_rotations()
+            self.assertEqual(run.liveness, [{"kind": "rotation-unfinished", "constellation": "cid",
+                                             "new_members": ["new"]}])
+            self.assertEqual(run.faults["rotation-recovered"], 0)
+
+    def test_deferred_installed_rotation_reuses_its_checkpoint(self):
+        checkpoint = [["sigil", 0, "tid"]]
+        incomplete = RotationIncomplete(1, ["new"])
+        incomplete.checkpoint = checkpoint
+        chain = [{"body": {"version": 1}}]
+        net = SimpleNamespace(registry=SimpleNamespace(chain=lambda _cid: chain))
+        with tempfile.TemporaryDirectory() as directory:
+            run = ChaosRun(Config(seed=12, skew="none"), workdir=directory)
+            run.deferred_rotations.append(("cid", ["new"], net, incomplete))
+            seen = []
+            with patch.object(run, "_finish_rotation", side_effect=lambda _n, _c, e: seen.append(e.checkpoint) or 1), \
+                 patch.object(run.c, "write_chain") as write_chain, \
+                 patch.object(run, "_publish") as publish:
+                run._complete_deferred_rotations()
+            self.assertEqual(seen, [checkpoint])
+            write_chain.assert_called_once_with("cid", chain)
+            publish.assert_called_once_with("cid", ["new"], [])
+            self.assertEqual(run.faults["rotation-recovered"], 1)
+            self.assertFalse(run.deferred_rotations)
+
     def test_incomplete_rotation_reuses_its_checkpoint(self):
         checkpoint = [["sigil", 0, "tid"]]
         incomplete = RotationIncomplete(1, ["new"])
@@ -319,7 +353,6 @@ class ChaosCase(unittest.TestCase):
             time.sleep(1)
         self.fail(f"{a} could not pay {b} within {within}s: {err!r}")
 
-
 class SeededChaos(ChaosCase):
     """Randomized runs: every fault type, Rust and Python mixed, safety always, liveness after healing."""
 
@@ -340,6 +373,30 @@ class SeededChaos(ChaosCase):
 
 
 class Scenarios(ChaosCase):
+    def test_failed_freeze_completes_after_heal(self):
+        """A minority that FREEZEs before the quorum is cut off must be handed over
+        with the same proposal after the fault clears, before wallet settlement."""
+        run = self.scenario(seed=1, kinds="python")
+        cid = run.cids[0]  # random.Random(1).choice(run.cids)
+        old_urls = list(run.directory[cid])
+        old_idx = run.c.indices(cid)
+        for i in old_idx[2:]:
+            run.c.proxies[i].faults.partition = "refuse"
+        self.assertEqual(run.op_rotate(random.Random(1)), "deferred")
+        self.assertEqual(run.directory[cid], old_urls)
+        self.assertEqual(len(run.deferred_rotations), 1)
+        self.assertTrue(all(RemoteWitness(run.c.real_url(i))._info()["frozen"] for i in old_idx[:2]))
+        for i in old_idx[2:]:
+            run.c.proxies[i].faults.partition = None
+        run.heal()
+        self.assertNotEqual(run.directory[cid], old_urls)
+        self.assertEqual(len(run.wallets["alice"].network.registry.chain(cid)), 2)
+        self.assertEqual(run.faults["rotation-recovered"], 1)
+        self.assertFalse(run.liveness)
+        self.pay_eventually(run, "alice", "bob", 1)
+        run.check()
+        self.assertFalse(run.violations)
+
     def test_request_delivered_after_expiry_is_refused(self):
         """SPEC §4 rule 3 / §5.1 step 4 over real processes: the payment is held in flight,
         the wallet releases its pledge after expiry + skew and pays someone else, and the held
