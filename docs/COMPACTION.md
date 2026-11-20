@@ -102,10 +102,10 @@ their STANDBY handover, require the extension rule before signing a successor, a
 dead-man successor carries exactly the dead version's checkpoint (the committee cannot
 check new settlements).
 
-Choosing `S`: the driver asks each live member for its settled records (`/v0/settled`)
-and offers the previous checkpoint plus the entries every answering member holds
-settled; settled sets only grow, so each of those members will accept. A member that
-refuses does not freeze; nothing changes.
+Choosing `S`: the driver asks every current charter member for its settled records
+(`/v0/settled`). Only if all answer does it add entries that every member reports as
+settled. If any reply is missing, it carries only the previous checkpoint: the missing
+member might never have settled a candidate entry and could refuse to freeze for it.
 
 ### 3.3 Delta dossiers (SPEC §6.1)
 

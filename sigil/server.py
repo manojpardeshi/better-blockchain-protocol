@@ -1015,7 +1015,14 @@ class RemoteNetwork:
             if ck and any("checkpoint" not in getattr(m, "features", []) for m in new + standbys):
                 raise RuntimeError("a new member or standby member no longer supports the planned checkpoint")
         else:
-            ck = plan_checkpoint(cur, settled_answers([w for w in olds if w.pk in cur["witnesses"]]), compact)
+            # A checkpoint addition must be settled at every current member that
+            # may later be needed to sign. Intersecting only the available SETTLED
+            # replies can freeze a minority for a binding the missing honest
+            # members never settled, making the original plan impossible to finish.
+            members = {w.pk: w for w in olds if w.pk in cur["witnesses"]}
+            answers = settled_answers(members.values())
+            all_answered = len(members) == len(cur["witnesses"]) and len(answers) == len(members)
+            ck = plan_checkpoint(cur, answers, compact and all_answered)
             ck = _gate_checkpoint(ck, cur, new + standbys)
             nxt = charter_body(cur["name"], cur["version"] + 1, [w.pk for w in new], charter_hash(cur), succ,
                                checkpoint_hash(ck) if ck else None)

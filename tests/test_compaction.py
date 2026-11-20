@@ -403,6 +403,24 @@ class CheckpointTests(Base):
         for w in self.net.witnesses(self.X):
             self.assertEqual(w.status(s)["tid"], model.transition_id(Ta))
 
+    def test_missing_settled_reply_does_not_strand_rotation(self):
+        ws = self.net.witnesses(self.X)
+        ps, s = self.parcel("partial")
+        Ta = self.hdr([(s, 0)], "p")
+        seal = self.seal(Ta, s, ps)
+        for w in ws[:2]:
+            w.settle(self.cert(Ta, [(ps, seal)]))
+
+        def no_settled_reply():
+            raise Rejected("SETTLED reply lost")
+
+        for w in ws[2:]:
+            w.settled_records = no_settled_reply
+        self.assertEqual(self.net.rotate(self.X, [KeyPair.generate() for _ in range(4)]), 1)
+        self.assertNotIn("checkpoint", self.net.registry.latest(self.X))
+        self.assertEqual({w.status(s)["tid"] for w in self.net.witnesses(self.X)},
+                         {model.transition_id(Ta)})
+
     def test_drivers_gate_checkpoints_on_the_feature(self):
         """Review finding 4: an older daemon accepts a charter with a checkpoint but ignores the
         set (it would treat checkpointed sigils as fresh): drivers add one only if every member
