@@ -421,6 +421,31 @@ class CheckpointTests(Base):
         self.assertEqual({w.status(s)["tid"] for w in self.net.witnesses(self.X)},
                          {model.transition_id(Ta)})
 
+    def test_missing_settled_reply_carries_existing_checkpoint(self):
+        _, old_sigil, old_header, _ = self.settled_sigil()
+        self.net.rotate(self.X, [KeyPair.generate() for _ in range(4)])
+        inherited = [[old_sigil, 0, model.transition_id(old_header)]]
+        self.assertEqual(self.net.registry.latest(self.X)["checkpoint"], checkpoint_hash(inherited))
+
+        ws = self.net.witnesses(self.X)
+        parcel, sigil = self.parcel("new")
+        header = self.hdr([(sigil, 0)], "n")
+        seal = self.seal(header, sigil, parcel)
+        for w in ws[:2]:
+            w.settle(self.cert(header, [(parcel, seal)]))
+
+        def no_settled_reply():
+            raise Rejected("SETTLED reply lost")
+
+        for w in ws[2:]:
+            w.settled_records = no_settled_reply
+        self.assertEqual(self.net.rotate(self.X, [KeyPair.generate() for _ in range(4)]), 2)
+        self.assertEqual(self.net.registry.latest(self.X)["checkpoint"], checkpoint_hash(inherited))
+        for w in self.net.witnesses(self.X):
+            self.assertEqual(w.records[old_sigil].settled, CHECKPOINTED)
+            self.assertEqual(w.status(sigil)["tid"], model.transition_id(header))
+            self.assertNotEqual(w.records[sigil].settled, CHECKPOINTED)
+
     def test_drivers_gate_checkpoints_on_the_feature(self):
         """Review finding 4: an older daemon accepts a charter with a checkpoint but ignores the
         set (it would treat checkpointed sigils as fresh): drivers add one only if every member

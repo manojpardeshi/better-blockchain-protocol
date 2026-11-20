@@ -982,10 +982,11 @@ class RemoteNetwork:
         with ``witnessd standby --wait``) and ``dead_man`` give the new version a
         committee, which enters standby with the same evidence.
 
-        With ``compact`` (SPEC §5.7) the new charter checkpoints every sigil that all
-        answering members hold settled (SETTLED), plus the current checkpoint; the
-        members omit those sigils from their snapshots and the new members adopt
-        them from the checkpoint set alone.
+        With ``compact`` (SPEC §5.7) and SETTLED replies from every distinct
+        current charter member, the new charter adds sigils they all hold settled
+        to the current checkpoint. If a reply is missing, it carries only the
+        current checkpoint. Members omit checkpointed sigils from their snapshots;
+        new members adopt them from the checkpoint set alone.
 
         Nothing a witness answers is trusted: a charter signature that does not
         verify is dropped together with its evidence. Raises ``RuntimeError`` if

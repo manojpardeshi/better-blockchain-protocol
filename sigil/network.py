@@ -156,8 +156,9 @@ class Network:
         (SPEC §5.5): its members get the members' signatures as the request,
         fence, and hand over their mirror logs as well. ``successor`` gives the
         new version a committee (``{"n" | "keys", "dead_man"}``). With ``compact``
-        the new charter checkpoints every sigil all live members hold settled
-        (SPEC §5.7); the current checkpoint is carried over in any case.
+        and SETTLED replies from every current charter member, the new charter
+        checkpoints sigils all members hold settled (SPEC §5.7). Otherwise it
+        carries only the current checkpoint.
         """
         chain = self.registry.chain(cid)
         cur = chain[-1]["body"]
