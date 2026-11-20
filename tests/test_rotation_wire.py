@@ -147,6 +147,37 @@ class RotationOverHttp(unittest.TestCase):
         self.assertTrue(all(members[url].cid == cid for url in new_urls))
         self.assertEqual(operator._rotation_plans, {})
 
+    def test_missing_settled_replies_do_not_checkpoint_a_partial_binding(self):
+        """An absent SETTLED reply must not strand a later FREEZE quorum."""
+        owner = KeyPair.generate()
+        parcel = model.parcel(self.X, "x", 1, locks.sig(owner.pk), "partial-settlement")
+        sigil = model.sigil_of(parcel)
+        header = {"inputs": [[sigil, 0]], "body": "b" * 64}
+        tid = model.transition_id(header)
+        unlock = locks.empty_unlock(int(self.sim.clock()) + 1000)
+        unlock["sigs"][owner.pk] = locks.sign_unlock(owner, sigil, tid, unlock["expires"])
+        req = {"sigil": sigil, "header": header, "home": self.X, "lock": parcel["lock"],
+               "salt": parcel["salt"], "unlock": unlock}
+        seal = model.seal_from_votes([w.spend(req) for w in self.old])
+        cert = {"header": header, "inputs": [{"parcel": {"home": self.X, "lock": parcel["lock"],
+                                                 "salt": parcel["salt"]}, "seal": seal}]}
+        for w in self.old[:2]:
+            w.settle(cert)
+        new_urls = self.new_members([KeyPair.generate() for _ in range(4)])
+        missing = {self.servers[i].url for i in (2, 3)}
+        original = RemoteWitness.settled_records
+
+        def unreliable_settled(member):
+            if member.url in missing:
+                raise Rejected("SETTLED reply lost")
+            return original(member)
+
+        with patch.object(RemoteWitness, "settled_records", unreliable_settled):
+            self.assertEqual(self.net.rotate(self.X, new_urls, TOKEN), 1)
+        self.assertIsNone(self.net.registry.latest(self.X).get("checkpoint"))
+        self.assertTrue(all(w.frozen for w in self.old))
+        self.assertEqual({RemoteWitness(u).version for u in new_urls}, {1})
+
     def test_rotation_calls_need_the_token_and_adopt_runs_once(self):
         cur = self.sim.registry.latest(self.X)
         nxt = charter_body("orion", 1, [KeyPair.generate().pk], charter_hash(cur))

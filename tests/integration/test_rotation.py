@@ -6,15 +6,54 @@ paying across the rotation and deep-confirm history sealed by both versions.
 """
 
 import os
+import time
+from unittest.mock import patch
 
-from sigil import model
+from sigil import KeyPair, locks, model
 from sigil.charter import taken_over, verify_chain
 from sigil.server import RemoteNetwork, RemoteStandby, RemoteWitness
 from sigil.wallet import SealFailed, Wallet, mirror_acks, request_seal
+from sigil.witness import Rejected
 from tests.integration.harness import MIXED, IntegrationCase, manual_spend
 
 
 class RotationTests(IntegrationCase):
+    def test_rotation_avoids_partial_checkpoint_when_settled_replies_are_lost(self):
+        """Real witness processes can finish a handover after partial SETTLED loss."""
+        c = self.c
+        R, old = c.constellation("partial-checkpoint", ["python"] * 4)
+        net = self.net({R: c.urls(old)})
+        owner = KeyPair.generate()
+        parcel = model.parcel(R, "x", 1, locks.sig(owner.pk), "partial-checkpoint")
+        sigil = model.sigil_of(parcel)
+        header = {"inputs": [[sigil, 0]], "body": "c" * 64}
+        tid = model.transition_id(header)
+        unlock = locks.empty_unlock(int(time.time()) + 1000)
+        unlock["sigs"][owner.pk] = locks.sign_unlock(owner, sigil, tid, unlock["expires"])
+        req = {"sigil": sigil, "header": header, "home": R, "lock": parcel["lock"],
+               "salt": parcel["salt"], "unlock": unlock}
+        seal = model.seal_from_votes([w.spend(req) for w in net.witnesses(R)])
+        cert = {"header": header, "inputs": [{"parcel": {"home": R, "lock": parcel["lock"],
+                                                 "salt": parcel["salt"]}, "seal": seal}]}
+        for w in net.witnesses(R)[:2]:
+            w.settle(cert)
+        new = c.add_members(R, ["python"] * 4, c.admin())
+        c.start_all(new)
+        for i in new:
+            c.witnesses[i]["pending"] = False
+        old_urls = c.urls(old)
+        original = RemoteWitness.settled_records
+
+        def unreliable_settled(member):
+            if member.url in old_urls[2:]:
+                raise Rejected("SETTLED reply lost")
+            return original(member)
+
+        with patch.object(RemoteWitness, "settled_records", unreliable_settled):
+            self.assertEqual(net.rotate(R, c.urls(new), c.token), 1)
+        self.assertIsNone(net.registry.latest(R).get("checkpoint"))
+        self.assertEqual({RemoteWitness(u).version for u in c.urls(new)}, {1})
+
     def test_rotation_of_a_live_constellation(self):
         c = self.c
         R, old = c.constellation("rotor", MIXED, start=False)

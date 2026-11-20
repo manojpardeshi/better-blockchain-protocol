@@ -21,14 +21,12 @@ def plan_checkpoint(cur: dict, answers: list, compact: bool = True) -> list:
 
     ``answers`` are members' SETTLED answers. The current version's own set (checked
     against ``cur``'s hash) is always kept: members refuse a charter that drops one
-    of its sigils. With ``compact`` it is extended by the entries ALL answering members
-    hold settled: settled records only accumulate, so every one of them accepts, and the
-    rotation needs only as many as it did without a checkpoint. (Taking the entries a
-    mere quorum holds would make honest members outside that quorum refuse to freeze, so
-    the rotation would depend on every member of the quorum, possibly a faulty one, and an
-    honest member that missed a vote can never settle that sigil.) The price: one member
-    answering with little, a Byzantine one included, limits compaction, never rotation. A
-    malformed answer counts as holding nothing settled.
+    of its sigils. Callers enable ``compact`` only after every current charter member
+    answers SETTLED. Then the set is extended by entries all answering members hold
+    settled, so each honest member can freeze for it. A missing reply may hide an honest
+    member that never settled an entry; adding it could strand a frozen minority. A
+    member answering with little, including a Byzantine one, limits compaction, never
+    rotation. A malformed answer counts as holding nothing settled.
     """
     prev: list = []
     ck = cur.get("checkpoint")
@@ -158,13 +156,20 @@ class Network:
         (SPEC §5.5): its members get the members' signatures as the request,
         fence, and hand over their mirror logs as well. ``successor`` gives the
         new version a committee (``{"n" | "keys", "dead_man"}``). With ``compact``
-        the new charter checkpoints every sigil all live members hold settled
-        (SPEC §5.7); the current checkpoint is carried over in any case.
+        and SETTLED replies from every current charter member, the new charter
+        checkpoints sigils all members hold settled (SPEC §5.7). Otherwise it
+        carries only the current checkpoint.
         """
         chain = self.registry.chain(cid)
         cur = chain[-1]["body"]
         ckeys, succ = self._committee_keys(successor)
-        ck = plan_checkpoint(cur, settled_answers(self.witnesses(cid)), compact)
+        members = self.witnesses(cid)
+        answers = settled_answers(members)
+        # Missing SETTLED replies cannot justify adding a new checkpoint entry:
+        # a recovered honest member may never have settled that binding and
+        # would then refuse FREEZE, even though it could sign without compaction.
+        all_answered = len(members) == len(cur["witnesses"]) and len(answers) == len(members)
+        ck = plan_checkpoint(cur, answers, compact and all_answered)
         nxt = charter_body(cur["name"], cur["version"] + 1, [k.pk for k in new_keys], charter_hash(cur), succ,
                            checkpoint_hash(ck) if ck else None)
         sigs, snapshots = {}, []
