@@ -47,6 +47,29 @@ class WireTests(unittest.TestCase):
         self.assertEqual(self.net.registry.chain(self.X), self.sim.registry.chain(self.X))
         self.assertEqual(len(self.net.witnesses(self.X)), 4)
 
+    def test_refresh_charters_reloads_member_at_reused_url(self):
+        sim = Network()
+        cid = sim.create_constellation("reused-url", n=1)
+        old_server = WitnessServer(sim.all_witnesses(cid)[0]).start()
+        self.addCleanup(old_server.stop)
+        port = old_server.httpd.server_address[1]
+        net = RemoteNetwork({cid: [old_server.url]})
+        old_pk = net.witnesses(cid)[0].pk
+        alice, bob = Wallet("alice", net, cid), Wallet("bob", net, cid)
+        coin = alice.issue("C", 5)
+
+        old_server.stop()
+        sim.rotate(cid, [KeyPair.generate()])
+        new_server = WitnessServer(sim.all_witnesses(cid)[0], port=port).start()
+        self.addCleanup(new_server.stop)
+        net.refresh_charters(cid)
+
+        self.assertEqual(net.registry.latest(cid)["version"], 1)
+        self.assertNotEqual(net.witnesses(cid)[0].pk, old_pk)
+        self.assertEqual(net.witnesses(cid)[0].pk, new_server.witness.pk)
+        alice.pay(bob, coin, 2)
+        self.assertEqual(bob.balance(coin), 2)
+
     def test_payments_swaps_and_deep_confirmation_over_http(self):
         alice, bob = Wallet("alice", self.net, self.X), Wallet("bob", self.net, self.X)
         usd = alice.issue("USD", 1_000)
