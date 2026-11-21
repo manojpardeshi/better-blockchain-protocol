@@ -16,6 +16,7 @@ rm -rf ./tn                           # start over
 ```
 
 `up` creates the directory on first use and prints each constellation id with its witness URLs. Witnesses are detached and keep running until `down`. Add `--stamps` to make witnesses require a [stamp](../sigil/stamps.py) with every spend.
+Use at least one constellation and 1–128 witnesses per constellation; invalid sizes are rejected before any keys or stores are created.
 
 ```
 tn/

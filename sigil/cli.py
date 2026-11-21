@@ -30,6 +30,7 @@ The wallet directory holds money (see sigil/wallet_store.py): back it up.
 
 import argparse
 import json
+import os
 import sys
 
 from . import model, wallet_store
@@ -72,13 +73,29 @@ def _balances(w: Wallet) -> dict:
 
 
 def cmd_init(args):
-    if wallet_store.exists(args.wallet):
-        raise CliError(f"wallet already exists at {args.wallet}")
+    if os.path.islink(args.wallet) or (os.path.lexists(args.wallet) and not os.path.isdir(args.wallet)):
+        raise CliError(f"wallet path is not a directory: {args.wallet}")
     net = _network(args.directory)
     if args.home not in net.registry:
         raise CliError("home constellation not in the directory (or its charter could not be verified)")
-    w = Wallet(args.name, net, args.home, deep_threshold=args.deep_threshold)
-    wallet_store.save(w, args.wallet)
+    os.makedirs(args.wallet, mode=0o700, exist_ok=True)
+    # Claim initialization before inspecting the directory. A second init must
+    # not race us into replacing keys.json or dossier.json. A crash leaves the
+    # lock and any partial files for the operator to inspect and recover.
+    lock = os.path.join(args.wallet, ".init.lock")
+    try:
+        fd = os.open(lock, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError as e:
+        raise CliError(f"wallet initialization already started at {args.wallet}") from e
+    try:
+        os.close(fd)
+        with os.scandir(args.wallet) as entries:
+            if any(entry.name != ".init.lock" for entry in entries):
+                raise CliError(f"wallet directory is not empty: {args.wallet}")
+        w = Wallet(args.name, net, args.home, deep_threshold=args.deep_threshold)
+        wallet_store.save(w, args.wallet)
+    finally:
+        os.unlink(lock)
     return {"wallet": args.wallet, "name": w.name, "home": w.home}
 
 
