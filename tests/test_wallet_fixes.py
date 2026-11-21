@@ -53,6 +53,30 @@ class InvalidAmountTests(unittest.TestCase):
             self.assertIsNone(self.net.witnesses(self.X)[0].status(right["sigil"])["tid"])
             self.assertEqual(self.alice.balance(model.MINT_PREFIX + asset), 5)
 
+    def test_invalid_custom_transaction_never_binds_its_input(self):
+        asset = self.alice.issue("USD", 10)
+        held = next(iter(self.alice.holdings.values()))
+        ref, sigil = held["ref"], held["sigil"]
+        addr = self.bob.address()
+
+        def output(amount, name=asset):
+            return model.parcel(self.X, name, amount, addr["lock"], addr["salt"])
+
+        for refs, outputs in (([ref], [output(0)]),
+                              ([ref], [output(True)]),
+                              ([ref], [output(11)]),
+                              ([ref], [output(10, "different-asset")]),
+                              ([ref, ref], [output(20)]),
+                              ([dict(ref, extra=1)], [output(10)]),
+                              ([model.ref(ref["tx"], -1)], [output(10)]),
+                              ([model.ref("00" * 32, 0)], [output(10)])):
+            with self.subTest(refs=refs, outputs=outputs), self.assertRaises(InvalidDossier):
+                self.alice.transact(refs, outputs)
+            self.assertIsNone(self.net.witnesses(self.X)[0].status(sigil)["tid"])
+            self.assertNotIn(sigil, self.alice.pledged)
+            self.assertEqual(self.alice.balance(asset), 10)
+            self.assertEqual(len(self.alice.dossier.transitions), 1)
+
 
 class PledgePruneTests(unittest.TestCase):
     def setUp(self):

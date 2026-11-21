@@ -16,7 +16,7 @@ from .locks import keys_in, sign_unlock
 from .network import Network
 from .proofs import proves_dead, verify_ack, verify_seal, verify_vote
 from .stamps import buy_stamp
-from .validate import Dossier, InvalidDossier, TrustPolicy, Verifier
+from .validate import Dossier, InvalidDossier, TrustPolicy, Verifier, check_transfer_values
 from .witness import CONTESTED, MAX_GEN, Conflict, Rejected
 
 
@@ -838,6 +838,9 @@ class Wallet:
         return n
 
     def transact(self, refs: list, outputs: list, *, extra_unlocks: dict | None = None, memo: str = "") -> str:
+        # Witnesses attest only sigils and a body hash. Validate what that hash
+        # commits to before any owner signature or irreversible binding leaves.
+        check_transfer_values(self.dossier, refs, outputs)
         header, body, _ = self.prepare(refs, outputs, memo)
         unlocks = self.authorise(header, body, extra_unlocks)
         try:

@@ -266,13 +266,10 @@ class Verifier:
         refs = b["inputs"]
         if not refs or len(refs) != len(h["inputs"]):
             raise InvalidDossier("inputs do not match header")
-        if len({model.parcel_id(r) for r in refs}) != len(refs):
-            raise InvalidDossier("duplicate input")
         if len({s for s, _ in h["inputs"]}) != len(h["inputs"]):
             raise InvalidDossier("duplicate sigil")
-        totals_in, totals_out = Counter(), Counter()
-        for r, (s, gen) in zip(refs, h["inputs"]):
-            p = d.output(r)
+        parcels = check_transfer_values(d, refs, b["outputs"])
+        for r, p, (s, gen) in zip(refs, parcels, h["inputs"]):
             if model.sigil_of(p) != s:
                 raise InvalidDossier("header sigil does not match input parcel")
             seal = d.seals.get(model.seal_key(s, tid))
@@ -288,15 +285,38 @@ class Verifier:
             # produce the owner's unlock.
             if not evaluate(p["lock"], unlocks.get(s, {}), s, tid, None):
                 raise InvalidDossier("owner did not authorise this spend")
-            totals_in[p["asset"]] += p["amount"]
-        for o in b["outputs"]:
-            if o["asset"] in (SELF_ASSET, SELF_MINT):
-                raise InvalidDossier("asset placeholders are only valid in genesis")
-            totals_out[o["asset"]] += o["amount"]
-        for asset in set(totals_in) | set(totals_out):
-            x = base_asset(asset)
-            m = MINT_PREFIX + x
-            if totals_in[x] + totals_in[m] != totals_out[x] + totals_out[m]:
-                raise InvalidDossier(f"value not conserved for {x[:12]}")
-            if totals_out[m] > totals_in[m]:
-                raise InvalidDossier("mint right cannot grow")
+
+
+def check_transfer_values(dossier: Dossier, refs: list, outputs: list) -> list:
+    """Check a spend's references, parcels and conservation before a wallet signs it.
+
+    The holder verifier uses the same checks after sealing. This does not verify
+    signatures or seals; those still require the completed transition.
+    """
+    if not isinstance(refs, list) or not refs:
+        raise InvalidDossier("spend needs inputs")
+    if any(not isinstance(r, dict) or set(r) != {"tx", "i"} or not isinstance(r["tx"], str)
+           or type(r["i"]) is not int or r["i"] < 0 for r in refs):
+        raise InvalidDossier("malformed input reference")
+    if len({model.parcel_id(r) for r in refs}) != len(refs):
+        raise InvalidDossier("duplicate input")
+    if not isinstance(outputs, list) or not outputs or not all(Verifier._parcel_ok(o) for o in outputs):
+        raise InvalidDossier("malformed output")
+    parcels = [dossier.output(r) for r in refs]
+    if len({model.sigil_of(p) for p in parcels}) != len(parcels):
+        raise InvalidDossier("duplicate sigil")
+    totals_in, totals_out = Counter(), Counter()
+    for p in parcels:
+        totals_in[p["asset"]] += p["amount"]
+    for o in outputs:
+        if o["asset"] in (SELF_ASSET, SELF_MINT):
+            raise InvalidDossier("asset placeholders are only valid in genesis")
+        totals_out[o["asset"]] += o["amount"]
+    for asset in set(totals_in) | set(totals_out):
+        x = base_asset(asset)
+        m = MINT_PREFIX + x
+        if totals_in[x] + totals_in[m] != totals_out[x] + totals_out[m]:
+            raise InvalidDossier(f"value not conserved for {x[:12]}")
+        if totals_out[m] > totals_in[m]:
+            raise InvalidDossier("mint right cannot grow")
+    return parcels
