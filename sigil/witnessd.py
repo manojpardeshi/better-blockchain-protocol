@@ -73,6 +73,15 @@ def _write_private(path: str, obj: dict) -> None:
     os.chmod(path, 0o600)  # the file may have existed with looser permissions
 
 
+def _write_new_private(path: str, obj: dict) -> None:
+    """Create a key file exclusively so keygen cannot replace an identity."""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(obj, f)
+        f.flush()
+        os.fsync(f.fileno())
+
+
 def _write_json(path: str, obj) -> None:
     tmp = path + ".tmp"
     with open(tmp, "w") as f:
@@ -86,11 +95,18 @@ def pub_path(key_path: str) -> str:
 
 def generate_key(out: str) -> KeyPair:
     """Write a fresh Ed25519 key to ``out`` (0600) and its public key to ``*.pub``."""
+    pub = pub_path(out)
+    # Check the companion first, then use exclusive creation for both files.
+    # A collision after writing the private file leaves it intact for recovery.
+    if os.path.lexists(pub):
+        raise FileExistsError(f"{pub}: already exists; refusing to replace a witness key")
     seed = os.urandom(32)
     kp = KeyPair(Ed25519PrivateKey.from_private_bytes(seed))
-    _write_private(out, {"seed": seed.hex(), "pk": kp.pk})
-    with open(pub_path(out), "w") as f:
+    _write_new_private(out, {"seed": seed.hex(), "pk": kp.pk})
+    with open(pub, "x") as f:
         f.write(kp.pk + "\n")
+        f.flush()
+        os.fsync(f.fileno())
     return kp
 
 
@@ -316,7 +332,10 @@ def main(argv=None) -> None:
 
     args = p.parse_args(argv)
     if args.cmd == "keygen":
-        print(generate_key(args.out).pk)
+        try:
+            print(generate_key(args.out).pk)
+        except OSError as e:
+            raise SystemExit(f"sigil.witnessd: {e}") from None
     elif args.cmd == "genesis":
         if bool(args.committee) != (args.dead_man is not None):
             raise SystemExit("--committee and --dead-man go together")
