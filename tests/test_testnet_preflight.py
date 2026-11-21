@@ -7,7 +7,9 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from sigil.charter import Registry, charter_body, constellation_id, successor_clause
+from sigil.charter import (Registry, charter_body, charter_hash, checkpoint_hash,
+                           constellation_id, sign_charter, successor_clause)
+from sigil.crypto import KeyPair
 from sigil.witnessd import load_registry
 from testnet.launcher import Testnet
 from testnet.preflight import check, main
@@ -105,6 +107,48 @@ class TestnetPreflightTests(unittest.TestCase):
             directory["committees"] = {cid: ["https://w3.example", "https://w4.example"]}
             errors = check(directory, registry)
             self.assertTrue(any("wrong daemon role" in error for error in errors), errors)
+
+    def test_checkpointed_charter_requires_checkpoint_feature(self):
+        key = KeyPair.generate()
+        standby = KeyPair.generate()
+        genesis = charter_body("checkpointed", 0, [key.pk], None)
+        cid = constellation_id(genesis)
+        current = charter_body("checkpointed", 1, [key.pk], charter_hash(genesis),
+                               successor_clause([standby.pk], 60),
+                               checkpoint=checkpoint_hash([["a" * 64, 0, "b" * 64]]))
+        chain = [{"body": genesis, "sigs": {}},
+                 {"body": current, "sigs": {key.pk: sign_charter(key, current)}}]
+        registry = Registry()
+        registry.add_chain(cid, chain)
+        directory = {"constellations": {cid: ["https://witness.example"]},
+                     "committees": {cid: ["https://standby.example"]}}
+
+        class Fake:
+            def __init__(self, url, timeout):
+                self.role = "standby" if "standby" in url else "witness"
+                self.pk = standby.pk if self.role == "standby" else key.pk
+                self.features = Fake.first_features[self.role]
+
+            def _info(self):
+                return {"pk": self.pk, "constellation": cid, "version": 1,
+                        "role": self.role, "frozen": False, "features": Fake.second_features[self.role]}
+
+            def chain(self, asked):
+                return chain
+
+        with patch("testnet.preflight.RemoteWitness", Fake), patch("testnet.preflight.RemoteStandby", Fake):
+            # The first INFO is cached by the client constructor; a later INFO
+            # must not hide an old daemon's lack of checkpoint support.
+            Fake.first_features = {"witness": [], "standby": ["checkpoint"]}
+            Fake.second_features = {"witness": ["checkpoint"], "standby": ["checkpoint"]}
+            errors = check(directory, registry)
+            self.assertTrue(any("witness" in error and "checkpoint" in error for error in errors), errors)
+            Fake.first_features = {"witness": ["checkpoint"], "standby": ["checkpoint"]}
+            Fake.second_features = {"witness": ["checkpoint"], "standby": []}
+            errors = check(directory, registry)
+            self.assertTrue(any("standby" in error and "checkpoint" in error for error in errors), errors)
+            Fake.second_features["standby"] = ["checkpoint"]
+            self.assertEqual(check(directory, registry), [])
 
 
 if __name__ == "__main__":
