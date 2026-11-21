@@ -15,6 +15,45 @@ from sigil.witness import MAX_GEN, Witness
 from tests.test_security import manual_spend
 
 
+class InvalidAmountTests(unittest.TestCase):
+    def setUp(self):
+        self.net = Network()
+        self.X = self.net.create_constellation("orion")
+        self.alice = Wallet("alice", self.net, self.X)
+        self.bob = Wallet("bob", self.net, self.X)
+
+    def test_issue_rejects_invalid_amounts_before_creating_a_genesis(self):
+        for supply, cap in ((0, 0), (-1, 0), (True, 0), (1.5, 0), (1, -1), (1, True)):
+            with self.subTest(supply=supply, cap=cap), self.assertRaises(ValueError):
+                self.alice.issue("BAD", supply, mint_cap=cap)
+        self.assertEqual(self.alice.dossier.transitions, {})
+        self.assertEqual(self.alice.holdings, {})
+        self.assertEqual(self.alice.issued, set())
+
+    def test_invalid_payment_amount_never_binds_a_coin(self):
+        asset = self.alice.issue("USD", 10)
+        sigil = next(iter(self.alice.holdings.values()))["sigil"]
+        for amount in (0, -1, True, 1.5):
+            with self.subTest(amount=amount), self.assertRaises(ValueError):
+                self.alice.pay(self.bob, asset, amount)
+            self.assertEqual(self.alice.balance(asset), 10)
+            self.assertIsNone(self.net.witnesses(self.X)[0].status(sigil)["tid"])
+        self.assertEqual(self.bob.issued, set())
+        with self.assertRaises(ValueError):
+            self.alice.payment_outputs(asset, 0, self.bob.address())
+        self.assertIsNone(self.net.witnesses(self.X)[0].status(sigil)["tid"])
+
+    def test_invalid_mint_amount_never_binds_the_mint_right(self):
+        asset = self.alice.issue("USD", 10, mint_cap=5)
+        right = next(h for h in self.alice.holdings.values()
+                     if h["parcel"]["asset"] == model.MINT_PREFIX + asset)
+        for amount in (0, -1, True, 1.5):
+            with self.subTest(amount=amount), self.assertRaises(ValueError):
+                self.alice.mint(asset, amount)
+            self.assertIsNone(self.net.witnesses(self.X)[0].status(right["sigil"])["tid"])
+            self.assertEqual(self.alice.balance(model.MINT_PREFIX + asset), 5)
+
+
 class PledgePruneTests(unittest.TestCase):
     def setUp(self):
         self.net = Network()
