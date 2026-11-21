@@ -32,6 +32,7 @@ from .gossip import GossipStore
 from .ratelimit import (DEFAULT_BURST, DEFAULT_RATE, IDLE_TIMEOUT, MAX_CLIENT_CONNECTIONS, MAX_CONNECTIONS,
                         ConnectionLimiter, RateLimiter, client_key, is_loopback)
 from .network import plan_checkpoint, settled_answers
+from .stamps import parse_hex
 from .witness import Conflict, Rejected, Witness
 
 MAX_BODY = 1 << 20
@@ -241,7 +242,7 @@ class WitnessServer:
             if method == "heartbeat":
                 return w.heartbeat(body["challenge"])
             if method == "sell_stamp":
-                return format(w.sell_stamp(int(body["blinded"], 16)), "x")
+                return format(w.sell_stamp(parse_hex(body["blinded"])), "x")
             if method == "gossip":
                 out = self.gossip.merge(body)
                 w.remember_charters()  # a restart must not forget a version learned here
