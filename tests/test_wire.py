@@ -8,7 +8,7 @@ import urllib.request
 from sigil import InvalidDossier, KeyPair, Network, SealFailed, Wallet
 from sigil import model
 from sigil.charter import charter_body, constellation_id
-from sigil.server import RemoteNetwork, RemoteWitness, WitnessServer
+from sigil.server import RemoteNetwork, RemoteWitness, StandbyServer, WitnessServer
 from sigil.store import WitnessStore
 from sigil.swap import atomic_swap
 from sigil.witness import Conflict, Rejected, Witness
@@ -69,6 +69,29 @@ class WireTests(unittest.TestCase):
         self.assertEqual(net.witnesses(cid)[0].pk, new_server.witness.pk)
         alice.pay(bob, coin, 2)
         self.assertEqual(bob.balance(coin), 2)
+
+    def test_refresh_charters_reloads_standby_at_reused_url(self):
+        sim = Network()
+        cid = sim.create_constellation("reused-standby-url", n=1,
+                                       successor={"n": 1, "dead_man": 10_000})
+        witness_server = WitnessServer(sim.all_witnesses(cid)[0]).start()
+        self.addCleanup(witness_server.stop)
+        old_server = StandbyServer(sim.committee(cid)[0]).start()
+        self.addCleanup(old_server.stop)
+        port = old_server.httpd.server_address[1]
+        net = RemoteNetwork({cid: [witness_server.url]}, committees={cid: [old_server.url]})
+        old_pk = net.committee(cid)[0].pk
+
+        old_server.stop()
+        sim.rotate(cid, [KeyPair.generate()], successor={"keys": [KeyPair.generate()],
+                                                    "dead_man": 10_000})
+        new_server = StandbyServer(sim.committee(cid)[0], port=port).start()
+        self.addCleanup(new_server.stop)
+        net.refresh_charters(cid)
+
+        self.assertEqual(net.registry.latest(cid)["version"], 1)
+        self.assertNotEqual(net.committee(cid)[0].pk, old_pk)
+        self.assertEqual(net.committee(cid)[0].pk, new_server.standby.pk)
 
     def test_payments_swaps_and_deep_confirmation_over_http(self):
         alice, bob = Wallet("alice", self.net, self.X), Wallet("bob", self.net, self.X)

@@ -947,7 +947,11 @@ class RemoteNetwork:
         return set(self.urls) | set(self.committees)
 
     def refresh_charters(self, cid: str) -> None:
-        """Learn ``cid``'s charter chain and current witness identities from its URLs."""
+        """Learn ``cid``'s charter chain and current member identities from its URLs."""
+        # A successor committee may have changed while reusing the same URLs.
+        # Re-read /info before using its members for mirror acks or rotation.
+        for url in self.committees.get(cid, []):
+            self._standbys.pop(url, None)
         for url in self.urls.get(cid, []):
             # The operator may have rotated a new member onto the same URL.
             # A cached RemoteWitness keeps its old /info key indefinitely.
