@@ -57,6 +57,8 @@ def check(directory: dict, registry: Registry, *, timeout: float = 3.0,
         if charter is None:
             errors.append(f"{cid}: missing verified registry chain")
             continue
+        expected_chain = registry.chain(cid)
+        checkpoint_required = any("checkpoint" in entry["body"] for entry in expected_chain)
         expected = [("witness", charter["witnesses"], urls)]
         committee_keys = charter.get("successor", {}).get("committee", [])
         committee_urls = committees.get(cid, [])
@@ -95,10 +97,14 @@ def check(directory: dict, registry: Registry, *, timeout: float = 3.0,
                     errors.append(f"{cid} {role} {url}: public key changed between info reads")
                 if info.get("frozen") or info.get("fenced"):
                     errors.append(f"{cid} {role} {url}: member is frozen or fenced")
+                features = info.get("features")
+                if checkpoint_required and ("checkpoint" not in client.features
+                                            or not isinstance(features, list) or "checkpoint" not in features):
+                    errors.append(f"{cid} {role} {url}: checkpointed charter requires checkpoint feature")
                 if client.pk not in keys:
                     errors.append(f"{cid} {role} {url}: public key is not in current charter")
                 found.append(client.pk)
-                if chain != registry.chain(cid):
+                if chain != expected_chain:
                     errors.append(f"{cid} {role} {url}: served charter chain differs from registry")
             if len(found) != len(set(found)):
                 errors.append(f"{cid} {role}: duplicate public key among endpoints")

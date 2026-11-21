@@ -104,7 +104,9 @@ python -m testnet.preflight --registry registry.json --directory directory.json
 It validates the registry chain, requires HTTPS URLs, and checks that every
 current witness (and, when configured, standby member) has a unique endpoint
 and public key, announces the expected constellation and charter version, and
-serves the exact agreed chain. It exits nonzero and reports each mismatch.
+serves the exact agreed chain. If any charter in the chain uses a checkpoint,
+it also requires every current witness and standby member to advertise the
+`checkpoint` feature. It exits nonzero and reports each mismatch.
 For a local testnet or protected private HTTP transport, pass `--allow-http`.
 The check only reads `/v0/info` and `/v0/charters/<cid>`; it does not test
 admin access controls, TLS termination policy, payment liveness, or independent
