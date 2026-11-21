@@ -8,7 +8,7 @@ import tempfile
 import unittest
 from contextlib import redirect_stderr
 
-from sigil import Network, cli, wallet_store
+from sigil import Network, cli, model, wallet_store
 from sigil.server import RemoteNetwork, WitnessServer
 
 
@@ -103,6 +103,46 @@ class CliTests(unittest.TestCase):
         self.assertEqual(self.run_cli("bob", "receive", bad, ok=False)["error"], "CliError")
         self.run_cli("bob", "receive", pay)
         self.assertEqual(self.balance("bob", asset), 10)
+
+    def test_capped_mint_persists_and_minted_coins_can_be_paid(self):
+        self.run_cli("alice", "init", "--home", self.X)
+        self.run_cli("bob", "init", "--home", self.X)
+        issued = self.run_cli("alice", "issue", "GOLD", "10", "--mint-cap", "5")
+        asset = issued["asset"]
+        right = model.MINT_PREFIX + asset
+        self.assertEqual((issued["supply"], issued["mint_cap"]), (10, 5))
+        self.assertEqual((self.balance("alice", asset), self.balance("alice", right)), (10, 5))
+
+        first = self.run_cli("alice", "mint", asset, "3")
+        self.assertEqual((first["amount"], first["balance"], first["remaining_mint_cap"]), (3, 13, 2))
+        self.assertIn(first["tid"], self.run_cli("alice", "export-dossier")["transitions"])
+        # Each CLI call reloads the wallet from disk and uses the HTTP witnesses.
+        self.assertEqual((self.balance("alice", asset), self.balance("alice", right)), (13, 2))
+        self.assertEqual(self.run_cli("alice", "mint", asset, "3", ok=False)["message"],
+                         "exceeds remaining mint cap")
+        self.assertEqual(self.run_cli("alice", "mint", asset, "2")["remaining_mint_cap"], 0)
+        self.assertEqual(self.run_cli("alice", "mint", asset, "1", ok=False)["message"],
+                         "no mint right for this asset")
+
+        payment = self.path("minted-payment.json")
+        self.run_cli("alice", "pay", self.address_file("bob"), asset, "12", "--out", payment)
+        self.assertEqual(self.run_cli("bob", "receive", payment, "--deep")["received"],
+                         [{"asset": asset, "amount": 12, "home": self.X}])
+        self.assertEqual((self.balance("alice", asset), self.balance("bob", asset)), (3, 12))
+
+    def test_mint_cli_rejects_invalid_amounts_and_uncapped_asset(self):
+        self.run_cli("alice", "init", "--home", self.X)
+        for supply, cap in (("0", "1"), ("-1", "1"), ("1", "-1")):
+            self.assertEqual(self.run_cli("alice", "issue", "BAD", supply, "--mint-cap", cap,
+                                          ok=False)["error"], "CliError")
+        self.assertEqual(self.run_cli("alice", "export-dossier")["transitions"], {})
+        asset = self.run_cli("alice", "issue", "USD", "5")["asset"]
+        for amount in ("0", "-1"):
+            self.assertEqual(self.run_cli("alice", "mint", asset, amount, ok=False)["error"],
+                             "CliError")
+        self.assertEqual(self.run_cli("alice", "mint", asset, "1", ok=False)["message"],
+                         "no mint right for this asset")
+        self.assertEqual(self.balance("alice", asset), 5)
 
     def test_errors(self):
         self.run_cli("alice", "balance", ok=False)                       # no wallet yet
