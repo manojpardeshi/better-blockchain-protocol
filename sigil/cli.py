@@ -6,7 +6,9 @@ Commands (all print JSON on stdout):
 
     init --home CID [--name N] [--deep-threshold X]   create a wallet
     address [--home CID]                 a fresh receiving address (give it to a payer)
-    issue NAME SUPPLY [--home CID]       create a new asset; prints its id
+    issue NAME SUPPLY [--home CID] [--mint-cap N]
+                                         create an asset and optional predeclared mint right
+    mint ASSET AMOUNT                    spend part of the issuer's mint right
     balance [ASSET]                      balances (of one asset, or all)
     assets                               assets held, with names
     pay ADDRESS_FILE ASSET AMOUNT --out PAYMENT_FILE
@@ -92,9 +94,24 @@ def cmd_address(args):
 
 def cmd_issue(args):
     w = _load(args)
-    asset = w.issue(args.name, args.supply, args.home)
+    if args.supply <= 0:
+        raise CliError("supply must be positive")
+    if args.mint_cap < 0:
+        raise CliError("mint cap must be nonnegative")
+    asset = w.issue(args.name, args.supply, args.home, mint_cap=args.mint_cap)
     wallet_store.save(w, args.wallet)
-    return {"asset": asset, "name": args.name, "supply": args.supply}
+    return {"asset": asset, "name": args.name, "supply": args.supply, "mint_cap": args.mint_cap}
+
+
+def cmd_mint(args):
+    w = _load(args)
+    if args.amount <= 0:
+        raise CliError("amount must be positive")
+    tid = w.mint(args.asset, args.amount)
+    wallet_store.save(w, args.wallet)
+    return {"tid": tid, "asset": args.asset, "amount": args.amount,
+            "balance": w.balance(args.asset),
+            "remaining_mint_cap": w.balance(model.MINT_PREFIX + args.asset)}
 
 
 def cmd_balance(args):
@@ -240,6 +257,9 @@ def parser() -> argparse.ArgumentParser:
     s = sub.add_parser("address"); s.set_defaults(fn=cmd_address); s.add_argument("--home")
     s = sub.add_parser("issue"); s.set_defaults(fn=cmd_issue)
     s.add_argument("name"); s.add_argument("supply", type=int); s.add_argument("--home")
+    s.add_argument("--mint-cap", type=int, default=0, help="predeclare additional supply the issuer can mint later")
+    s = sub.add_parser("mint"); s.set_defaults(fn=cmd_mint)
+    s.add_argument("asset"); s.add_argument("amount", type=int)
     s = sub.add_parser("balance"); s.set_defaults(fn=cmd_balance); s.add_argument("asset", nargs="?")
     s = sub.add_parser("assets"); s.set_defaults(fn=cmd_assets)
     s = sub.add_parser("pay"); s.set_defaults(fn=cmd_pay)
