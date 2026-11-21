@@ -51,7 +51,7 @@ is an intentionally conservative amount: use zero when a bond is absent, expired
 homed in a compromised constellation, unavailable to the intended claimant, or
 otherwise not demonstrably collectible. Do not enter a bond's face amount merely
 because it exists. Give every positive amount a non-empty `bond_id` that identifies
-the underlying bond parcel. A positive `bond_id` can appear on only one witness
+the underlying bond parcel. A bond ID may have a positive amount on only one witness
 row: if several witnesses share one bond, allocate its collectible amount to one
 row and enter zero for the others. Zero rows may omit `bond_id` or repeat the
 shared ID. Count separate positive amounts only when they are backed by genuinely
