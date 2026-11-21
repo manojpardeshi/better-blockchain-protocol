@@ -70,13 +70,15 @@ class AgentPolicyTests(unittest.TestCase):
                                       [(self.bank, self.agent_kp.pk),
                                        (self.bank, cosigners[0].pk), (self.bank, cosigners[1].pk)]))
 
-    def test_time_delay_with_owner_veto_window(self):
+    def test_time_delay_requires_agent_for_early_spend(self):
         future = int(self.net.clock()) + 10_000
         lock = ap.time_delayed_with_veto(self.agent_kp.pk, self.owner_kp.pk, future)
         h = _fund(self.net, self.c, self.bank, lock, 100, self.usd)
-        # Before the delay the agent alone cannot settle (owner's veto window).
+        # Withholding consent delays the agent, but the owner cannot claw back alone.
         self.assertFalse(_spend_parcel(self.bank, h, self._dest(),
                                        [(self.bank, self.agent_kp.pk)]))
+        self.assertFalse(_spend_parcel(self.bank, h, self._dest(),
+                                       [(self.bank, self.owner_kp.pk)]))
         # With the owner's consent it settles immediately.
         self.assertTrue(_spend_parcel(self.bank, h, self._dest(),
                                       [(self.bank, self.agent_kp.pk), (self.bank, self.owner_kp.pk)]))

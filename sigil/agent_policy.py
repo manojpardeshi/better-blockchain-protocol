@@ -78,14 +78,12 @@ def threshold_multisig(agent_pk: str, cosigner_pks: list, k: int) -> dict:
 
 
 def time_delayed_with_veto(agent_pk: str, owner_pk: str, not_before: int) -> dict:
-    """A large payment the agent proposes now but that only *settles* after
-    ``not_before`` -- unless the owner vetoes.
+    """Require the owner's co-signature for an agent spend before ``not_before``.
 
-    Expressed as: the agent may complete the spend alone once the delay has
-    passed, OR the owner co-signs to let it through sooner. The *veto* is the
-    owner refusing to co-sign AND re-homing the parcel before the delay
-    elapses (see ``veto_by_rehome`` below). This gives the owner a window to
-    react to an injected large payment before it can settle.
+    The "veto" in the name means withholding consent for an immediate spend;
+    after the delay, the agent may spend alone. This lock does not let the owner
+    independently re-home the parcel or stop the agent after the delay. Use
+    ``owner_can_claw_back`` when the owner needs an independent recovery path.
 
         any( all(sig(agent), after(not_before)),      # agent alone, but only later
              all(sig(agent), sig(owner)) )            # or immediately with owner consent
@@ -162,7 +160,8 @@ WHAT_LOCKS_CANNOT_EXPRESS = [
     "(6) Revocation of a key mid-life without moving the parcel. To disable a "
     "compromised agent key the owner must re-home / re-lock the affected "
     "parcels (claw-back); the lock cannot be edited in place.",
-    "(7) Owner veto as a positive action. The time-delay pattern gives the owner "
-    "a WINDOW to react (by clawing back / not co-signing); it cannot express an "
-    "explicit 'owner stop' signal short of the owner spending the parcel first.",
+    "(7) Owner veto without spending the parcel. Refusing to co-sign a "
+    "time-delayed spend only delays the agent until the deadline; it cannot "
+    "stop a later spend. An owner-only claw-back path must be in the original "
+    "lock and consumes/re-homes the parcel before the agent spends it.",
 ]
