@@ -94,11 +94,47 @@ Save the JSON as `scenario.json`, then run:
 python3 research/economics.py scenario.json
 ```
 
+## Local stamp operation probe
+
+Run the reference Python witness's stamp paths with a real SQLite `WitnessStore`
+on the host you want to characterize:
+
+```sh
+python3 research/stamp_cost_probe.py --count 100 --stamp-bits 2048 > stamp-probe.json
+```
+
+The script creates a temporary, one-member witness and removes its store at the
+end. Each phase reports elapsed and process CPU seconds, per-operation
+milliseconds, and the change in checkpointed SQLite database bytes, log row
+counts, and encoded log payload bytes. `sale_sign` times witness RSA blind
+signing for twice `--count` fresh stamps. `spend_accepted` times distinct valid
+one-input requests with stamps. `spend_rejected_valid_stamp` presents fresh
+valid stamps on requests with the wrong home: those stamps are persisted as
+redeemed before the request is rejected. `spend_rejected_replay` retries the
+accepted requests with already redeemed stamps, so it should add no rows.
+The script checks these outcomes and fails if an operation has an unexpected
+result.
+
+Request construction, RSA key generation, client blinding and unblinding, and
+store checkpoints are outside the timed phases. The probe invokes the witness
+in process: it omits HTTP, network transfer, concurrent load, payment collection,
+wallet work, key storage, and fixed operations. Its wrong-home rejection is an
+early validation failure, not a worst-case malformed request. The SQLite byte
+delta is **database file growth after a checkpoint**, not bytes written to the
+WAL or storage device; it can be zero for a phase that writes rows when existing
+pages have room. CPU time is process-wide. Run several trials on the intended
+hardware and retain the platform, workload, and raw JSON with any cost decision.
+These measurements are resource observations, **not monetary prices**. To fill
+`variable_sale_cost` or `variable_spend_cost`, measure the missing production
+work and apply the operator's actual CPU, storage, bandwidth, payment, and
+maintenance costs. The open sale endpoint still collects no payment.
+
 ## How to populate it with evidence
 
-1. **Measure spend cost under load.** Use the existing benchmark as a starting
-   point, but measure CPU time, durable write bytes, disk space, bandwidth and
-   operational overhead on the actual host and workload, with stamps enabled.
+1. **Measure spend cost under load.** Use the local stamp operation probe and
+   existing benchmark as starting points, but measure CPU time, durable write
+   bytes, disk space, bandwidth and operational overhead on the actual host and
+   workload, with stamps enabled.
    [BENCHMARKS.md](BENCHMARKS.md) measures votes with fresh one input payments
    and no stamp cost. Its single machine throughput numbers are not a cost per
    stamp. Include valid SPENDs, malformed requests with valid stamps, repeated

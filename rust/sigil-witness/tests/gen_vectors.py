@@ -763,9 +763,10 @@ def stamp_cases():
         ("sig + n", dict(good, sig=format(int(good["sig"], 16) + n, "x"))),
         ("not hex", dict(good, sig="zz")), ("empty", dict(good, sig="")), ("missing sig", {"serial": good["serial"]}),
         ("sig not a string", dict(good, sig=5)),
-        # Python's int(x, 16) also takes a 0x prefix and a sign; Rust takes plain hex only.
-        ("0x prefix", dict(good, sig="0x" + good["sig"]), False),
-        ("plus sign", dict(good, sig="+" + good["sig"]), False),
+        ("0x prefix", dict(good, sig="0x" + good["sig"])),
+        ("plus sign", dict(good, sig="+" + good["sig"])),
+        ("whitespace", dict(good, sig=" " + good["sig"])),
+        ("underscore", dict(good, sig=good["sig"][:2] + "_" + good["sig"][2:])),
     ]
     verify_out = []
     for case in stamps:

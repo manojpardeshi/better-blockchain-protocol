@@ -69,6 +69,8 @@ S="python -m sigil.cli --directory directory.json"
 $S --wallet alice init --home <cid>
 $S --wallet bob   init --home <cid>
 $S --wallet alice issue USD 1000                  # -> {"asset": "<id>", ...}
+$S --wallet alice issue GOLD 100 --mint-cap 50    # 100 coins now, plus a right to mint up to 50 later
+$S --wallet alice mint <gold-id> 20               # spends 20 of that right; 30 remain
 $S --wallet bob   address > bob-addr.json         # bob gives this to alice
 $S --wallet alice pay bob-addr.json <id> 300 --out payment.json
 $S --wallet bob   receive payment.json [--deep]   # verifies, then takes custody
@@ -81,6 +83,8 @@ $S --wallet alice buy-stamps <cid> 10             # for homes whose witnesses re
 If a `pay` completes an earlier payment that had been left pending (for example after a witness outage), it writes that payment's file next to `--out` and lists it under `completed` in its output: hand it to the payee.
 
 Payments are handed from holder to holder as files; no server stores them. Receiving the same payment twice is a no-op; a tampered or already-spent payment is rejected. **Back up the wallet directory**: it holds your key seeds and your dossier, and in Sigil the dossier is the money. There is no ledger to recover it from.
+
+`--mint-cap` declares an additional supply right in the asset's genesis. The right is a transferable `mint:<asset-id>` parcel; whoever holds it can mint up to its amount. `mint` consumes rights through the witness network and combines multiple right parcels when needed. Back up the holder's wallet and keys. A failed mint can be retried with the same asset and amount; the wallet reuses its pending transition rather than signing a conflicting one. These commands do **not** implement issuer redemption or a trustless, supply-neutral history refresh. An issuer could receive old coins, mint replacement coins, and still retain or spend the old ones, increasing circulating units within the declared cap. Exchanging old coins for replacements therefore requires custody and issuer controls; the two transfers are not atomic.
 
 ## Repository layout
 

@@ -60,6 +60,12 @@ python -m sigil.witnessd keygen --out /private/w1.json
 # Share /private/w1.pub with the other operators; never share w1.json.
 ```
 
+`keygen` refuses to replace an existing private key or its `.pub` file in both
+the Python and Rust CLIs. Keep the key and its public file together; if a run
+stops after creating only the private key, derive its public key from that key
+instead of running `keygen` again. Replacing a witness key can make its durable
+store unusable and remove that member from the constellation.
+
 After all public keys are agreed, create and compare the same genesis registry
 and constellation ID. The coordinator can run:
 
@@ -86,6 +92,23 @@ Create a directory mapping `<cid>` to each operator's reachable `https://`
 URL, following [the wire format](WIRE.md#files). A successor committee needs
 its own independent keys, stores, endpoints and `committees` entry; see
 [succession](WIRE.md#succession). The local Compose fixture has no committee.
+
+Before publishing that directory, run the read-only endpoint check from a
+separate host using the agreed registry and the exact directory clients will
+receive:
+
+```sh
+python -m testnet.preflight --registry registry.json --directory directory.json
+```
+
+It validates the registry chain, requires HTTPS URLs, and checks that every
+current witness (and, when configured, standby member) has a unique endpoint
+and public key, announces the expected constellation and charter version, and
+serves the exact agreed chain. It exits nonzero and reports each mismatch.
+For a local testnet or protected private HTTP transport, pass `--allow-http`.
+The check only reads `/v0/info` and `/v0/charters/<cid>`; it does not test
+admin access controls, TLS termination policy, payment liveness, or independent
+operator control. Run the acceptance drills below as well.
 
 ### Rust standby heartbeat endpoints
 

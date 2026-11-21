@@ -90,7 +90,6 @@ def normalise(x, bad_sigs: list):
 # wire differences. Keyed by case name; the value says why. A listed case must still answer an
 # error on the Rust side.
 KNOWN: dict = {
-    "sell_stamp 0x prefix": "deliberate: hex in stamps must be plain [0-9a-fA-F]+ (BENCHMARKS.md)",
     "witness POST v1": "minor: a path outside /v0/ is 404 in Rust, 400 in Python; both bad_request",
     "standby POST v1": "minor: a path outside /v0/ is 404 in Rust, 400 in Python; both bad_request",
 }
@@ -365,7 +364,8 @@ class WireCompatTests(unittest.TestCase):
         # --- STAMPS
         r.send("sell_stamp unstamped", P, W, "/v0/sell_stamp", {"blinded": "abcd"})
         for b, name in (("abcd", "valid"), ("0", "zero"), (format(self.mint_pub["n"] + 1, "x"), "over n"),
-                        ("zz", "not hex"), ("-1", "negative"), ("0x10", "0x prefix")):
+                        ("zz", "not hex"), ("-1", "negative"), ("0x10", "0x prefix"),
+                        ("+10", "plus sign"), (" 10", "whitespace"), ("1_0", "underscore")):
             r.send(f"sell_stamp {name}", ST, W, "/v0/sell_stamp", {"blinded": b})
         p1, s1 = self.parcel("03" * 16)
         r.send("stamped spend without stamp", ST, W, "/v0/spend", {"request": self.req(self.hdr([(s1, 0)], "6"), s1, p1)})
