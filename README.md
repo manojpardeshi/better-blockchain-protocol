@@ -62,22 +62,22 @@ assert bob.balance(usd) == 250
 
 ## CLI quickstart
 
-A file-based wallet for a real network (`sigil/cli.py`). `directory.json` lists witness URLs per constellation (see [docs/WIRE.md](docs/WIRE.md)). Every command prints JSON.
+A file-based wallet for a real network (`sigil/cli.py`). `directory.json` lists witness URLs per constellation (see [docs/WIRE.md](docs/WIRE.md)). Every command prints JSON. Replace the example IDs below with IDs from your directory and the `issue` output.
 
 ```sh
-S="python -m sigil.cli --directory directory.json"
-$S --wallet alice init --home <cid>
-$S --wallet bob   init --home <cid>
-$S --wallet alice issue USD 1000                  # -> {"asset": "<id>", ...}
-$S --wallet alice issue GOLD 100 --mint-cap 50    # 100 coins now, plus a right to mint up to 50 later
-$S --wallet alice mint <gold-id> 20               # spends 20 of that right; 30 remain
-$S --wallet bob   address > bob-addr.json         # bob gives this to alice
-$S --wallet alice pay bob-addr.json <id> 300 --out payment.json
-$S --wallet bob   receive payment.json [--deep]   # verifies, then takes custody
-$S --wallet bob   balance; $S --wallet bob assets; $S --wallet bob export-dossier
-$S --wallet bob   trust <other-cid>               # accept parcels homed there too (by default a wallet
-                                                   # trusts only its home and the directory's constellations)
-$S --wallet alice buy-stamps <cid> 10             # for homes whose witnesses require stamps
+sigil() { python3 -m sigil.cli --directory directory.json "$@"; }
+sigil --wallet alice init --home <cid>
+sigil --wallet bob   init --home <cid>
+sigil --wallet alice issue USD 1000                  # -> {"asset": "<id>", ...}
+sigil --wallet alice issue GOLD 100 --mint-cap 50    # 100 coins now, plus a right to mint up to 50 later
+sigil --wallet alice mint <gold-id> 20               # spends 20 of that right; 30 remain
+sigil --wallet bob   address > bob-addr.json         # bob gives this to alice
+sigil --wallet alice pay bob-addr.json <id> 300 --out payment.json
+sigil --wallet bob   receive payment.json           # add --deep for deep confirmation
+sigil --wallet bob   balance; sigil --wallet bob assets; sigil --wallet bob export-dossier
+sigil --wallet bob   trust <other-cid>               # accept parcels homed there too (by default a wallet
+                                                      # trusts only its home and the directory's constellations)
+sigil --wallet alice buy-stamps <cid> 10             # for homes whose witnesses require stamps
 ```
 
 If a `pay` completes an earlier payment that had been left pending (for example after a witness outage), it writes that payment's file next to `--out` and lists it under `completed` in its output: hand it to the payee.
