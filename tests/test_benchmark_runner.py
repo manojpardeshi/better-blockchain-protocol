@@ -105,6 +105,27 @@ class BenchmarkRunnerTests(unittest.TestCase):
         with open(self.output) as f:
             self.assertEqual(f.read(), "old result")
 
+    def test_http_run_rejects_partial_success(self):
+        result = {"bench": "http_spend", "n": 4, "ok": 3, "errors": 1, "votes_per_s": 100}
+        with mock.patch.object(run_all, "sh", return_value=result):
+            with self.assertRaisesRegex(RuntimeError, "incomplete HTTP benchmark: requested 4"):
+                run_all.rust("http", "--url", "http://localhost:7000", "--n", "4")
+
+    def test_http_run_rejects_missing_or_inconsistent_counts(self):
+        for result in (
+            {"bench": "http_spend", "n": 4, "ok": 4},
+            {"bench": "http_spend", "n": 5, "ok": 4, "errors": 0},
+            {"bench": "http_spend", "n": 4, "ok": True, "errors": 0},
+        ):
+            with self.subTest(result=result), mock.patch.object(run_all, "sh", return_value=result):
+                with self.assertRaisesRegex(RuntimeError, "incomplete HTTP benchmark"):
+                    run_all.rust("http", "--n", "4")
+
+    def test_http_run_accepts_complete_measurement(self):
+        result = {"bench": "http_spend", "n": 4, "ok": 4, "errors": 0, "votes_per_s": 100}
+        with mock.patch.object(run_all, "sh", return_value=result):
+            self.assertEqual(run_all.rust("http", "--n", "4"), result)
+
 
 if __name__ == "__main__":
     unittest.main()

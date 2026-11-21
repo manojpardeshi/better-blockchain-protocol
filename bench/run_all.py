@@ -104,7 +104,23 @@ def sh(cmd, **kw) -> dict:
 
 
 def rust(*args, pin=None) -> dict:
-    return sh([*(["taskset", "-c", pin] if pin else []), BENCH_BIN, *args])
+    result = sh([*(["taskset", "-c", pin] if pin else []), BENCH_BIN, *args])
+    if args and args[0] == "http":
+        requested_n = int(args[args.index("--n") + 1])
+        validate_http_result(result, requested_n)
+    return result
+
+
+def validate_http_result(result: dict, requested_n: int) -> None:
+    """Keep partial or mislabeled load runs out of published results."""
+    if (result.get("bench") != "http_spend"
+            or type(result.get("n")) is not int or result["n"] != requested_n
+            or type(result.get("ok")) is not int
+            or type(result.get("errors")) is not int
+            or result["ok"] != requested_n or result["errors"] != 0):
+        raise RuntimeError(f"incomplete HTTP benchmark: requested {requested_n}, "
+                           f"reported n={result.get('n')}, ok={result.get('ok')}, "
+                           f"errors={result.get('errors')}")
 
 
 def python(*args) -> dict:

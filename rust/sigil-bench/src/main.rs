@@ -284,6 +284,29 @@ impl Conn {
     }
 }
 
+/// Check the response without doing signature verification in the timed load loop.
+/// The benchmark measures witness throughput, so client-side verification would
+/// add another Ed25519 operation to every request.
+fn valid_spend_response(body: &[u8], cid: &str, sigil: &str, tid: &str) -> bool {
+    let Ok(reply) = parse(body) else {
+        return false;
+    };
+    if reply.get("error").is_some() {
+        return false;
+    }
+    let Some(v) = reply.get("ok") else {
+        return false;
+    };
+    v.get("constellation").and_then(Json::as_str) == Some(cid)
+        && v.get("sigil").and_then(Json::as_str) == Some(sigil)
+        && v.get("tid").and_then(Json::as_str) == Some(tid)
+        && v.get("gen").and_then(Json::as_int) == Some(0)
+        && v.get("version").and_then(Json::as_int).is_some_and(|n| n >= 0)
+        && v.get("time").and_then(Json::as_int).is_some()
+        && v.get("witness").and_then(Json::as_str).is_some_and(|s| !s.is_empty())
+        && v.get("sig").and_then(Json::as_str).is_some_and(|s| !s.is_empty())
+}
+
 fn http(url: &str, n: usize, concurrency: usize, new_conn: bool, gen_threads: usize) {
     let addr = url.trim_start_matches("http://").trim_end_matches('/').to_string();
     let info = {
@@ -296,13 +319,20 @@ fn http(url: &str, n: usize, concurrency: usize, new_conn: bool, gen_threads: us
     };
     let cid = info.get("ok").and_then(|o| o.get("constellation")).and_then(Json::as_str).unwrap().to_string();
     let tag = format!("http-{}-{}", std::process::id(), rand::random::<u32>());
-    let bodies: Vec<Vec<u8>> = requests(&cid, n, gen_threads, &tag).into_iter().map(|r| obj([("request", r)]).canonical()).collect();
+    let bodies: Vec<(Vec<u8>, String, String)> = requests(&cid, n, gen_threads, &tag)
+        .into_iter()
+        .map(|r| {
+            let sigil = r.get("sigil").and_then(Json::as_str).expect("request sigil").to_string();
+            let tid = sigil_witness::model::transition_id(r.get("header").expect("request header"));
+            (obj([("request", r)]).canonical(), sigil, tid)
+        })
+        .collect();
     let bodies = Arc::new(bodies);
     let next = Arc::new(AtomicUsize::new(0));
     let t0 = Instant::now();
     let handles: Vec<_> = (0..concurrency)
         .map(|_| {
-            let (bodies, next, addr) = (bodies.clone(), next.clone(), addr.clone());
+            let (bodies, next, addr, cid) = (bodies.clone(), next.clone(), addr.clone(), cid.clone());
             std::thread::spawn(move || {
                 let mut c = Conn { host: addr.clone(), addr, stream: None };
                 let mut lat = Vec::new();
@@ -313,8 +343,16 @@ fn http(url: &str, n: usize, concurrency: usize, new_conn: bool, gen_threads: us
                         break;
                     }
                     let t = Instant::now();
-                    match c.post("/v0/spend", &bodies[i], new_conn) {
-                        Ok((200, _)) => lat.push(t.elapsed().as_secs_f64() * 1e3),
+                    match c.post("/v0/spend", &bodies[i].0, new_conn) {
+                        Ok((200, body)) if valid_spend_response(&body, &cid, &bodies[i].1, &bodies[i].2) => {
+                            lat.push(t.elapsed().as_secs_f64() * 1e3);
+                        }
+                        Ok((200, body)) => {
+                            errors += 1;
+                            if errors < 3 {
+                                eprintln!("HTTP 200 without matching vote: {}", String::from_utf8_lossy(&body));
+                            }
+                        }
                         Ok((code, body)) => {
                             errors += 1;
                             if errors < 3 {

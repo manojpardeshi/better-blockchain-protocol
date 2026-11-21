@@ -54,6 +54,9 @@ from the checked-in results. The runner checks that it can create a temporary fi
 in the output directory before measuring, though later filesystem failures remain
 possible. A measurement or serialization failure leaves any existing output file
 intact; the runner replaces it only after every measurement succeeds.
+For HTTP measurements, the load generator counts only a successful response containing
+a vote for the requested sigil and transition. The full runner rejects any HTTP run
+with failed requests or inconsistent counts before writing results.
 
 Individual pieces:
 
