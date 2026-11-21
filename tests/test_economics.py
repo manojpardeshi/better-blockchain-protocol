@@ -6,10 +6,13 @@ from research.economics import evaluate
 
 
 def member(name, bond, price="1", gate=True):
-    return {"id": name, "assumed_collectible_bond": bond,
-            "paid_stamp_gate": gate, "stamp_price": price,
-            "variable_sale_cost": "0.1", "variable_spend_cost": "0.2",
-            "allocated_fixed_cost_per_stamp": "0.3"}
+    row = {"id": name, "assumed_collectible_bond": bond,
+           "paid_stamp_gate": gate, "stamp_price": price,
+           "variable_sale_cost": "0.1", "variable_spend_cost": "0.2",
+           "allocated_fixed_cost_per_stamp": "0.3"}
+    if bond != "0":
+        row["bond_id"] = f"bond-{name}"
+    return row
 
 
 class EconomicsWorksheetTests(unittest.TestCase):
@@ -38,6 +41,29 @@ class EconomicsWorksheetTests(unittest.TestCase):
             evaluate({"max_concurrent_loss": "1", "witnesses": [member("a", "1"), member("a", "2")]})
         with self.assertRaisesRegex(ValueError, "non-negative"):
             evaluate({"max_concurrent_loss": "1", "witnesses": [member("a", "-1")]})
+
+    def test_positive_bond_requires_nonempty_id(self):
+        witness = member("a", "10")
+        del witness["bond_id"]
+        with self.assertRaisesRegex(ValueError, "a.bond_id is required"):
+            evaluate({"max_concurrent_loss": "0", "witnesses": [witness]})
+        witness["bond_id"] = "  "
+        with self.assertRaisesRegex(ValueError, "a.bond_id must be a non-empty string"):
+            evaluate({"max_concurrent_loss": "0", "witnesses": [witness]})
+
+    def test_rejects_duplicate_positive_bond_ids(self):
+        witnesses = [member("a", "10"), member("b", "20")]
+        witnesses[1]["bond_id"] = " bond-a "
+        with self.assertRaisesRegex(ValueError, "duplicate positive bond_id: bond-a"):
+            evaluate({"max_concurrent_loss": "0", "witnesses": witnesses})
+
+    def test_distinct_positive_bonds_and_zero_allocation(self):
+        witnesses = [member("a", "10"), member("b", "20"),
+                     member("c", "0"), member("d", "0")]
+        witnesses[3]["bond_id"] = "bond-a"  # A shared bond is counted only for a.
+        result = evaluate({"max_concurrent_loss": "5", "witnesses": witnesses})
+        self.assertEqual(result["assumed_collectible_collateral_floor"], "0")
+        self.assertEqual(result["least_assumed_collectible_bonds"], ["c", "d"])
 
 
 if __name__ == "__main__":

@@ -40,10 +40,24 @@ def evaluate(scenario):
     q = n - f
     intersection = 2 * q - n
     exposure = amount(scenario["max_concurrent_loss"], "max_concurrent_loss")
-    bonds = sorted(
-        (amount(m["assumed_collectible_bond"], f"{m['id']}.assumed_collectible_bond"), m["id"])
-        for m in members
-    )
+    bonds = []
+    positive_bond_ids = set()
+    for member in members:
+        name = member["id"]
+        bond = amount(member["assumed_collectible_bond"], f"{name}.assumed_collectible_bond")
+        bond_id = member.get("bond_id")
+        if bond_id is not None:
+            if not isinstance(bond_id, str) or not bond_id.strip():
+                raise ValueError(f"{name}.bond_id must be a non-empty string")
+            bond_id = bond_id.strip()
+        if bond > 0:
+            if bond_id is None:
+                raise ValueError(f"{name}.bond_id is required for a positive assumed_collectible_bond")
+            if bond_id in positive_bond_ids:
+                raise ValueError(f"duplicate positive bond_id: {bond_id}")
+            positive_bond_ids.add(bond_id)
+        bonds.append((bond, name))
+    bonds.sort()
     collateral_floor = sum((b for b, _ in bonds[:intersection]), Decimal(0))
 
     rows = []
