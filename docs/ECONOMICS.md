@@ -50,8 +50,15 @@ List the witnesses of one charter version only. All amounts must use the
 is an intentionally conservative amount: use zero when a bond is absent, expired,
 homed in a compromised constellation, unavailable to the intended claimant, or
 otherwise not demonstrably collectible. Do not enter a bond's face amount merely
-because it exists. Record the bond parcel, home, lock, unbond time, auditor
-independence and claim procedure outside this file. The current auditor signed
+because it exists. Give every positive amount a non-empty `bond_id` that identifies
+the underlying bond parcel. A bond ID may have a positive amount on only one witness
+row: if several witnesses share one bond, allocate its collectible amount to one
+row and enter zero for the others. Zero rows may omit `bond_id` or repeat the
+shared ID. Count separate positive amounts only when they are backed by genuinely
+separate bond parcels with distinct IDs. The worksheet checks ID uniqueness, but
+cannot verify that the parcels are independent or collectible. Record the bond
+parcel, home, lock, unbond time, auditor independence and claim procedure outside
+this file. The current auditor signed
 lock prevents the original self claim bug, but the lock alone does not promise
 that auditors sign, that a claim wins, or that victims receive the proceeds.
 
@@ -59,16 +66,16 @@ that auditors sign, that a claim wins, or that victims receive the proceeds.
 {
   "max_concurrent_loss": "40",
   "witnesses": [
-    {"id": "A", "assumed_collectible_bond": "25", "paid_stamp_gate": true,
+    {"id": "A", "bond_id": "bond-A", "assumed_collectible_bond": "25", "paid_stamp_gate": true,
      "stamp_price": "0.02", "variable_sale_cost": "0.002",
      "variable_spend_cost": "0.006", "allocated_fixed_cost_per_stamp": "0.004"},
-    {"id": "B", "assumed_collectible_bond": "25", "paid_stamp_gate": true,
+    {"id": "B", "bond_id": "bond-B", "assumed_collectible_bond": "25", "paid_stamp_gate": true,
      "stamp_price": "0.02", "variable_sale_cost": "0.002",
      "variable_spend_cost": "0.006", "allocated_fixed_cost_per_stamp": "0.004"},
-    {"id": "C", "assumed_collectible_bond": "25", "paid_stamp_gate": true,
+    {"id": "C", "bond_id": "bond-C", "assumed_collectible_bond": "25", "paid_stamp_gate": true,
      "stamp_price": "0.02", "variable_sale_cost": "0.002",
      "variable_spend_cost": "0.006", "allocated_fixed_cost_per_stamp": "0.004"},
-    {"id": "D", "assumed_collectible_bond": "25", "paid_stamp_gate": true,
+    {"id": "D", "bond_id": "bond-D", "assumed_collectible_bond": "25", "paid_stamp_gate": true,
      "stamp_price": "0.02", "variable_sale_cost": "0.002",
      "variable_spend_cost": "0.006", "allocated_fixed_cost_per_stamp": "0.004"}
   ]
