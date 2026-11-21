@@ -7,9 +7,11 @@ import stat
 import tempfile
 import unittest
 from contextlib import redirect_stderr
+from unittest import mock
 
 from sigil import Network, cli, model, wallet_store
 from sigil.server import RemoteNetwork, WitnessServer
+from sigil.wallet import SealFailed
 
 
 class CliTests(unittest.TestCase):
@@ -143,6 +145,58 @@ class CliTests(unittest.TestCase):
         self.assertEqual(self.run_cli("alice", "mint", asset, "1", ok=False)["message"],
                          "no mint right for this asset")
         self.assertEqual(self.balance("alice", asset), 5)
+
+    def test_mint_right_can_be_transferred_and_split_rights_combined(self):
+        for who in ("alice", "bob"):
+            self.run_cli(who, "init", "--home", self.X)
+        asset = self.run_cli("alice", "issue", "GOLD", "10", "--mint-cap", "8")["asset"]
+        right = model.MINT_PREFIX + asset
+        out = self.path("right-to-bob.json")
+        self.run_cli("alice", "pay", self.address_file("bob"), right, "3", "--out", out)
+        self.run_cli("bob", "receive", out)
+        self.assertEqual((self.balance("alice", right), self.balance("bob", right)), (5, 3))
+        self.run_cli("bob", "mint", asset, "1")
+        self.assertEqual(self.balance("bob", asset), 1)
+        out = self.path("right-to-alice.json")
+        self.run_cli("bob", "pay", self.address_file("alice"), right, "2", "--out", out)
+        self.run_cli("alice", "receive", out)
+        self.assertEqual(self.balance("alice", right), 7)  # two parcels: 5 + 2
+        result = self.run_cli("alice", "mint", asset, "6")
+        self.assertEqual((result["balance"], result["remaining_mint_cap"]), (16, 1))
+        self.assertEqual(self.balance("alice", right), 1)
+
+    def test_failed_mint_retries_the_same_durable_transition(self):
+        self.run_cli("alice", "init", "--home", self.X)
+        asset = self.run_cli("alice", "issue", "GOLD", "10", "--mint-cap", "5")["asset"]
+        with mock.patch("sigil.wallet.request_seal", side_effect=SealFailed("blocked", [], [])):
+            self.assertEqual(self.run_cli("alice", "mint", asset, "3", ok=False)["error"], "SealFailed")
+        state = wallet_store.load(self.path("alice"), RemoteNetwork({self.X: [s.url for s in self.servers]}))
+        (tid, _), = state.pending.items()
+        self.assertEqual({v[1] for v in state.pledged.values()}, {tid})
+        self.assertEqual(self.run_cli("alice", "mint", asset, "1", ok=False)["message"],
+                         "mint right is currently pledged")
+        result = self.run_cli("alice", "mint", asset, "3")
+        self.assertEqual(result["tid"], tid)
+        self.assertEqual((result["balance"], result["remaining_mint_cap"]), (13, 2))
+        state = wallet_store.load(self.path("alice"), RemoteNetwork({self.X: [s.url for s in self.servers]}))
+        self.assertEqual(state.pending, {})
+        self.assertEqual(state.pledged, {})
+        self.assertIn(tid, state.dossier.transitions)
+
+    def test_mint_crash_after_seal_recovers_on_reload(self):
+        self.run_cli("alice", "init", "--home", self.X)
+        asset = self.run_cli("alice", "issue", "GOLD", "10", "--mint-cap", "5")["asset"]
+        wallet_path = self.path("alice")
+        w = wallet_store.load(wallet_path, RemoteNetwork({self.X: [s.url for s in self.servers]}))
+        w.on_pledge = lambda wallet: wallet_store.save(wallet, wallet_path)
+        with mock.patch.object(w, "finalise", side_effect=RuntimeError("crash")):
+            with self.assertRaisesRegex(RuntimeError, "crash"):
+                w.mint(asset, 3)  # process exits without a final save
+        del w
+        state = wallet_store.load(wallet_path, RemoteNetwork({self.X: [s.url for s in self.servers]}))
+        (tid, _), = state.pending.items()
+        self.assertEqual(self.run_cli("alice", "mint", asset, "3")["tid"], tid)
+        self.assertEqual(self.balance("alice", asset), 13)
 
     def test_errors(self):
         self.run_cli("alice", "balance", ok=False)                       # no wallet yet
