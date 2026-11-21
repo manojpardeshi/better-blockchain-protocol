@@ -265,8 +265,10 @@ keys, but can **destroy** the holder's money by deleting the only copy (the doss
 
 **Mitigation:**
 * **P0 for AI-held wallets:** the agent-policy locks of [§5](#5-protecting-ai-agents-that-hold-wallets)
-  (`sigil/agent_policy.py`): co-signing, time-delays with an owner veto window, and
-  claw-back so a single phished/injected agent key cannot move large value alone.
+  (`sigil/agent_policy.py`): co-signing, a delay that requires owner consent for
+  early agent spends, and a separately predeclared owner-only claw-back path.
+  Choose the lock before delegation; a delay alone does not give the owner a
+  recovery path.
 * **P1:** hardware-key and threshold-signing guidance for high-value holders;
   encrypted, redundant dossier backup (the format already supports it).
 * **P2:** operator key hygiene, HSM-backed witness keys, and short witness terms
@@ -655,7 +657,7 @@ agent's own, prompt-injectable code. Tested end-to-end in `tests/test_agent_poli
 |---|---|---|
 | Co-signing | `all(sig(agent), sig(owner))` | A subverted agent cannot move the parcel without an out-of-band owner signature. |
 | k-of-n threshold | `all(sig(agent), multi(k, cosigners))` | Large reserves need *k* independent approvers besides the agent. |
-| Time-delay + veto window | `any(all(sig(agent), after(T)), all(sig(agent), sig(owner)))` | A large payment settles alone only after `T`; the owner has until `T` to claw back or decline to co-sign. |
+| Time-delay + early owner consent | `any(all(sig(agent), after(T)), all(sig(agent), sig(owner)))` | The agent cannot spend alone before `T`; the owner may approve an earlier spend by co-signing. This lock gives the owner no independent claw-back path. |
 | Owner claw-back | `any(sig(owner), all(sig(agent), after(T)))` | The owner can reclaim the float at any time; the agent spends alone only after the window. |
 | Cooperative payee allow-list | `all(sig(agent), sig(payee))` | The agent can complete a payment only with the named payee's counter-signature. |
 | Capped float (structural) | small parcels `sig(agent)`, large parcels co-signed; owner sets the refill cadence | Approximates a per-period cap without on-chain state. |
@@ -670,12 +672,16 @@ need state a stateless per-parcel lock cannot hold (delegate to a co-signing pol
 server that keeps the counter); (5) **conditioning on asset/amount/memo/payee** —
 the only non-signature predicates are the `after`/`before` clock and hash
 preimages; (6) **in-place key revocation** — disabling a compromised agent key means
-re-homing the parcels (claw-back), not editing the lock; (7) **owner veto as a
-positive stop** — the time-delay gives a *window*, not an explicit halt signal.
+re-homing the parcels (claw-back), not editing the lock; (7) **owner veto without
+spending** — withholding a co-signature only delays an agent until `T`.
+Independent claw-back must be included when the lock is created, and consumes
+the parcel before the agent spends it.
 
 The honest summary: the lock language gives an owner **co-signing, delay, and
-claw-back**, which together defang a single injected agent key for large value. It
-**cannot** give amount-aware or stateful policy on its own; those belong to a
+claw-back** as distinct lock policies. A time-delayed co-sign lock does not
+itself provide claw-back; use an owner-only branch when that recovery path is
+required. These controls can limit a single injected agent key's access to large
+value. They **cannot** give amount-aware or stateful policy on their own; those belong to a
 co-signing **policy server** (itself a `sig` in the lock) that applies the stateful
 rules before signing — reducing the trust in the agent to the trust in that server.
 
