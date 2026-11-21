@@ -22,6 +22,8 @@ import sys
 import time
 import urllib.request
 
+from sigil.witnessd import load_key
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 NAMES = ["orion", "lyra", "vega", "draco", "cygnus", "hydra", "pyxis", "lupus"]
 
@@ -125,20 +127,27 @@ class Testnet:
             self.wait_ready(i, timeout)
 
     def wait_ready(self, i: int, timeout: float = 30) -> None:
+        w = self.witnesses[i]
+        expected_pk = load_key(w["key"]).pk
         deadline = time.monotonic() + timeout
         while True:
             p = self.procs.get(i)
             if p is not None and p.poll() is not None:
-                raise RuntimeError(f"{self.witnesses[i]['name']} exited with {p.returncode}; "
-                                   f"see {self.witnesses[i]['log']}")
+                raise RuntimeError(f"{w['name']} exited with {p.returncode}; see {w['log']}")
             try:
                 with urllib.request.urlopen(self.url(i) + "/v0/info", timeout=1) as r:
-                    if json.loads(r.read())["ok"]["pk"]:
+                    reply = json.loads(r.read())
+                info = reply.get("ok") if isinstance(reply, dict) else None
+                if isinstance(info, dict):
+                    if info.get("pk") == expected_pk and info.get("constellation") == w["cid"]:
                         return
-            except OSError:
+                    raise RuntimeError(f"{w['name']} at {self.url(i)} has an unexpected identity: "
+                                       f"expected pk={expected_pk!r}, constellation={w['cid']!r}; "
+                                       f"got pk={info.get('pk')!r}, constellation={info.get('constellation')!r}")
+            except (OSError, ValueError):
                 pass
             if time.monotonic() > deadline:
-                raise TimeoutError(f"{self.witnesses[i]['name']} did not come up")
+                raise TimeoutError(f"{w['name']} did not come up")
             time.sleep(0.05)
 
     def kill(self, i: int, sig: int = signal.SIGKILL, timeout: float = 10) -> None:

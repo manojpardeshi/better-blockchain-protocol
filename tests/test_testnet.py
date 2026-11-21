@@ -157,5 +157,33 @@ class StampedTestnetTests(unittest.TestCase):
             self.assertTrue(f.read().rstrip().endswith("stopped"))
 
 
+class TestnetReadinessTests(unittest.TestCase):
+    def test_wait_ready_rejects_another_witness_on_the_port(self):
+        with tempfile.TemporaryDirectory(prefix="sigil-testnet-ready-") as d:
+            tn = Testnet(d)
+            tn.create(constellations=1, witnesses=2)
+            try:
+                tn.start(0)
+                tn.wait_ready(0)
+                tn.witnesses[1]["port"] = tn.witnesses[0]["port"]
+
+                # The endpoint is live, but it belongs to witness 0. The old
+                # readiness check accepted its nonempty public key for witness 1.
+                with self.assertRaisesRegex(RuntimeError, "unexpected identity"):
+                    tn.wait_ready(1, timeout=2)
+
+                original_cid = tn.witnesses[0]["cid"]
+                tn.witnesses[0]["cid"] = "0" * 64
+                with self.assertRaisesRegex(RuntimeError, "unexpected identity"):
+                    tn.wait_ready(0, timeout=2)  # right key, wrong constellation
+                tn.witnesses[0]["cid"] = original_cid
+
+                tn.start(1)  # cannot bind the already occupied port
+                with self.assertRaises(RuntimeError):
+                    tn.wait_ready(1, timeout=2)
+            finally:
+                tn.stop_all(signal.SIGKILL)
+
+
 if __name__ == "__main__":
     unittest.main()
