@@ -8,6 +8,8 @@
 * Bad configurations make the daemon exit non-zero promptly, without serving, and say what
   is wrong (the last line of its output names the problem).
 * ``docker compose config`` accepts docker-compose.yml (skipped without docker).
+  An opt-in smoke test also builds and runs the constellation, pays across it,
+  crashes a witness, and checks a restart from the same volumes.
 """
 
 import json
@@ -19,9 +21,12 @@ import subprocess
 import threading
 import time
 import unittest
+import urllib.request
 
 from sigil import locks, model
 from sigil.crypto import KeyPair
+from sigil.server import RemoteNetwork
+from sigil.wallet import Wallet
 
 from tests.integration.compat_harness import (ROOT, Daemon, daemon_cmd, free_port, http, make_tmpdir, new_constellation,
                                        requires_rust, run_cli, rust_available, witnessd, write_token)
@@ -330,6 +335,66 @@ class DockerComposeTests(unittest.TestCase):
             self.assertIn("--store /data/", cmd, name)
             self.assertEqual(svc.get("stop_signal"), "SIGTERM", name)
         self.assertTrue(os.path.exists(os.path.join(ROOT, "testnet", "docker-init.sh")))
+
+    @unittest.skipUnless(os.environ.get("SIGIL_COMPOSE_SMOKE") == "1",
+                         "set SIGIL_COMPOSE_SMOKE=1 to run the Docker lifecycle smoke test")
+    def test_compose_lifecycle(self):
+        docker = shutil.which("docker")
+        self.assertIsNotNone(docker, "Docker is required for the opt-in smoke test")
+        for port in range(7001, 7005):
+            if not port_free(port):
+                self.skipTest(f"host port {port} is already in use")
+
+        # A unique project keeps this test's containers and volumes separate from
+        # any other local constellation. Only this project's volumes are removed.
+        project = f"sigil-smoke-{os.getpid()}-{os.urandom(3).hex()}"
+        compose = [docker, "compose", "-p", project, "-f", os.path.join(ROOT, "docker-compose.yml")]
+
+        def run(*args, timeout=180):
+            out = subprocess.run([*compose, *args], cwd=ROOT, capture_output=True,
+                                 text=True, timeout=timeout)
+            self.assertEqual(out.returncode, 0, out.stderr or out.stdout)
+            return out.stdout
+
+        self.addCleanup(lambda: subprocess.run([*compose, "down", "-v", "--remove-orphans"],
+                                               cwd=ROOT, capture_output=True, timeout=60))
+
+        def wait_for_witnesses():
+            deadline = time.monotonic() + 30
+            for port in range(7001, 7005):
+                while True:
+                    try:
+                        with urllib.request.urlopen(f"http://127.0.0.1:{port}/v0/charters", timeout=1) as response:
+                            self.assertEqual(response.status, 200)
+                        break
+                    except OSError:
+                        if time.monotonic() >= deadline:
+                            self.fail(f"witness on port {port} did not become ready")
+                        time.sleep(0.1)
+
+        run("up", "-d", "--build", timeout=300)
+        wait_for_witnesses()
+        directory = json.loads(run("run", "--rm", "--entrypoint", "cat", "init",
+                                   "/net/directory.json"))["constellations"]
+        cid = next(iter(directory))
+        net = RemoteNetwork(directory)
+        alice, bob = Wallet("alice", net, cid), Wallet("bob", net, cid)
+        asset = alice.issue("USD", 100)
+        alice.pay(bob, asset, 10)
+
+        run("kill", "-s", "SIGKILL", "witness2")
+        run("start", "witness2")
+        wait_for_witnesses()
+        alice.pay(bob, asset, 5)
+
+        run("down")  # Named volumes retain keys and witness stores.
+        run("up", "-d")
+        wait_for_witnesses()
+        again = json.loads(run("run", "--rm", "--entrypoint", "cat", "init",
+                               "/net/directory.json"))["constellations"]
+        self.assertEqual(again, directory)
+        alice.pay(bob, asset, 5)
+        self.assertEqual((alice.balance(asset), bob.balance(asset)), (80, 20))
 
 
 if __name__ == "__main__":

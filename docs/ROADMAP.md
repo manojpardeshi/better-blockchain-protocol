@@ -21,7 +21,7 @@ Status legend: ⬜ not started · 🟨 in progress · ✅ done
 | ✅ | Witness server daemon with a durable store (`python -m sigil.witnessd`) |
 | ✅ | Wallet CLI: keys, receive, pay, balance, dossier export and import (`python -m sigil.cli`) |
 | ✅ | Gossip for charters and equivocation proofs (`sigil/gossip.py`) |
-| ✅ | Multi-process local testnet and a SIGKILL crash/restart harness (`testnet/`); docker-compose written but not yet run |
+| ✅ | Multi-process local testnet and a SIGKILL crash/restart harness (`testnet/`); Docker Compose build, payment, crash/restart and volume recovery exercised by an opt-in smoke test |
 
 ## Phase 2: Performance, Rust (#9)
 | | Item |
