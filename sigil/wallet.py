@@ -388,18 +388,36 @@ class Wallet:
         return tid
 
     def mint(self, asset: str, amount: int, home: str | None = None) -> str:
-        right = next((h for h in self.holdings.values() if h["parcel"]["asset"] == model.MINT_PREFIX + asset), None)
-        if right is None:
+        if amount <= 0:
+            raise ValueError("mint amount must be positive")
+        right_asset = model.MINT_PREFIX + asset
+        # A failed seal (or a crash before finalise was saved) leaves a durable
+        # pledge. Reuse its exact header and body, refreshing authorisations for
+        # that same tid if they have expired; a new tid would equivocate.
+        for tid, p in list(self.pending.items()):
+            b = p["body"]
+            if (b.get("memo") == "mint" and b["outputs"][0]["asset"] == asset
+                    and b["outputs"][0]["amount"] == amount
+                    and any(v[1] == tid for v in self.pledged.values())):
+                unlocks = self.authorise(p["header"], b, p.get("extra"))
+                self.seal(p["header"], b, unlocks)
+                return self.finalise(p["header"], b, unlocks)
+        self.release_expired_pledges()
+        rights = [h for h in self.holdings.values() if h["parcel"]["asset"] == right_asset]
+        if not rights:
             raise ValueError("no mint right for this asset")
-        cap = right["parcel"]["amount"]
-        if amount > cap:
+        if amount > sum(h["parcel"]["amount"] for h in rights):
             raise ValueError("exceeds remaining mint cap")
+        try:
+            refs, cap = self.select(right_asset, amount)
+        except ValueError as e:
+            raise ValueError("mint right is currently pledged") from e
         a = self.address(home)
         outputs = [model.parcel(a["home"], asset, amount, a["lock"], a["salt"])]
         if cap > amount:
-            m = self.address(right["parcel"]["home"])
+            m = self.address(self.dossier.output(refs[0])["home"])
             outputs.append(model.parcel(m["home"], model.MINT_PREFIX + asset, cap - amount, m["lock"], m["salt"]))
-        return self.transact([right["ref"]], outputs, memo="mint")
+        return self.transact(refs, outputs, memo="mint")
 
     # --------------------------------------------------------------- spending
 

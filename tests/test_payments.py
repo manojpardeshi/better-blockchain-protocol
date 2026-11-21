@@ -1,7 +1,8 @@
 import copy
 import unittest
+from unittest import mock
 
-from sigil import InvalidDossier, Network, Wallet
+from sigil import InvalidDossier, Network, SealFailed, Wallet
 from sigil import locks, model
 from sigil.swap import atomic_swap
 from sigil.validate import Dossier
@@ -48,6 +49,19 @@ class PaymentTests(unittest.TestCase):
         self.assertEqual(self.alice.balance(gold), 15)
         with self.assertRaises(ValueError):
             self.alice.mint(gold, 1)  # mint right fully used up
+
+    def test_mint_retry_refreshes_expired_authorisation_for_same_tid(self):
+        alice = Wallet("issuer", self.net, self.X, pledge_ttl=3, max_skew=1)
+        gold = alice.issue("GOLD", 10, mint_cap=5)
+        with mock.patch("sigil.wallet.request_seal", side_effect=SealFailed("blocked", [], [])):
+            with self.assertRaises(SealFailed):
+                alice.mint(gold, 3)
+        (tid, _), = alice.pending.items()
+        old_expiry = next(iter(alice.pledged.values()))[2]
+        self.net.clock.advance(4)
+        self.assertEqual(alice.mint(gold, 3), tid)
+        self.assertEqual(alice.balance(gold), 13)
+        self.assertLess(old_expiry, int(self.net.clock()))
 
     def test_atomic_swap_across_constellations(self):
         gold = self.bob.issue("GOLD", 50)

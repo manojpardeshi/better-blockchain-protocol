@@ -107,8 +107,11 @@ def cmd_mint(args):
     w = _load(args)
     if args.amount <= 0:
         raise CliError("amount must be positive")
-    tid = w.mint(args.asset, args.amount)
-    wallet_store.save(w, args.wallet)
+    try:
+        tid = w.mint(args.asset, args.amount)
+    finally:
+        # Mint selection can settle an older pledge even when this request fails.
+        wallet_store.save(w, args.wallet)
     return {"tid": tid, "asset": args.asset, "amount": args.amount,
             "balance": w.balance(args.asset),
             "remaining_mint_cap": w.balance(model.MINT_PREFIX + args.asset)}
