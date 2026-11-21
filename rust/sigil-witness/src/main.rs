@@ -40,7 +40,7 @@ use sigil_witness::json::{obj, parse, Json};
 use sigil_witness::stamps::load_mint;
 use sigil_witness::store::Store;
 use sigil_witness::witness::system_clock;
-use sigil_witness::{load_admin_token, load_key, load_registry, probe_url, ratelimit, server, write_private, KeyPair, Standby, Witness};
+use sigil_witness::{load_admin_token, load_key, load_registry, probe_url, ratelimit, server, write_private_new, KeyPair, Standby, Witness};
 
 #[derive(Parser)]
 #[command(name = "sigil-witness", about = "Sigil v0 witness (Rust)", version)]
@@ -240,10 +240,20 @@ fn main() {
 }
 
 fn keygen(out: &str) -> Result<(), String> {
+    use std::io::Write;
+    let pub_file = pub_path(out);
+    match std::fs::symlink_metadata(&pub_file) {
+        Ok(_) => return Err(format!("{pub_file}: already exists; refusing to replace a witness key")),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {},
+        Err(e) => return Err(format!("{pub_file}: {e}")),
+    }
     let (kp, seed) = KeyPair::generate();
     let v = obj([("seed", Json::str(hex::encode(seed))), ("pk", Json::str(&kp.pk))]);
-    write_private(out, &v.canonical()).map_err(|e| format!("{out}: {e}"))?;
-    std::fs::write(pub_path(out), format!("{}\n", kp.pk)).map_err(|e| e.to_string())?;
+    write_private_new(out, &v.canonical()).map_err(|e| format!("{out}: {e}"))?;
+    let mut f = std::fs::OpenOptions::new().write(true).create_new(true).open(&pub_file)
+        .map_err(|e| format!("{pub_file}: {e}"))?;
+    f.write_all(format!("{}\n", kp.pk).as_bytes()).map_err(|e| format!("{pub_file}: {e}"))?;
+    f.sync_all().map_err(|e| format!("{pub_file}: {e}"))?;
     println!("{}", kp.pk);
     Ok(())
 }

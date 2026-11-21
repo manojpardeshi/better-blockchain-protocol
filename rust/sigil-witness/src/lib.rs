@@ -71,9 +71,28 @@ pub fn write_private(path: &str, data: &[u8]) -> std::io::Result<()> {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
 }
 
+/// Create a private key file exclusively. Unlike `write_private`, this must
+/// never truncate an existing witness identity.
+#[cfg(unix)]
+pub fn write_private_new(path: &str, data: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(path)?;
+    f.write_all(data)?;
+    f.sync_all()
+}
+
 #[cfg(not(unix))]
 pub fn write_private(path: &str, data: &[u8]) -> std::io::Result<()> {
     std::fs::write(path, data)
+}
+
+#[cfg(not(unix))]
+pub fn write_private_new(path: &str, data: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new().write(true).create_new(true).open(path)?;
+    f.write_all(data)?;
+    f.sync_all()
 }
 
 /// The operator token in `path` that authorises `/v0/freeze` and `/v0/adopt` (trimmed).

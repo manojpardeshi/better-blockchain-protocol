@@ -60,6 +60,12 @@ python -m sigil.witnessd keygen --out /private/w1.json
 # Share /private/w1.pub with the other operators; never share w1.json.
 ```
 
+`keygen` refuses to replace an existing private key or its `.pub` file in both
+the Python and Rust CLIs. Keep the key and its public file together; if a run
+stops after creating only the private key, derive its public key from that key
+instead of running `keygen` again. Replacing a witness key can make its durable
+store unusable and remove that member from the constellation.
+
 After all public keys are agreed, create and compare the same genesis registry
 and constellation ID. The coordinator can run:
 
