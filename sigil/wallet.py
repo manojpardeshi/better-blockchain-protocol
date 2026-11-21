@@ -372,6 +372,10 @@ class Wallet:
 
     def issue(self, name: str, supply: int, home: str | None = None, *, mint_cap: int = 0) -> str:
         """Create a new asset. Its id is the id of this genesis transition."""
+        if type(supply) is not int or supply <= 0:
+            raise ValueError("supply must be a positive integer")
+        if type(mint_cap) is not int or mint_cap < 0:
+            raise ValueError("mint cap must be a nonnegative integer")
         home = home or self.home
         a = self.address(home)
         outputs = [model.parcel(home, model.SELF_ASSET, supply, a["lock"], a["salt"])]
@@ -388,8 +392,8 @@ class Wallet:
         return tid
 
     def mint(self, asset: str, amount: int, home: str | None = None) -> str:
-        if amount <= 0:
-            raise ValueError("mint amount must be positive")
+        if type(amount) is not int or amount <= 0:
+            raise ValueError("mint amount must be a positive integer")
         right_asset = model.MINT_PREFIX + asset
         # A failed seal (or a crash before finalise was saved) leaves a durable
         # pledge. Reuse its exact header and body, refreshing authorisations for
@@ -569,6 +573,8 @@ class Wallet:
         raise ValueError(f"{self.name}: insufficient funds")
 
     def payment_outputs(self, asset: str, amount: int, to_address: dict) -> tuple[list, list]:
+        if type(amount) is not int or amount <= 0:
+            raise ValueError("payment amount must be a positive integer")
         refs, total = self.select(asset, amount)
         outputs = [model.parcel(to_address["home"], asset, amount, to_address["lock"], to_address["salt"])]
         if total > amount:
@@ -578,6 +584,8 @@ class Wallet:
 
     def pay(self, to: "Wallet", asset: str, amount: int, home: str | None = None) -> str:
         """Pay ``to``; the recipient chooses where the parcel lives (``home``)."""
+        if type(amount) is not int or amount <= 0:
+            raise ValueError("payment amount must be a positive integer")
         addr = to.address(home)
         refs, outputs = self.payment_outputs(asset, amount, addr)
         tid = self.transact(refs, outputs)
