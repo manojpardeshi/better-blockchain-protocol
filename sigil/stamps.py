@@ -14,6 +14,13 @@ import secrets
 from cryptography.hazmat.primitives.asymmetric import rsa
 
 
+def parse_hex(value: str) -> int:
+    """Parse the plain hexadecimal format required for stamp wire values."""
+    if not isinstance(value, str) or not value or any(c not in "0123456789abcdefABCDEF" for c in value):
+        raise ValueError("stamp value must be a plain hex string")
+    return int(value, 16)
+
+
 def full_domain_hash(n: int, serial: str) -> int:
     size = (n.bit_length() + 7) // 8 + 16
     out, counter = b"", 0
@@ -81,7 +88,7 @@ def unblind(public: dict, blind_sig: int, r: int) -> int:
 
 def verify_stamp(public: dict, stamp: dict) -> bool:
     try:
-        sig = int(stamp["sig"], 16)
+        sig = parse_hex(stamp["sig"])
         return 0 < sig < public["n"] and pow(sig, public["e"], public["n"]) == full_domain_hash(public["n"], stamp["serial"])
     except (KeyError, TypeError, ValueError):
         return False

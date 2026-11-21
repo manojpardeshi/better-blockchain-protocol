@@ -415,8 +415,8 @@ abstain, which the protocol tolerates.
     depends on it.
 * **Store format** is redb, not the reference's SQLite log, so stores are not interchangeable
   between implementations. Keys, registries, stamp keys and the wire are.
-* **Hex in stamps** must be plain `[0-9a-fA-F]+`. Python's `int(x, 16)` also takes a sign, a
-  `0x` prefix, underscores and surrounding whitespace (vectors `"python": true, "rust": false`).
+* **Hex in stamps** must be plain `[0-9a-fA-F]+`; both witnesses reject signs, `0x` prefixes,
+  underscores and surrounding whitespace in stamp signatures and blinded sale values.
 * **Gossip order within one message**: the reference admits a message's charter chains in the
   order the JSON lists them, Rust in key order. This only matters when the store reaches its
   10 000-constellation cap within one message.
