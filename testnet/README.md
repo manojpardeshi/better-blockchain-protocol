@@ -77,6 +77,18 @@ docker compose kill -s SIGKILL witness2 && docker compose start witness2        
 docker compose down            # keeps keys and stores; `down -v` wipes them
 ```
 
+To exercise the full Compose lifecycle in an isolated, temporary project, run:
+
+```bash
+SIGIL_COMPOSE_SMOKE=1 python3 -m unittest -v tests.integration.test_daemon_ops.DockerComposeTests
+```
+
+The smoke test builds four witnesses, issues and pays over their host HTTP ports,
+kills and restarts one witness, then brings the project down and back up with its
+original keys and stores. It uses ports 7001–7004 and skips the lifecycle test
+if any of them are already occupied. Its own containers and volumes are removed
+after the run.
+
 A one-shot `init` service (`testnet/docker-init.sh`) writes the keys, the genesis charter and the directory files into a shared `net` volume. Each witness keeps its store in its own volume (`data1` to `data4`). `directory.internal.json` lists the URLs for clients inside the compose network.
 
 This Compose setup is for local experiments only: all private keys sit in one shared volume, every container can read them, and the witness rate limit is disabled. Do not publish its ports beyond loopback. For independently operated nodes, use the [operator testnet runbook](../docs/OPERATOR_TESTNET.md).
