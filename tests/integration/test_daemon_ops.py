@@ -356,8 +356,12 @@ class DockerComposeTests(unittest.TestCase):
             self.assertEqual(out.returncode, 0, out.stderr or out.stdout)
             return out.stdout
 
-        self.addCleanup(lambda: subprocess.run([*compose, "down", "-v", "--remove-orphans"],
-                                               cwd=ROOT, capture_output=True, timeout=60))
+        def cleanup():
+            out = subprocess.run([*compose, "down", "-v", "--remove-orphans"],
+                                 cwd=ROOT, capture_output=True, text=True, timeout=180)
+            self.assertEqual(out.returncode, 0, out.stderr or out.stdout)
+
+        self.addCleanup(cleanup)
 
         def wait_for_witnesses():
             deadline = time.monotonic() + 30
@@ -372,6 +376,14 @@ class DockerComposeTests(unittest.TestCase):
                             self.fail(f"witness on port {port} did not become ready")
                         time.sleep(0.1)
 
+        def statuses(sigil):
+            result = {}
+            for port in range(7001, 7005):
+                code, body, _ = http(f"http://127.0.0.1:{port}", "/v0/status", {"sigil": sigil})
+                self.assertEqual(code, 200, (port, body))
+                result[port] = body["ok"]
+            return result
+
         run("up", "-d", "--build", timeout=300)
         wait_for_witnesses()
         directory = json.loads(run("run", "--rm", "--entrypoint", "cat", "init",
@@ -380,16 +392,23 @@ class DockerComposeTests(unittest.TestCase):
         net = RemoteNetwork(directory)
         alice, bob = Wallet("alice", net, cid), Wallet("bob", net, cid)
         asset = alice.issue("USD", 100)
-        alice.pay(bob, asset, 10)
+        original_sigil = next(iter(alice.holdings.values()))["sigil"]
+        original_tid = alice.pay(bob, asset, 10)
+        bound_before = statuses(original_sigil)
+        for status in bound_before.values():
+            self.assertEqual(status["tid"], original_tid)
+            self.assertTrue(status["votes"])
 
         run("kill", "-s", "SIGKILL", "witness2")
         run("start", "witness2")
         wait_for_witnesses()
+        self.assertEqual(statuses(original_sigil)[7002], bound_before[7002])
         alice.pay(bob, asset, 5)
 
         run("down")  # Named volumes retain keys and witness stores.
         run("up", "-d")
         wait_for_witnesses()
+        self.assertEqual(statuses(original_sigil), bound_before)
         again = json.loads(run("run", "--rm", "--entrypoint", "cat", "init",
                                "/net/directory.json"))["constellations"]
         self.assertEqual(again, directory)
