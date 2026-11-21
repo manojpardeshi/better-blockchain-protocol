@@ -948,6 +948,10 @@ class RemoteNetwork:
 
     def refresh_charters(self, cid: str) -> None:
         """Learn ``cid``'s charter chain from its witnesses (only that chain, verified)."""
+        # A successor committee may have changed while reusing the same URLs.
+        # Re-read /info before using its members for mirror acks or rotation.
+        for url in self.committees.get(cid, []):
+            self._standbys.pop(url, None)
         for url in self.urls.get(cid, []):
             c = self._client(url)
             if c is None:
