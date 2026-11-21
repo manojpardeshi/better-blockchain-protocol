@@ -87,6 +87,23 @@ URL, following [the wire format](WIRE.md#files). A successor committee needs
 its own independent keys, stores, endpoints and `committees` entry; see
 [succession](WIRE.md#succession). The local Compose fixture has no committee.
 
+Before publishing that directory, run the read-only endpoint check from a
+separate host using the agreed registry and the exact directory clients will
+receive:
+
+```sh
+python -m testnet.preflight --registry registry.json --directory directory.json
+```
+
+It validates the registry chain, requires HTTPS URLs, and checks that every
+current witness (and, when configured, standby member) has a unique endpoint
+and public key, announces the expected constellation and charter version, and
+serves the exact agreed chain. It exits nonzero and reports each mismatch.
+For a local testnet or protected private HTTP transport, pass `--allow-http`.
+The check only reads `/v0/info` and `/v0/charters/<cid>`; it does not test
+admin access controls, TLS termination policy, payment liveness, or independent
+operator control. Run the acceptance drills below as well.
+
 ### Rust standby heartbeat endpoints
 
 The Rust `sigil-witness standby` heartbeat client currently accepts only
