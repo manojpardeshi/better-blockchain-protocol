@@ -24,7 +24,10 @@ def main(argv=None) -> None:
 
     tn = Testnet(args.dir, args.host)
     if not tn.witnesses:
-        tn.create(args.constellations, args.witnesses, args.stamps)
+        try:
+            tn.create(args.constellations, args.witnesses, args.stamps)
+        except ValueError as exc:
+            p.error(str(exc))
     tn.stop_all()  # in case a previous run left processes behind
     try:
         tn.start_all(detach=True)
