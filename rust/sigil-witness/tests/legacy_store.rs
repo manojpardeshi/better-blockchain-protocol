@@ -11,7 +11,7 @@
 use redb::{Database, TableDefinition};
 use sigil_witness::charter::Registry;
 use sigil_witness::crypto::KeyPair;
-use sigil_witness::json::{parse, Json};
+use sigil_witness::json::{obj, parse, Json};
 use sigil_witness::store::Store;
 use sigil_witness::testkit::{genesis, spend_request};
 use sigil_witness::witness::{system_clock, Error, Witness};
@@ -114,4 +114,47 @@ fn unknown_kinds_are_skipped() {
     assert_eq!(loaded.pk.as_deref(), Some(pk.as_str()));
     store.close();
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn pinned_stamp_store_uses_format_3() {
+    let dir = std::env::temp_dir().join(format!("sigil-stamp-format-{}-{}", std::process::id(), rand::random::<u64>()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("pinned.redb");
+    write_raw(&path, &[
+        ("stamp_key".into(), String::new(), obj([("n", Json::str("a")), ("e", Json::str("b"))]).canonical()),
+        ("format".into(), String::new(), Json::Int(3).canonical()),
+    ]);
+    let (store, loaded) = Store::open(&path).unwrap();
+    assert_eq!(loaded.format, 3);
+    assert!(loaded.format > 2, "a v2 reader refuses this store before ignoring stamp_key");
+    assert!(loaded.stamp_key.is_some());
+    store.close();
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn redeemed_legacy_store_cannot_initialize_new_stamp_key() {
+    let dir = std::env::temp_dir().join(format!("sigil-stamp-redeemed-{}-{}", std::process::id(), rand::random::<u64>()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let binary = env!("CARGO_BIN_EXE_sigil-witness");
+    let key = dir.join("witness.json");
+    assert!(std::process::Command::new(binary).args(["keygen", "--out", key.to_str().unwrap()]).output().unwrap().status.success());
+    let registry = dir.join("registry.json");
+    let genesis = std::process::Command::new(binary)
+        .args(["genesis", "--name", "legacy", "--keys", dir.join("witness.pub").to_str().unwrap(),
+               "--out", registry.to_str().unwrap()])
+        .output().unwrap();
+    assert!(genesis.status.success(), "{}", String::from_utf8_lossy(&genesis.stderr));
+    let cid = String::from_utf8(genesis.stdout).unwrap().trim().to_string();
+    let store = dir.join("witness.redb");
+    write_raw(&store, &[("stamp".into(), "already-redeemed".into(), Json::Bool(true).canonical())]);
+    let run = std::process::Command::new(binary)
+        .args(["run", "--key", key.to_str().unwrap(), "--registry", registry.to_str().unwrap(),
+               "--constellation", &cid, "--store", store.to_str().unwrap(), "--stamps", "--init-stamps"])
+        .output().unwrap();
+    assert!(!run.status.success());
+    assert!(String::from_utf8_lossy(&run.stderr).contains("redeemed stamps exist"));
+    assert!(!dir.join("witness.redb.stamps.json").exists());
+    let _ = std::fs::remove_dir_all(dir);
 }

@@ -220,6 +220,7 @@ pub struct Witness {
     state: Mutex<State>,
     stamps: Option<StampKey>,
     redeemed: Mutex<HashSet<String>>,
+    store_format: i128,
     pub store: Arc<Store>,
     clock: Clock,
     /// Use Ed25519 batch verification for seals, death proofs and equivocation proofs.
@@ -291,6 +292,10 @@ impl Witness {
             return Err(format!("constellation {cid} is not in the registry"));
         }
         let mut setup: Vec<Entry> = Vec::new();
+        let store_format = loaded.format.max(if loaded.stamp_key.is_some() { 3 } else { 0 });
+        if loaded.stamp_key.is_some() && loaded.format < 3 {
+            setup.push(("format".into(), String::new(), Json::Int(3)));
+        }
         match &loaded.pk {
             None => setup.push(("pk".into(), String::new(), Json::str(&kp.pk))),
             Some(pk) if *pk != kp.pk => return Err("store belongs to a different witness key".into()),
@@ -331,6 +336,7 @@ impl Witness {
             state: Mutex::new(State { records, member, frozen: loaded.frozen, frozen_for: loaded.frozen_for }),
             stamps: None,
             redeemed: Mutex::new(loaded.stamps),
+            store_format,
             store,
             clock,
             batch_verify: true,
@@ -341,6 +347,7 @@ impl Witness {
     /// Require a stamp with every SPEND, sold by this key (`witnessd run --stamps`).
     pub fn with_stamps(mut self, key: StampKey) -> Witness {
         self.stamps = Some(key);
+        self.store_format = 3;
         self
     }
 
@@ -709,7 +716,7 @@ impl Witness {
             changed.push((s.clone(), rec));
         }
         if !changed.is_empty() {
-            let mut entries: Vec<Entry> = vec![format_entry()];
+            let mut entries: Vec<Entry> = vec![format_entry(self.store_format)];
             entries.extend(changed.iter().map(|(s, r)| ("record".to_string(), s.clone(), r.to_json())));
             self.store.submit(entries);
             for (s, r) in changed {
@@ -1067,7 +1074,7 @@ impl Witness {
         }
         batch_entries.push(("member".into(), String::new(), Json::Arr(vec![Json::str(cid), Json::Int(version)])));
         if !ck.is_empty() {
-            batch_entries.push(format_entry());
+            batch_entries.push(format_entry(self.store_format));
         }
         batch_entries.extend(records.iter().map(|(s, r)| ("record".to_string(), s.clone(), r.to_json())));
         self.store.submit(batch_entries);
@@ -1350,7 +1357,19 @@ pub(crate) fn checkpoint_for(body_ck: Option<&Json>, entries: Option<&Json>) -> 
 
 /// Written with every settled or checkpointed record (`Witness._format_entry`): a binary from
 /// before compaction refuses the unknown entry kind instead of opening a store whose
-/// checkpointed records have no log to hand over.
-fn format_entry() -> Entry {
-    ("format".into(), String::new(), Json::Int(2))
+/// checkpointed records have no log to hand over. Retain format 3 after stamp-key pinning.
+fn format_entry(store_format: i128) -> Entry {
+    ("format".into(), String::new(), Json::Int(2.max(store_format)))
+}
+
+#[cfg(test)]
+mod stamp_format_tests {
+    use super::*;
+
+    #[test]
+    fn compacted_records_preserve_pinned_stamp_format() {
+        // SETTLE and checkpointed ADOPT both use this writer.
+        assert_eq!(format_entry(0).2, Json::Int(2));
+        assert_eq!(format_entry(3).2, Json::Int(3));
+    }
 }

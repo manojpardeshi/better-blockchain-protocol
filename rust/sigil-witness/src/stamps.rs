@@ -139,14 +139,28 @@ pub fn unblind(key_n: &BigUint, blind_sig: &BigUint, r: &BigUint) -> Option<BigU
 
 /// `witnessd.load_mint`: the stamp key at `path`, created (mode 0600) on first use.
 pub fn load_mint(path: &str, bits: usize) -> Result<StampKey, String> {
+    load_mint_checked(path, bits, true)
+}
+
+/// Load a key, generating one only when `create` is true. Startup passes false after a
+/// store has pinned this key so a lost sidecar cannot silently invalidate sold stamps.
+pub fn load_mint_checked(path: &str, bits: usize, create: bool) -> Result<StampKey, String> {
     match std::fs::read(path) {
         Ok(bytes) => {
             let v = crate::json::parse(&bytes).map_err(|e| format!("{path}: {e}"))?;
-            StampKey::from_json(&v).map_err(|e| format!("{path}: {e}"))
+            let key = StampKey::from_json(&v).map_err(|e| format!("{path}: {e}"))?;
+            for x in [2u32, 3] {
+                let probe = BigUint::from(x);
+                let sig = key.sign_blinded(&probe).map_err(|e| format!("{path}: {e}"))?;
+                if sig.modpow(&key.e, &key.n) != probe {
+                    return Err(format!("{path}: stamp private exponent does not match public key"));
+                }
+            }
+            Ok(key)
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && create => {
             let key = StampKey::generate(bits);
-            crate::write_private(path, &key.numbers_json().canonical()).map_err(|e| format!("{path}: {e}"))?;
+            crate::write_private_new(path, &key.numbers_json().canonical()).map_err(|e| format!("{path}: {e}"))?;
             Ok(key)
         }
         Err(e) => Err(format!("{path}: {e}")),

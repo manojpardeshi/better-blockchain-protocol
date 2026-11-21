@@ -228,6 +228,7 @@ class Witness:
         self._charters_saved: dict[str, int] = {}  # cid -> chain length the store holds
         self._charters_keep = set(registry.ids())  # constellations the registry file names
         self.store = store
+        self._store_format = 0
         if store is not None:
             self._restore()
 
@@ -235,6 +236,9 @@ class Witness:
 
     def _restore(self) -> None:
         state = self.store.load()
+        self._store_format = max(state["format"], 3 if state["stamp_key"] is not None else 0)
+        if state["stamp_key"] is not None and state["format"] < 3:
+            self.store.append([("format", "", 3)])
         if state["pk"] is None:
             self.store.append([("pk", "", self.pk)])
         elif state["pk"] != self.pk:
@@ -266,13 +270,13 @@ class Witness:
                 self._persist(*entries)
             self._charters_saved = saved
 
-    @staticmethod
-    def _format_entry() -> list:
+    def _format_entry(self) -> list:
         """Written with every settled or checkpointed record: a store holding one must not be
         opened by a version that cannot read it (a Rust binary from before compaction refuses
         an unknown entry kind; a Python one fails on the ``settled`` field), since a checkpointed
-        record has no log and an old version would hand it over as nothing."""
-        return [("format", "", 2)]
+        record has no log and an old version would hand it over as nothing. Keep format 3
+        after stamp-key pinning so an older daemon cannot drop that guard."""
+        return [("format", "", max(2, self._store_format))]
 
     @staticmethod
     def _rec(sigil: str, rec: Record) -> tuple[str, str, dict]:
