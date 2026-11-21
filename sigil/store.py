@@ -13,6 +13,9 @@ Kinds:
 * ``frozen``  -- hash of the successor charter the witness froze for (``true`` in older stores)
 * ``record``  -- key = sigil, value = the full ``Record`` as a dict
 * ``stamp``   -- key = a redeemed stamp serial
+* ``stamp_key`` -- public stamp key {n, e}; pins sold stamps across restarts
+* ``format``  -- 2 for compacted records, 3 for a pinned stamp key; older readers
+  refuse a format they cannot preserve
 * ``charter`` -- key = a constellation id the registry file names, value = the
   longest verified charter chain the witness learned for it (by gossip or ADOPT;
   extensions of the file's chains only). A restarted witness
@@ -64,19 +67,24 @@ class WitnessStore:
         self.db.execute("COMMIT")
 
     def load(self) -> dict:
-        """Replay the log into ``{pk, member, frozen, records, stamps}``."""
-        state = {"pk": None, "member": None, "frozen": False, "records": {}, "stamps": set(), "charters": {}}
+        """Replay the log into the witness state, including its pinned stamp key."""
+        state = {"pk": None, "member": None, "frozen": False, "records": {}, "stamps": set(),
+                 "stamp_key": None, "format": 0, "charters": {}}
         for kind, key, value in self.db.execute("SELECT kind, key, value FROM log ORDER BY seq"):
             v = json.loads(value)
-            if kind == "format" and not (isinstance(v, int) and not isinstance(v, bool) and v <= 2):
-                # 2 may hold settled or checkpointed records (SPEC §5.7); a later format is refused.
-                raise ValueError(f"store format {v!r} is newer than this version reads")
-            if kind == "charter":
+            if kind == "format":
+                if not (isinstance(v, int) and not isinstance(v, bool) and 0 <= v <= 3):
+                    # 3 pins the stamp key; older binaries must refuse this store.
+                    raise ValueError(f"store format {v!r} is newer than this version reads")
+                state["format"] = v
+            elif kind == "charter":
                 state["charters"][key] = v
             elif kind == "record":
                 state["records"][key] = v
             elif kind == "stamp":
                 state["stamps"].add(key)
+            elif kind == "stamp_key":
+                state["stamp_key"] = v
             elif kind in ("pk", "member", "frozen"):
                 state[kind] = v
         return state

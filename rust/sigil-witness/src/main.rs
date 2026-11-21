@@ -6,7 +6,7 @@
 //!                       [--committee m1.pub m2.pub m3.pub m4.pub --dead-man SECONDS]
 //! sigil-witness run     --key key.json --registry registry.json --constellation <cid> \
 //!                       --store data.redb [--host 127.0.0.1] [--port 7000] [--stamps] \
-//!                       [--admin-token FILE] [--adopt] [--rate-limit R] [--rate-burst B]
+//!                       [--init-stamps] [--admin-token FILE] [--adopt] [--rate-limit R] [--rate-burst B]
 //! sigil-witness standby --key key.json --registry registry.json --constellation <cid> \
 //!                       --store standby.redb [--host 127.0.0.1] [--port 7100] [--wait] \
 //!                       [--admin-token FILE] [--members URL ...] [--probe-every S] \
@@ -23,7 +23,9 @@
 //! even with SIGKILL, and restarted on the same store.
 //!
 //! `--stamps` requires a stamp with every SPEND and sells them; the stamp key lives in
-//! `<store>.stamps.json` (the reference's file and format), created on first use. A fresh
+//! `<store>.stamps.json` (the reference's file and format), created on first use. The store
+//! pins its public key; losing the file after activation refuses startup. On an existing store,
+//! creating a stamp key for the first time requires `--init-stamps`. A fresh
 //! store joins charter version 0; a new member of a later version is started with `--adopt`
 //! and waits for `/v0/adopt`. The rotation calls need the token in `--admin-token FILE`.
 //!
@@ -37,7 +39,7 @@ use std::sync::Arc;
 use clap::{Parser, Subcommand};
 use sigil_witness::charter::{constellation_id, short, Successor, MAX_WITNESSES};
 use sigil_witness::json::{obj, parse, Json};
-use sigil_witness::stamps::load_mint;
+use sigil_witness::stamps::load_mint_checked;
 use sigil_witness::store::Store;
 use sigil_witness::witness::system_clock;
 use sigil_witness::{load_admin_token, load_key, load_registry, probe_url, ratelimit, server, write_private_new, KeyPair, Standby, Witness};
@@ -123,6 +125,9 @@ enum Cmd {
         /// Require a stamp with every spend (and sell stamps); key in <store>.stamps.json.
         #[arg(long)]
         stamps: bool,
+        /// Enable stamps on an existing store for the first time.
+        #[arg(long, requires = "stamps")]
+        init_stamps: bool,
         /// File holding the operator token that authorises /v0/freeze and /v0/adopt.
         #[arg(long, value_name = "FILE")]
         admin_token: Option<String>,
@@ -209,6 +214,7 @@ fn main() {
             host,
             port,
             stamps,
+            init_stamps,
             admin_token,
             adopt,
             rate_limit,
@@ -224,6 +230,7 @@ fn main() {
             host,
             port,
             stamps,
+            init_stamps,
             admin_token,
             adopt,
             rate_limit,
@@ -316,6 +323,7 @@ struct RunArgs {
     host: String,
     port: u16,
     stamps: bool,
+    init_stamps: bool,
     admin_token: Option<String>,
     adopt: bool,
     rate_limit: Option<f64>,
@@ -333,16 +341,40 @@ fn run(a: RunArgs) -> Result<(), String> {
         return Err(format!("constellation {cid} is not in {}", a.registry));
     }
     let token = a.admin_token.as_deref().map(load_admin_token).transpose()?;
+    let store_existed = !a.memory && std::path::Path::new(&a.store).symlink_metadata().is_ok();
     let (store, loaded) = if a.memory {
         eprintln!("sigil-witness: WARNING --unsafe-memory-store: state is not durable (benchmarks only)");
         (Store::memory(), Default::default())
     } else {
         Store::open(&a.store)?
     };
+    let pinned_stamp_key = loaded.stamp_key.clone();
+    let existing_store = store_existed || loaded.pk.is_some();
+    let redeemed_stamps = !loaded.stamps.is_empty();
     let mut w = Witness::open_with(kp, reg, cid, store.clone(), loaded, system_clock(), a.adopt)?;
     if a.stamps {
         // Redeemed serials come back from the witness store.
-        w = w.with_stamps(load_mint(&format!("{}.stamps.json", a.store), 2048)?);
+        let path = format!("{}.stamps.json", a.store);
+        let exists = std::path::Path::new(&path).exists();
+        if !exists && pinned_stamp_key.is_none() && redeemed_stamps {
+            return Err(format!("{path}: redeemed stamps exist in {}; restore the original stamp key", a.store));
+        }
+        if !exists && (pinned_stamp_key.is_some() || (existing_store && !a.init_stamps)) {
+            return Err(format!("{path}: missing stamp key for an existing store; restore the original key \
+                (use --init-stamps only to enable stamps for the first time)"));
+        }
+        let key = load_mint_checked(&path, 2048, !exists && pinned_stamp_key.is_none())?;
+        let public = key.public_json();
+        if let Some(pinned) = pinned_stamp_key {
+            if pinned != public {
+                return Err(format!("{path}: stamp key differs from the key pinned in {}", a.store));
+            }
+        } else {
+            let seq = store.submit(vec![("stamp_key".into(), String::new(), public),
+                                        ("format".into(), String::new(), Json::Int(3))]);
+            store.wait(seq);
+        }
+        w = w.with_stamps(key);
     }
     w.batch_verify = a.batch;
     let w = Arc::new(w);
