@@ -47,6 +47,38 @@ class CliTests(unittest.TestCase):
     def balance(self, who, asset):
         return self.run_cli(who, "balance", asset)[asset]
 
+    def test_init_preserves_partial_or_existing_wallet_directory(self):
+        partial = self.path("partial")
+        os.mkdir(partial)
+        keys = os.path.join(partial, wallet_store.KEYS)
+        dossier = os.path.join(partial, wallet_store.DOSSIER)
+        with open(keys, "w") as f:
+            f.write("recoverable old keys")
+        with open(dossier, "w") as f:
+            f.write("recoverable old dossier")
+
+        error = self.run_cli("partial", "init", "--home", self.X, ok=False)
+        self.assertEqual(error["error"], "CliError")
+        self.assertIn("not empty", error["message"])
+        with open(keys) as f:
+            self.assertEqual(f.read(), "recoverable old keys")
+        with open(dossier) as f:
+            self.assertEqual(f.read(), "recoverable old dossier")
+        self.assertFalse(os.path.exists(os.path.join(partial, wallet_store.STATE)))
+
+        empty = self.path("empty")
+        os.mkdir(empty)
+        self.run_cli("empty", "init", "--home", self.X)
+        self.assertFalse(os.path.exists(os.path.join(empty, ".init.lock")))
+        self.assertEqual(self.run_cli("empty", "init", "--home", self.X, ok=False)["error"], "CliError")
+
+    def test_init_rejects_wallet_directory_symlink(self):
+        target = self.path("target")
+        os.mkdir(target)
+        os.symlink(target, self.path("linked"))
+        self.assertEqual(self.run_cli("linked", "init", "--home", self.X, ok=False)["error"], "CliError")
+        self.assertEqual(os.listdir(target), [])
+
     def test_alice_bob_carol(self):
         for who in ("alice", "bob", "carol"):
             self.run_cli(who, "init", "--home", self.X, "--name", who)
