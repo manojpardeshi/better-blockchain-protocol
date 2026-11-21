@@ -7,8 +7,9 @@
 //! State is a key/value table in [redb](https://docs.rs/redb): key `"<kind>\0<key>"`, value
 //! the canonical JSON of the current value. Kinds are those of `sigil/store.py`: `pk`,
 //! `member` (`[cid, version]`), `frozen` (the hash of the one successor charter the witness
-//! froze for), `record` (key = sigil, value = the record as the reference's `asdict(Record)`)
-//! and `stamp` (key = a redeemed stamp serial). A standby member (`crate::succession`) uses the
+//! froze for), `record` (key = sigil, value = the record as the reference's `asdict(Record)`),
+//! `stamp` (key = a redeemed stamp serial), and `stamp_key` (the public key that keeps sold
+//! stamps valid across restarts). A standby member (`crate::succession`) uses the
 //! kinds of the reference's `StandbyStore`: `pk`, `standby` (`{constellation, version, since}`),
 //! `fenced` (`{constellation, version, charter}`) and `mirror` (key `"<version>|<sigil>"`, value
 //! that sigil's mirror log). Both also keep `charter` (key = a constellation id, value = the
@@ -45,6 +46,8 @@ pub type Entry = (String, String, Json);
 /// What a store held at startup.
 #[derive(Debug, Default)]
 pub struct Loaded {
+    /// Store format; 2 holds compacted records, 3 pins the stamp key.
+    pub format: i128,
     pub pk: Option<String>,
     pub member: Option<(String, i128)>,
     pub frozen: bool,
@@ -54,6 +57,8 @@ pub struct Loaded {
     pub records: HashMap<String, Json>,
     /// Redeemed stamp serials.
     pub stamps: HashSet<String>,
+    /// Public stamp key pinned when stamps were first enabled.
+    pub stamp_key: Option<Json>,
     /// A standby member's `{constellation, version, since}` (the latest STANDBY).
     pub standby: Option<Json>,
     /// A standby member's `{constellation, version, charter}`: the successor it signed.
@@ -316,6 +321,7 @@ fn load(db: &Database) -> Result<Loaded, String> {
             "stamp" => {
                 out.stamps.insert(key.to_string());
             }
+            "stamp_key" => out.stamp_key = Some(value),
             "record" => {
                 out.records.insert(key.to_string(), value);
             }
@@ -327,12 +333,13 @@ fn load(db: &Database) -> Result<Loaded, String> {
             "checkpoint" => {
                 out.checkpoint.insert(key.to_string(), value);
             }
-            // The store format: 2 may hold settled or checkpointed records. A later format is
-            // refused (a record this version cannot read must never be handed over as less).
+            // Format 2 may hold settled or checkpointed records; 3 pins the stamp key.
+            // A later format is refused so an older binary cannot erase a safety boundary.
             "format" => {
-                if value.as_int().is_none_or(|f| f > 2) {
+                if value.as_int().is_none_or(|f| !(0..=3).contains(&f)) {
                     return Err(format!("store format {} is newer than this version reads", value.canonical_string()));
                 }
+                out.format = value.as_int().unwrap();
             }
             "charter" => {
                 out.charters.insert(key.to_string(), value);

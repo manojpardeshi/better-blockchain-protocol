@@ -226,6 +226,40 @@ class SettleTests(Base):
 
 
 class CheckpointTests(Base):
+    def test_pinned_stamp_format_survives_settle_and_checkpoint(self):
+        """Later compaction writes must never make a stamp-pinned store readable by v2."""
+        with tempfile.TemporaryDirectory() as d:
+            old = self.net.members[self.X][0]
+            source = WitnessStore(os.path.join(d, "source.db"))
+            marker = {"n": "a", "e": "b"}
+            source.append([("stamp_key", "", marker), ("format", "", 3)])
+            durable = Witness(old.kp, self.net.registry, self.net.clock, store=source)
+            durable.join(self.X, 0)
+            self.net.members[self.X][0] = durable
+
+            ps, sigil = self.parcel("pinned")
+            header = self.hdr([(sigil, 0)], "pin")
+            seal = self.seal(header, sigil, ps)
+            certificate = self.cert(header, [(ps, seal)])
+            for witness in self.net.witnesses(self.X):
+                witness.settle(certificate)
+            self.assertEqual(source.load()["format"], 3)
+
+            next_key = KeyPair.generate()
+            target = WitnessStore(os.path.join(d, "target.db"))
+            target.append([("stamp_key", "", marker), ("format", "", 3)])
+
+            class StoredWitness(Witness):
+                def __init__(self, kp, registry, clock):
+                    super().__init__(kp, registry, clock, store=target if kp.pk == next_key.pk else None)
+
+            self.net.rotate(self.X, [next_key] + [KeyPair.generate() for _ in range(3)],
+                            witness_cls=StoredWitness)
+            self.assertEqual(target.load()["format"], 3)
+            self.assertEqual(self.net.members[self.X][0].records[sigil].settled, CHECKPOINTED)
+            source.close()
+            target.close()
+
     def settled_sigil(self, salt="s", tag="a"):
         ps, s = self.parcel(salt)
         Ta = self.hdr([(s, 0)], tag)

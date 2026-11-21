@@ -5,7 +5,7 @@
                                      [--committee m1.pub m2.pub m3.pub m4.pub --dead-man SECONDS]
     python -m sigil.witnessd run     --key key.json --registry registry.json --constellation <cid> \\
                                      --store data.db [--host 127.0.0.1] [--port 7000] [--stamps] \\
-                                     [--admin-token FILE] [--adopt] [--rate-limit R] [--rate-burst B]
+                                     [--init-stamps] [--admin-token FILE] [--adopt] [--rate-limit R] [--rate-burst B]
     python -m sigil.witnessd standby --key key.json --registry registry.json --constellation <cid> \\
                                      --store standby.db [--host 127.0.0.1] [--port 7100] [--wait] \\
                                      [--admin-token FILE] [--members URL ...] [--probe-every S] \\
@@ -150,19 +150,24 @@ def load_registry(path: str) -> Registry:
     return reg
 
 
-def load_mint(path: str, bits: int = 2048) -> StampMint:
+def load_mint(path: str, bits: int = 2048, *, create: bool = True) -> StampMint:
     """The stamp-signing key, created on first use and kept across restarts.
 
-    A new key after a restart would invalidate every stamp sold before it.
+    ``create=False`` requires the existing file. A new key after a restart
+    would invalidate every stamp sold before it.
     """
-    if not os.path.exists(path):
+    if not os.path.exists(path) and create:
         mint = StampMint(bits)
-        _write_private(path, {k: format(v, "x") for k, v in mint.numbers().items()})
+        _write_new_private(path, {k: format(v, "x") for k, v in mint.numbers().items()})
         return mint
     with open(path) as f:
         k = json.load(f)
     # Redeemed serials come back from the witness store.
-    return StampMint.from_numbers(int(k["n"], 16), int(k["e"], 16), int(k["d"], 16))
+    mint = StampMint.from_numbers(int(k["n"], 16), int(k["e"], 16), int(k["d"], 16))
+    if min(mint.n, mint.e, mint._d) <= 1 or any(pow(pow(x, mint._d, mint.n), mint.e, mint.n) != x
+                                                for x in (2, 3)):
+        raise ValueError(f"{path}: stamp private exponent does not match public key")
+    return mint
 
 
 # --------------------------------------------------------------------- run
@@ -179,13 +184,29 @@ def load_admin_token(path: str | None) -> str | None:
 
 
 def build_witness(key: str, registry: str, cid: str, store: str, stamps: bool = False,
-                  adopt: bool = False) -> Witness:
+                  adopt: bool = False, init_stamps: bool = False) -> Witness:
     kp = load_key(key)
     reg = load_registry(registry)
     if cid not in reg:
         raise SystemExit(f"constellation {cid} is not in {registry}")
-    mint = load_mint(store + ".stamps.json") if stamps else None
-    w = Witness(kp, reg, lambda: int(time.time()), stamp_mint=mint, store=WitnessStore(store))
+    store_existed = os.path.lexists(store)
+    witness_store = WitnessStore(store)
+    state = witness_store.load()
+    mint = None
+    if stamps:
+        key_path = store + ".stamps.json"
+        pinned = state["stamp_key"]
+        exists = os.path.exists(key_path)
+        if not exists and pinned is None and state["stamps"]:
+            raise SystemExit(f"{key_path}: redeemed stamps exist in {store}; restore the original stamp key")
+        if not exists and (pinned is not None or ((store_existed or state["pk"] is not None) and not init_stamps)):
+            raise SystemExit(f"{key_path}: missing stamp key for an existing store; restore the original key "
+                             "(use --init-stamps only to enable stamps for the first time)")
+        mint = load_mint(key_path, create=not exists and pinned is None)
+        public = {k: format(v, "x") for k, v in mint.public.items()}
+        if pinned is not None and pinned != public:
+            raise SystemExit(f"{key_path}: stamp key differs from the key pinned in {store}")
+    w = Witness(kp, reg, lambda: int(time.time()), stamp_mint=mint, store=witness_store)
     if w.cid is None and not adopt:
         # First start: join version 0. A later version must be entered by ADOPT,
         # which brings the predecessors' bindings; joining it bare could vote a
@@ -199,6 +220,9 @@ def build_witness(key: str, registry: str, cid: str, store: str, stamps: bool = 
         w.join(cid, 0)
     elif w.cid is not None and w.cid != cid:
         raise SystemExit(f"store {store} belongs to constellation {w.cid}, not {cid}")
+    if stamps and pinned is None:
+        witness_store.append([("stamp_key", "", public), ("format", "", 3)])
+        w._store_format = 3
     return w
 
 
@@ -247,7 +271,8 @@ def standby(args) -> None:
 
 def run(args) -> None:
     token = load_admin_token(args.admin_token)
-    w = build_witness(args.key, args.registry, args.constellation, args.store, args.stamps, args.adopt)
+    w = build_witness(args.key, args.registry, args.constellation, args.store, args.stamps, args.adopt,
+                      args.init_stamps)
     server = WitnessServer(w, args.host, args.port, admin_token=token, rate_limit=args.rate_limit,
                            rate_burst=args.rate_burst).start()
     stop = threading.Event()
@@ -320,6 +345,7 @@ def main(argv=None) -> None:
     r.add_argument("--host", default="127.0.0.1")
     r.add_argument("--port", type=int, default=7000)
     r.add_argument("--stamps", action="store_true", help="require a stamp with every spend")
+    r.add_argument("--init-stamps", action="store_true", help="enable stamps on an existing store for the first time")
     r.add_argument("--admin-token", metavar="FILE",
                    help="file holding the operator token that authorises /v0/freeze and /v0/adopt")
     r.add_argument("--adopt", action="store_true",
@@ -331,6 +357,8 @@ def main(argv=None) -> None:
                    help=f"requests a client may burst above the rate (default {DEFAULT_BURST})")
 
     args = p.parse_args(argv)
+    if args.cmd == "run" and args.init_stamps and not args.stamps:
+        p.error("--init-stamps requires --stamps")
     if args.cmd == "keygen":
         try:
             print(generate_key(args.out).pk)

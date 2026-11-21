@@ -89,6 +89,8 @@ A witness on the open network must not serve every request of every client (SPEC
 
 Why a rate limit and not stamps by default: stamps (SPEC §3.10) price attention, but `/v0/sell_stamp` blind-signs for anyone who asks, since the protocol leaves payment to the deployment. Stamps on by default would therefore limit nothing, and each sale costs the witness an RSA-2048 signature. A per-client bucket needs no payment system and bounds what one address can make a witness do. It does not stop an attacker with many addresses; a deployment that can take payment should also require stamps (`--stamps`, with `sell_stamp` behind the payment) and put the witness behind a network-level filter. A reverse proxy in front of a witness makes every client the proxy's address; give the proxy its own limits and run the witness with `--rate-limit 0`.
 
+**Stamp key recovery.** Back up `<store>.stamps.json` with the witness store: losing it invalidates stamps already sold. Both daemons pin its public key in store format 3 when `--stamps` first starts, then refuse startup if the sidecar is missing or changed. Older daemons refuse format 3, so they cannot silently rotate the key after a rollback. An existing store without a sidecar requires `--init-stamps` to enable stamps for the first time. Stores from before key pinning adopt an existing sidecar on their next stamped start; if that sidecar was lost, restore the original before starting. Use `--init-stamps` only when that store has never sold stamps; a store with redeemed stamps refuses this flag.
+
 ## Client behaviour
 
 * A witness that cannot be reached counts as crashed. It does not vote, and it can never be assumed to hold no vote (see the wallet's `unpledge_if_unbound`).
