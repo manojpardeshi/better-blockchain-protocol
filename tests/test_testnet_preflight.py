@@ -1,10 +1,12 @@
 """Read-only operator preflight checks against real local witness endpoints."""
 
 import copy
+import io
 import json
 import signal
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from unittest.mock import patch
 
 from sigil.charter import (Registry, charter_body, charter_hash, checkpoint_hash,
@@ -36,6 +38,27 @@ class TestnetPreflightTests(unittest.TestCase):
         self.assertEqual(check(self.directory, self.registry, allow_http=True), [])
         self.assertEqual(main(["--registry", self.tn.path("registry.json"),
                                "--directory", self.tn.path("directory.json"), "--allow-http"]), 0)
+
+    def test_down_witness_is_reported_and_recovery_passes(self):
+        victim = 1
+        url = self.tn.url(victim)
+        self.tn.kill(victim, signal.SIGKILL)
+        try:
+            errors = check(self.directory, self.registry, allow_http=True, timeout=1)
+            self.assertTrue(any(url in error and "unreachable or malformed reply" in error
+                                for error in errors), errors)
+            self.assertTrue(any("endpoint keys do not match current charter" in error
+                                for error in errors), errors)
+            output = io.StringIO()
+            with redirect_stdout(output):
+                self.assertEqual(main(["--registry", self.tn.path("registry.json"),
+                                       "--directory", self.tn.path("directory.json"),
+                                       "--allow-http", "--timeout", "1"]), 1)
+            self.assertIn(url, output.getvalue())
+        finally:
+            self.tn.start(victim)
+            self.tn.wait_ready(victim)
+        self.assertEqual(check(self.directory, self.registry, allow_http=True), [])
 
     def test_requires_explicit_http_flag(self):
         errors = check(self.directory, self.registry)
