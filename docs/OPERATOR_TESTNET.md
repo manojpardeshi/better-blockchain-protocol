@@ -101,6 +101,13 @@ receive:
 python -m testnet.preflight --registry registry.json --directory directory.json
 ```
 
+For a dated evidence file, add `--report-json preflight-report.json`. The
+report records the result, redacted error codes, and SHA-256 hashes of the
+exact registry and directory bytes it read. A hash is `null` if that file
+could not be read. Keep the input files alongside the report for later review;
+the report intentionally omits endpoint URLs and public keys. The option does
+not change the command's normal terminal diagnostics or exit status.
+
 It validates the registry chain, requires HTTPS URLs, and checks that every
 current witness (and, when configured, standby member) has a unique endpoint
 and public key, announces the expected constellation and charter version, and
