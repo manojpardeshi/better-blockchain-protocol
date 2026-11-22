@@ -100,7 +100,12 @@ class PaymentTests(unittest.TestCase):
         refs, _ = self.alice.select(self.usd, 1_000)
         addr = self.carol.address()
         outputs = [model.parcel(addr["home"], self.usd, 5_000, addr["lock"], addr["salt"])]
-        tid = self.alice.transact(refs, outputs)  # sealed fine
+        # A malicious signer can bypass Wallet.transact's own value check.
+        # Witnesses still attest only the header, so the receiver must verify.
+        header, body, tid = self.alice.prepare(refs, outputs)
+        unlocks = self.alice.authorise(header, body)
+        self.alice.seal(header, body, unlocks)
+        self.alice.finalise(header, body, unlocks)
         with self.assertRaises(InvalidDossier):
             self.carol.receive(self.alice.dossier.ancestry([tid]), [model.ref(tid, 0)])
 

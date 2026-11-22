@@ -22,6 +22,7 @@ import sys
 import time
 import urllib.request
 
+from sigil.charter import MAX_WITNESSES
 from sigil.witnessd import load_key
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -66,6 +67,11 @@ class Testnet:
         """Generate keys and genesis charters; returns the constellation ids."""
         if self.witnesses:
             raise RuntimeError(f"{self.dir} already holds a testnet")
+        if not isinstance(constellations, int) or isinstance(constellations, bool) or constellations < 1:
+            raise ValueError("constellations must be at least 1")
+        if (not isinstance(witnesses, int) or isinstance(witnesses, bool)
+                or not 1 <= witnesses <= MAX_WITNESSES):
+            raise ValueError(f"witnesses must be between 1 and {MAX_WITNESSES}")
         for d in ("keys", "data", "logs"):
             os.makedirs(self.path(d), exist_ok=True)
         registry, cids = self.path("registry.json"), []

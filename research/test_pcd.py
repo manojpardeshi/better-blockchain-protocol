@@ -138,8 +138,13 @@ class CatchesInvalidHistories(unittest.TestCase):
         w = self.w
         refs, _ = w.alice.select(w.usd, 10)
         addr = w.bob.address()
-        # Blind witnesses seal it; holders (and the step) refuse it.
-        tid = w.alice.transact(refs, [model.parcel(w.Y, w.usd, 9_999, addr["lock"], addr["salt"])])
+        # Construct the history below the wallet's pre-binding guard: blind
+        # witnesses seal it, while holders (and the step) must still refuse it.
+        outputs = [model.parcel(w.Y, w.usd, 9_999, addr["lock"], addr["salt"])]
+        header, body, tid = w.alice.prepare(refs, outputs)
+        unlocks = w.alice.authorise(header, body)
+        w.alice.seal(header, body, unlocks)
+        w.alice.finalise(header, body, unlocks)
         d = w.alice.dossier.ancestry([tid])
         with self.assertRaises(InvalidDossier):
             Verifier(TrustPolicy(w.net.registry)).verify_parcel(d, model.ref(tid, 0))

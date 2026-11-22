@@ -48,7 +48,13 @@ print("no asset, no amount, no recipient, no graph.")
 say("4. Blind witnesses will seal nonsense. Holders refuse it.")
 refs, _ = carol.select(usd, 40_000)
 addr = bob.address()
-tid = carol.transact(refs, [model.parcel(lyra, usd, 9_999_999, addr["lock"], addr["salt"])])
+# Construct the invalid history below the wallet's pre-binding guard.  This
+# demonstrates why holders still validate what blind witnesses seal.
+outputs = [model.parcel(lyra, usd, 9_999_999, addr["lock"], addr["salt"])]
+header, body, tid = carol.prepare(refs, outputs)
+unlocks = carol.authorise(header, body)
+carol.seal(header, body, unlocks)
+carol.finalise(header, body, unlocks)
 try:
     bob.receive(carol.dossier.ancestry([tid]), [model.ref(tid, 0)])
 except InvalidDossier as e:
