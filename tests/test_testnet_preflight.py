@@ -1,6 +1,8 @@
 """Read-only operator preflight checks against real local witness endpoints."""
 
 import copy
+from datetime import datetime
+import hashlib
 import io
 import json
 import signal
@@ -59,6 +61,80 @@ class TestnetPreflightTests(unittest.TestCase):
             self.tn.start(victim)
             self.tn.wait_ready(victim)
         self.assertEqual(check(self.directory, self.registry, allow_http=True), [])
+
+    def test_json_report_records_live_success_and_input_hashes(self):
+        report_path = self.tn.path("preflight-success.json")
+        self.assertEqual(main(["--registry", self.tn.path("registry.json"),
+                               "--directory", self.tn.path("directory.json"),
+                               "--allow-http", "--report-json", report_path]), 0)
+        with open(report_path) as stream:
+            report = json.load(stream)
+        self.assertEqual(report["schema_version"], 1)
+        self.assertTrue(report["success"])
+        self.assertEqual(report["errors"], [])
+        self.assertIsNotNone(datetime.fromisoformat(report["checked_at_utc"].replace("Z", "+00:00")).tzinfo)
+        for name in ("registry", "directory"):
+            with open(self.tn.path(f"{name}.json"), "rb") as stream:
+                expected_hash = hashlib.sha256(stream.read()).hexdigest()
+            self.assertEqual(report[f"{name}_sha256"], expected_hash)
+
+    def test_json_report_redacts_live_outage(self):
+        report_path = self.tn.path("preflight-outage.json")
+        self.tn.kill(0)
+        try:
+            self.assertEqual(main(["--registry", self.tn.path("registry.json"),
+                                   "--directory", self.tn.path("directory.json"),
+                                   "--allow-http", "--timeout", "0.5",
+                                   "--report-json", report_path]), 1)
+            with open(report_path) as stream:
+                contents = stream.read()
+            report = json.loads(contents)
+            self.assertFalse(report["success"])
+            self.assertIn("endpoint_unreachable_or_malformed", report["errors"])
+            for url in self.directory["constellations"][self.cid]:
+                self.assertNotIn(url, contents)
+            for key in self.registry.latest(self.cid)["witnesses"]:
+                self.assertNotIn(key, contents)
+        finally:
+            self.tn.start(0)
+            self.tn.wait_ready(0)
+
+    def test_json_report_records_malformed_registry(self):
+        registry_path = self.tn.path("invalid-registry.json")
+        report_path = self.tn.path("preflight-invalid.json")
+        with open(registry_path, "wb") as stream:
+            stream.write(b"{invalid")
+        self.assertEqual(main(["--registry", registry_path,
+                               "--directory", self.tn.path("directory.json"),
+                               "--report-json", report_path]), 1)
+        with open(report_path) as stream:
+            report = json.load(stream)
+        self.assertFalse(report["success"])
+        self.assertEqual(report["errors"], ["invalid_input"])
+        self.assertEqual(report["registry_sha256"], hashlib.sha256(b"{invalid").hexdigest())
+        self.assertIsNotNone(report["directory_sha256"])
+
+    def test_json_report_cannot_overwrite_an_input(self):
+        registry_path = self.tn.path("registry.json")
+        with open(registry_path, "rb") as stream:
+            original = stream.read()
+        with self.assertRaises(SystemExit) as raised:
+            main(["--registry", registry_path, "--directory", self.tn.path("directory.json"),
+                  "--report-json", registry_path])
+        self.assertEqual(raised.exception.code, 2)
+        with open(registry_path, "rb") as stream:
+            self.assertEqual(stream.read(), original)
+
+    def test_json_report_marks_unreadable_input_hash_null(self):
+        report_path = self.tn.path("preflight-missing.json")
+        self.assertEqual(main(["--registry", self.tn.path("missing-registry.json"),
+                               "--directory", self.tn.path("directory.json"),
+                               "--report-json", report_path]), 1)
+        with open(report_path) as stream:
+            report = json.load(stream)
+        self.assertEqual(report["errors"], ["invalid_input"])
+        self.assertIsNone(report["registry_sha256"])
+        self.assertIsNotNone(report["directory_sha256"])
 
     def test_requires_explicit_http_flag(self):
         errors = check(self.directory, self.registry)
