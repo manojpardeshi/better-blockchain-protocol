@@ -54,6 +54,18 @@ python -m testnet.up --dir ./tn          # restarts all witnesses, on the same s
 
 `tests/test_testnet.py` does all of this automatically, including a SIGKILL during payments.
 
+For a no-value operator drill using separate CLI processes and file-based
+wallets across two constellations, run:
+
+```bash
+python3 -m unittest -v tests.integration.test_operator_cli_smoke
+```
+
+The drill pays and verifies a dossier before, during and after one witness is
+killed and restarted on its original store. It uses only loopback HTTP and
+temporary files; independent hosts, TLS and operator access controls still
+require the [external-operator checks](../docs/OPERATOR_TESTNET.md).
+
 ## The witness daemon
 
 `testnet` is a thin wrapper around `sigil.witnessd`, which you can also run by hand:
