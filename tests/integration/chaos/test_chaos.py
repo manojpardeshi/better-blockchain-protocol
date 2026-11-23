@@ -43,7 +43,7 @@ from unittest.mock import patch
 
 from sigil import model
 from sigil.charter import Registry
-from sigil.server import RemoteStandby, RemoteWitness, RotationIncomplete
+from sigil.server import RemoteNetwork, RemoteStandby, RemoteWitness, RotationIncomplete
 from sigil.wallet import SealFailed, request_seal
 from sigil.witness import Rejected
 
@@ -64,6 +64,35 @@ def kinds_of(violations) -> set:
 
 
 class HarnessCheckpointRecovery(unittest.TestCase):
+    def test_rotation_uses_local_charter_when_old_members_are_unreachable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run = ChaosRun(Config(seed=46, skew="none", hooks=False), workdir=directory)
+            cid = run.c.create("orion", ["python"] * 4)
+            run.cids = [cid]
+            run.directory[cid] = [run.c.url(i) for i in run.c.indices(cid)]
+            with open(run.c.registry) as f:
+                chain = json.load(f)[cid]
+            with self.assertRaisesRegex(ValueError, "unknown constellation"):
+                RemoteNetwork({cid: run.directory[cid]}, timeout=0.1)._current(cid)
+
+            def rotate(net, target, _new_urls, _token):
+                self.assertEqual(target, cid)
+                self.assertEqual(net._current(cid)[0], chain)
+                return 1
+
+            try:
+                # No witness process is started, so every remote charter fetch fails.
+                with patch.object(run.c, "add_members", return_value=[]), \
+                     patch.object(run, "_start_new", return_value=[]), \
+                     patch.object(RemoteNetwork, "rotate", autospec=True, side_effect=rotate), \
+                     patch.object(run.c, "write_chain") as write_chain, \
+                     patch.object(run, "_publish") as publish:
+                    self.assertEqual(run.op_rotate(random.Random(0)), "ok")
+                    write_chain.assert_called_once_with(cid, chain)
+                    publish.assert_called_once_with(cid, [], [])
+            finally:
+                run.c.teardown()
+
     def test_deferred_rotation_remains_a_liveness_failure_if_heal_cannot_complete_it(self):
         with tempfile.TemporaryDirectory() as directory:
             run = ChaosRun(Config(seed=12, skew="none"), workdir=directory)
