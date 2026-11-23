@@ -680,7 +680,15 @@ class ChaosRun:
                     self._arm(i, "freeze", r)
                 for i in r.sample(new_idx, r.randint(0, 2)):
                     self._arm(i, "adopt", r)
-            net = RemoteNetwork({cid: list(self.directory[cid])}, timeout=self.cfg.client_timeout + 2)
+            # A partition can hide every old member during the operator's first
+            # charter fetch. The cluster's local registry is already verified;
+            # retain that chain so rotation can retry after a transient outage.
+            with open(self.c.registry) as f:
+                chain = json.load(f)[cid]
+            registry = Registry()
+            registry.add_chain(cid, chain)
+            net = RemoteNetwork({cid: list(self.directory[cid])}, timeout=self.cfg.client_timeout + 2,
+                                registry=registry)
             for attempt in range(12):
                 try:
                     v = net.rotate(cid, new_urls, TOKEN)
