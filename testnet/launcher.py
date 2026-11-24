@@ -139,7 +139,19 @@ class Testnet:
         while True:
             p = self.procs.get(i)
             if p is not None and p.poll() is not None:
-                raise RuntimeError(f"{w['name']} exited with {p.returncode}; see {w['log']}")
+                # Test cleanup removes this directory, so preserve the daemon's
+                # reason for exiting in the exception printed by CI.
+                try:
+                    with open(w["log"], "rb") as log:
+                        log.seek(0, os.SEEK_END)
+                        log.seek(max(0, log.tell() - 8192))
+                        tail = log.read().decode("utf-8", errors="replace")
+                except OSError as exc:
+                    tail = f"<could not read daemon log: {exc}>"
+                raise RuntimeError(
+                    f"{w['name']} exited with {p.returncode} on {self.url(i)}; "
+                    f"log: {w['log']}\n{tail}"
+                )
             try:
                 with urllib.request.urlopen(self.url(i) + "/v0/info", timeout=1) as r:
                     reply = json.loads(r.read())
