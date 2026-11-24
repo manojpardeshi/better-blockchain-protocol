@@ -1,5 +1,9 @@
-"""Checks the worksheet's quorum and cost arithmetic, not protocol safety."""
+"""Checks the worksheet's arithmetic and scenario input, not protocol safety."""
 
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
 import unittest
 
 from research.economics import evaluate
@@ -16,6 +20,28 @@ def member(name, bond, price="1", gate=True):
 
 
 class EconomicsWorksheetTests(unittest.TestCase):
+    def test_cli_rejects_duplicate_json_keys_before_calculating(self):
+        scenarios = (
+            ('{"max_concurrent_loss":"100","max_concurrent_loss":"1","witnesses":[]}',
+             "max_concurrent_loss"),
+            ('{"max_concurrent_loss":"10","witnesses":[{"id":"A",'
+             '"assumed_collectible_bond":"0","assumed_collectible_bond":"50"}]}',
+             "assumed_collectible_bond"),
+        )
+        script = Path(__file__).resolve().parents[1] / "research" / "economics.py"
+        with tempfile.TemporaryDirectory() as directory:
+            scenario = Path(directory) / "scenario.json"
+            for contents, duplicate in scenarios:
+                with self.subTest(duplicate=duplicate):
+                    scenario.write_text(contents, encoding="utf-8")
+                    completed = subprocess.run(
+                        [sys.executable, str(script), str(scenario)],
+                        capture_output=True, text=True, check=False,
+                    )
+                    self.assertEqual(completed.returncode, 2)
+                    self.assertEqual(completed.stdout, "")
+                    self.assertIn(f"duplicate JSON key: {duplicate}", completed.stderr)
+
     def test_uses_cheapest_quorum_intersection(self):
         result = evaluate({"max_concurrent_loss": "29", "witnesses": [
             member("a", "10"), member("b", "20"),

@@ -11,6 +11,16 @@ from decimal import Decimal, InvalidOperation
 import json
 
 
+def reject_duplicate_keys(pairs):
+    """Keep a JSON typo from silently replacing an exposure or bond input."""
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON key: {key}")
+        result[key] = value
+    return result
+
+
 def amount(value, name):
     if isinstance(value, bool) or not isinstance(value, (int, float, str)):
         raise ValueError(f"{name} must be a non-negative number")
@@ -93,9 +103,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("scenario", help="JSON scenario file (see docs/ECONOMICS.md)")
     args = parser.parse_args()
-    with open(args.scenario, encoding="utf-8") as file:
-        scenario = json.load(file)
     try:
+        with open(args.scenario, encoding="utf-8") as file:
+            scenario = json.load(file, object_pairs_hook=reject_duplicate_keys)
         print(json.dumps(evaluate(scenario), indent=2))
     except (KeyError, ValueError) as exc:
         parser.error(str(exc))

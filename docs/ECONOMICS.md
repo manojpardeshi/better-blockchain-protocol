@@ -94,6 +94,11 @@ Save the JSON as `scenario.json`, then run:
 python3 research/economics.py scenario.json
 ```
 
+The CLI rejects repeated JSON keys at any level. A repeated exposure, bond or
+price field would otherwise be silently replaced by the last value during JSON
+parsing, making the retained scenario ambiguous. Keep the original scenario file
+with the worksheet output for review.
+
 ## Local stamp operation probe
 
 Run the reference Python witness's stamp paths with a real SQLite `WitnessStore`
