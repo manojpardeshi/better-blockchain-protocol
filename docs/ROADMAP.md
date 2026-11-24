@@ -45,6 +45,9 @@ Status legend: ⬜ not started · 🟨 in progress · ✅ done
 | 🟨 | Stamp pricing and bond sizing: the [operator worksheet](ECONOMICS.md) makes assumptions explicit, but measured costs, paid stamp issuance, exposure limits and collectible bonds are still needed |
 
 ## Phase 5: Public testnet and audit (#12)
+Track the evidence needed for the no-value external pilot and any later
+real-value v1 in the [release-gate register](RELEASE_GATES.md).
+
 | | Item |
 |---|---|
 | 🟨 | [Operator testnet runbook](OPERATOR_TESTNET.md): document isolation, transport, state recovery and fault drills; independently operated deployment and validation remain open |
