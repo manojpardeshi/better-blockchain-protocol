@@ -18,10 +18,12 @@ import shutil
 import signal
 import socket
 import subprocess
+import tempfile
 import threading
 import time
 import unittest
 import urllib.request
+from unittest.mock import Mock
 
 from sigil import locks, model
 from sigil.crypto import KeyPair
@@ -59,6 +61,23 @@ class Spender:
         u = locks.empty_unlock(self.exp)
         u["sigs"][self.owner.pk] = locks.sign_unlock(self.owner, s, model.transition_id(h), self.exp)
         return {"sigil": s, "header": h, "home": self.cid, "lock": p["lock"], "salt": p["salt"], "unlock": u}
+
+
+class DaemonStopDiagnosticsTests(unittest.TestCase):
+    def test_stop_timeout_includes_log_tail_and_reaps_process(self):
+        with tempfile.TemporaryDirectory() as d:
+            log = os.path.join(d, "daemon.log")
+            with open(log, "w") as f:
+                f.write("stopping\nhttp stopped\n")
+            dmn = Daemon("python", "unused", "unused", "unused", "unused", log)
+            proc = Mock()
+            proc.poll.return_value = None
+            proc.wait.side_effect = [subprocess.TimeoutExpired(["witnessd"], 0.01), -signal.SIGKILL]
+            dmn.proc = proc
+            with self.assertRaisesRegex(RuntimeError, "stopping\\nhttp stopped"):
+                dmn.stop(signal.SIGTERM, timeout=0.01)
+            proc.kill.assert_called_once_with()
+            self.assertEqual(proc.wait.call_count, 2)
 
 
 class DaemonLifecycleTests(unittest.TestCase):

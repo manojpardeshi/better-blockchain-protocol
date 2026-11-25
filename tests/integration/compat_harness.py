@@ -214,10 +214,16 @@ class Daemon:
                 pass
         try:
             return p.wait(timeout)
-        except subprocess.TimeoutExpired:
+        except subprocess.TimeoutExpired as exc:
+            try:
+                with open(self.log, errors="replace") as log:
+                    tail = log.read()[-4096:]
+            except OSError as read_exc:
+                tail = f"<unavailable: {read_exc}>"
             p.kill()
             p.wait()
-            raise
+            raise RuntimeError(f"{self.kind} {self.role} did not exit within {timeout}s after "
+                               f"{signal.Signals(sig).name}; daemon log tail:\n{tail}") from exc
 
     @property
     def pid(self) -> int:
