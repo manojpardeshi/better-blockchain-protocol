@@ -8,7 +8,7 @@ import json
 import signal
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from unittest.mock import patch
 
 from sigil.charter import (Registry, charter_body, charter_hash, checkpoint_hash,
@@ -17,6 +17,16 @@ from sigil.crypto import KeyPair
 from sigil.witnessd import load_registry
 from testnet.launcher import Testnet
 from testnet.preflight import check, main
+
+
+class TestnetPreflightArgumentTests(unittest.TestCase):
+    def test_timeout_must_be_finite(self):
+        for value in ("nan", "inf", "-inf", "1e309", "0", "-1"):
+            with self.subTest(value=value), redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as raised:
+                    main(["--registry", "unused.json", "--directory", "unused.json",
+                          "--timeout", value])
+                self.assertEqual(raised.exception.code, 2)
 
 
 class TestnetPreflightTests(unittest.TestCase):
