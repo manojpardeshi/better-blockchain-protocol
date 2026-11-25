@@ -10,6 +10,7 @@ import argparse
 from datetime import datetime, timezone
 import hashlib
 import json
+import math
 import os
 import tempfile
 from urllib.parse import urlsplit
@@ -199,8 +200,8 @@ def main(argv=None) -> int:
     parser.add_argument("--allow-http", action="store_true", help="allow HTTP for a local or protected testnet")
     parser.add_argument("--report-json", metavar="PATH", help="write a redacted JSON evidence report")
     args = parser.parse_args(argv)
-    if args.timeout <= 0:
-        parser.error("--timeout must be positive")
+    if not math.isfinite(args.timeout) or args.timeout <= 0:
+        parser.error("--timeout must be a positive finite number")
     if args.report_json and os.path.exists(args.report_json):
         if any(os.path.samefile(args.report_json, path)
                for path in (args.registry, args.directory) if os.path.exists(path)):
