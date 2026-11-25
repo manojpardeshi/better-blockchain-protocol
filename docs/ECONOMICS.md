@@ -108,6 +108,14 @@ on the host you want to characterize:
 python3 research/stamp_cost_probe.py --count 100 --stamp-bits 2048 > stamp-probe.json
 ```
 
+To include the Python server and client HTTP path over loopback, run a separate
+trial with `--http`. `--concurrency` sets the number of simultaneous requests
+within each phase (the witness still serializes calls that change its state):
+
+```sh
+python3 research/stamp_cost_probe.py --http --concurrency 4 --count 100 --stamp-bits 2048 > stamp-http-probe.json
+```
+
 The script creates a temporary, one-member witness and removes its store at the
 end. Each phase reports elapsed and process CPU seconds, per-operation
 milliseconds, and the change in checkpointed SQLite database bytes, log row
@@ -118,13 +126,18 @@ valid stamps on requests with the wrong home: those stamps are persisted as
 redeemed before the request is rejected. `spend_rejected_replay` retries the
 accepted requests with already redeemed stamps, so it should add no rows.
 The script checks these outcomes and fails if an operation has an unexpected
-result.
+result. HTTP mode also reports the concurrency setting and verified outcome
+counts. The existing default mode still invokes the witness directly.
 
 Request construction, RSA key generation, client blinding and unblinding, and
-store checkpoints are outside the timed phases. The probe invokes the witness
-in process: it omits HTTP, network transfer, concurrent load, payment collection,
-wallet work, key storage, and fixed operations. Its wrong-home rejection is an
-early validation failure, not a worst-case malformed request. The SQLite byte
+store checkpoints are outside the timed phases. Default mode invokes the witness
+in process and omits HTTP; HTTP mode includes loopback transport and client/server
+work in the same process, so its CPU time is process-wide and cannot separate
+client from server cost. Both modes omit production network transfer, payment
+collection, wallet work, key storage, and fixed operations. The HTTP mode measures
+the Python server only; the production Rust witness needs its own measurements.
+Its wrong-home rejection is an early validation failure, not a worst-case malformed
+request. The SQLite byte
 delta is **database file growth after a checkpoint**, not bytes written to the
 WAL or storage device; it can be zero for a phase that writes rows when existing
 pages have room. CPU time is process-wide. Run several trials on the intended

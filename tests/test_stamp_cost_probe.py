@@ -1,6 +1,6 @@
 import unittest
 
-from research.stamp_cost_probe import run
+from research.stamp_cost_probe import run, run_http
 
 
 class StampCostProbeTests(unittest.TestCase):
@@ -24,6 +24,24 @@ class StampCostProbeTests(unittest.TestCase):
         for count, bits in ((0, 1024), (-1, 1024), (1, 512)):
             with self.subTest(count=count, bits=bits), self.assertRaises(ValueError):
                 run(count=count, stamp_bits=bits)
+        for concurrency in (0, -1):
+            with self.subTest(concurrency=concurrency), self.assertRaises(ValueError):
+                run_http(count=1, stamp_bits=1024, concurrency=concurrency)
+
+    def test_http_paths_and_concurrent_durable_outcomes(self):
+        result = run_http(count=2, stamp_bits=1024, concurrency=2)
+        self.assertEqual(result["transport"], "loopback_http")
+        self.assertEqual(result["concurrency"], 2)
+        self.assertEqual(result["outcomes"], {
+            "sale_signed": 4, "spend_accepted": 2,
+            "spend_rejected_valid_stamp": 2, "spend_rejected_replay": 2})
+        phases = result["phases"]
+        self.assertEqual(phases["sale_sign"]["operations"], 4)
+        self.assertEqual(phases["spend_accepted"]["rows_delta_by_kind"]["record"], 2)
+        self.assertEqual(phases["spend_accepted"]["rows_delta_by_kind"]["stamp"], 2)
+        self.assertEqual(phases["spend_rejected_valid_stamp"]["rows_delta_by_kind"]["record"], 0)
+        self.assertEqual(phases["spend_rejected_valid_stamp"]["rows_delta_by_kind"]["stamp"], 2)
+        self.assertEqual(phases["spend_rejected_replay"]["rows_delta_by_kind"]["stamp"], 0)
 
 
 if __name__ == "__main__":
