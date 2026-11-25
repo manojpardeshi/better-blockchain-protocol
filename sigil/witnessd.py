@@ -284,7 +284,9 @@ def run(args) -> None:
     else:
         print(f"witness {w.pk[:12]} of {w.cid[:12]} v{w.version} listening on {server.url}", flush=True)
     stop.wait()
+    print("stopping", flush=True)
     server.stop()
+    print("http stopped", flush=True)
     with server._lock:  # wait for an in-flight call to finish its write
         w.store.close()
     print("stopped", flush=True)
