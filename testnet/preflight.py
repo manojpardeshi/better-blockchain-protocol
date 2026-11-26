@@ -17,7 +17,19 @@ from urllib.parse import urlsplit
 
 from sigil.charter import Registry
 from sigil.server import RemoteStandby, RemoteWitness
-from sigil.witnessd import load_registry
+
+
+def _unique_json(data: bytes):
+    """Reject ambiguous operator inputs, including duplicate keys in nested objects."""
+    def unique_pairs(pairs):
+        obj = {}
+        for key, value in pairs:
+            if key in obj:
+                raise ValueError(f"duplicate JSON key: {key}")
+            obj[key] = value
+        return obj
+
+    return json.loads(data, object_pairs_hook=unique_pairs)
 
 
 def _url_error(url, allow_http: bool) -> str | None:
@@ -184,7 +196,7 @@ def _read_inputs_with_hashes(registry_path: str, directory_path: str):
             with open(path, "rb") as stream:
                 data = stream.read()
             hashes[index] = hashlib.sha256(data).hexdigest()
-            contents.append(json.loads(data))
+            contents.append(_unique_json(data))
         except (OSError, ValueError, TypeError) as exc:
             contents.append(None)
             if first_error is None:
@@ -212,14 +224,15 @@ def main(argv=None) -> int:
             contents, hashes, read_error = _read_inputs_with_hashes(args.registry, args.directory)
             if read_error is not None:
                 raise read_error
-            registry = Registry()
-            for cid, chain in contents[0].items():
-                registry.add_chain(cid, chain)
-            directory = contents[1]
         else:
-            registry = load_registry(args.registry)
-            with open(args.directory) as stream:
-                directory = json.load(stream)
+            contents = []
+            for path in (args.registry, args.directory):
+                with open(path, "rb") as stream:
+                    contents.append(_unique_json(stream.read()))
+        registry = Registry()
+        for cid, chain in contents[0].items():
+            registry.add_chain(cid, chain)
+        directory = contents[1]
     except (OSError, ValueError, TypeError, KeyError, AttributeError, IndexError) as exc:
         print(f"preflight: invalid input: {exc}")
         if args.report_json:

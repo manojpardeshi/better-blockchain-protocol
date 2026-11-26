@@ -124,6 +124,30 @@ class TestnetPreflightTests(unittest.TestCase):
         self.assertEqual(report["registry_sha256"], hashlib.sha256(b"{invalid").hexdigest())
         self.assertIsNotNone(report["directory_sha256"])
 
+    def test_duplicate_input_keys_are_rejected_in_both_modes(self):
+        for kind, data in (("registry", b'{"same":[],"same":[]}'),
+                           ("directory", b'{"constellations":{"same":[],"same":[]}}')):
+            path = self.tn.path(f"duplicate-{kind}.json")
+            with open(path, "wb") as stream:
+                stream.write(data)
+            for report_enabled in (False, True):
+                with self.subTest(kind=kind, report=report_enabled):
+                    report_path = self.tn.path(f"duplicate-{kind}-report.json")
+                    args = ["--registry", path if kind == "registry" else self.tn.path("registry.json"),
+                            "--directory", path if kind == "directory" else self.tn.path("directory.json")]
+                    if report_enabled:
+                        args += ["--report-json", report_path]
+                    output = io.StringIO()
+                    with redirect_stdout(output):
+                        self.assertEqual(main(args), 1)
+                    self.assertIn("duplicate JSON key", output.getvalue())
+                    if report_enabled:
+                        with open(report_path) as stream:
+                            report = json.load(stream)
+                        self.assertFalse(report["success"])
+                        self.assertEqual(report["errors"], ["invalid_input"])
+                        self.assertEqual(report[f"{kind}_sha256"], hashlib.sha256(data).hexdigest())
+
     def test_json_report_cannot_overwrite_an_input(self):
         registry_path = self.tn.path("registry.json")
         with open(registry_path, "rb") as stream:

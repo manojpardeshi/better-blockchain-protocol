@@ -109,6 +109,8 @@ the report intentionally omits endpoint URLs and public keys. The option does
 not change the command's normal terminal diagnostics or exit status.
 
 It validates the registry chain, requires HTTPS URLs, and checks that every
+registry and directory JSON object has unique keys, so the recorded inputs are
+unambiguous. It checks that every
 current witness (and, when configured, standby member) has a unique endpoint
 and public key, announces the expected constellation and charter version, and
 serves the exact agreed chain. If any charter in the chain uses a checkpoint,
