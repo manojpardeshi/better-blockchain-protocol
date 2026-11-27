@@ -121,6 +121,9 @@ The check only reads `/v0/info` and `/v0/charters/<cid>`; it does not test
 admin access controls, TLS termination policy, payment liveness, or independent
 operator control. Run the acceptance drills below as well.
 
+Equivalent root URLs (a trailing slash, host case, or an explicit default
+port) count as one endpoint; give each member a distinct daemon address.
+
 ### Rust standby heartbeat endpoints
 
 The Rust `sigil-witness standby` heartbeat client currently accepts only

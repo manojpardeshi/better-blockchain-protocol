@@ -175,12 +175,40 @@ class TestnetPreflightTests(unittest.TestCase):
         self.assertTrue(any("must use HTTPS" in error for error in errors), errors)
 
     def test_reused_url_does_not_count_as_second_member(self):
+        for suffix in ("", "/"):
+            with self.subTest(suffix=suffix):
+                directory = copy.deepcopy(self.directory)
+                urls = directory["constellations"][self.cid]
+                urls[1] = urls[0] + suffix
+                errors = check(directory, self.registry, allow_http=True)
+                self.assertTrue(any("URL reused" in error for error in errors), errors)
+                self.assertTrue(any("endpoint keys do not match" in error for error in errors), errors)
+
+    def test_reused_https_url_with_case_and_default_port_is_rejected(self):
         directory = copy.deepcopy(self.directory)
-        urls = directory["constellations"][self.cid]
-        urls[1] = urls[0]
-        errors = check(directory, self.registry, allow_http=True)
+        directory["constellations"][self.cid] = [
+            "https://Node.Example", "https://node.example:443/"]
+        first_key = self.registry.latest(self.cid)["witnesses"][0]
+        chain = self.registry.chain(self.cid)
+
+        class Fake:
+            pk = first_key
+            features = []
+
+            def __init__(self, url, timeout):
+                pass
+
+            def _info(self):
+                return {"pk": self.pk, "constellation": self_cid,
+                        "version": 0, "frozen": False, "features": []}
+
+            def chain(self, cid):
+                return chain
+
+        self_cid = self.cid
+        with patch("testnet.preflight.RemoteWitness", Fake):
+            errors = check(directory, self.registry)
         self.assertTrue(any("URL reused" in error for error in errors), errors)
-        self.assertTrue(any("endpoint keys do not match" in error for error in errors), errors)
 
     def test_rejects_stale_or_spoofed_endpoint(self):
         class Fake:

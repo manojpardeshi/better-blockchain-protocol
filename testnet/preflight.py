@@ -65,7 +65,7 @@ def check(directory: dict, registry: Registry, *, timeout: float = 3.0,
         if cid not in groups:
             errors.append(f"{cid}: committee has no constellation entry")
 
-    used_urls = set()
+    used_endpoints = set()
     for cid, urls in groups.items():
         if not isinstance(cid, str) or not cid.isalnum():
             errors.append(f"{cid!r}: invalid constellation ID")
@@ -95,10 +95,15 @@ def check(directory: dict, registry: Registry, *, timeout: float = 3.0,
                 if bad:
                     errors.append(f"{cid} {role} {url!r}: {bad}")
                     continue
-                if url in used_urls:
+                parsed = urlsplit(url)
+                # Root URLs with a slash, host case changes, or an explicit
+                # default port still address the same daemon.
+                endpoint = (parsed.scheme, parsed.hostname,
+                            parsed.port or (443 if parsed.scheme == "https" else 80))
+                if endpoint in used_endpoints:
                     errors.append(f"{cid} {role} {url}: URL reused in directory")
                     continue
-                used_urls.add(url)
+                used_endpoints.add(endpoint)
                 try:
                     client = (RemoteStandby if role == "standby" else RemoteWitness)(url, timeout=timeout)
                     info = client._info()
