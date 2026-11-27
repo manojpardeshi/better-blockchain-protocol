@@ -10,6 +10,7 @@ process crash, SPEC §5).
 import os
 import shutil
 import signal
+import socket
 import tempfile
 import threading
 import unittest
@@ -158,6 +159,23 @@ class StampedTestnetTests(unittest.TestCase):
 
 
 class TestnetReadinessTests(unittest.TestCase):
+    def test_wait_ready_reports_daemon_log_if_startup_fails(self):
+        with tempfile.TemporaryDirectory(prefix="sigil-testnet-ready-") as d:
+            tn = Testnet(d)
+            tn.create(constellations=1, witnesses=1)
+            with socket.socket() as occupied:
+                occupied.bind(("127.0.0.1", 0))
+                occupied.listen()
+                tn.witnesses[0]["port"] = occupied.getsockname()[1]
+                try:
+                    tn.start(0)
+                    with self.assertRaisesRegex(RuntimeError, "Address already in use") as ctx:
+                        tn.wait_ready(0, timeout=5)
+                    self.assertIn("orion-0 exited with 1", str(ctx.exception))
+                    self.assertIn(tn.url(0), str(ctx.exception))
+                finally:
+                    tn.stop_all(signal.SIGKILL)
+
     def test_wait_ready_rejects_another_witness_on_the_port(self):
         with tempfile.TemporaryDirectory(prefix="sigil-testnet-ready-") as d:
             tn = Testnet(d)
